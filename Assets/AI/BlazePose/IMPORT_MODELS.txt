@@ -1,0 +1,48 @@
+BlazePose models for the on-device pose pipeline (Unity Inference Engine / Sentis 2.x)
+=====================================================================================
+
+The model + anchor files are a MANUAL download (large binaries, not committed to the repo).
+Drop them into this folder (Assets/AI/BlazePose/) and assign them on the BlazePoseRunner component.
+
+1) Install the package (already added to Packages/manifest.json):
+     com.unity.ai.inference @ 2.2.1   (namespace: Unity.InferenceEngine)
+   Open the project once so the Package Manager resolves it.
+
+2) Download the pre-converted ONNX models from HuggingFace:
+     https://huggingface.co/unity/inference-engine-blaze-pose/tree/main/models
+   Files:
+     - pose_detection.onnx                  -> BlazePoseRunner.poseDetector
+     - pose_landmarks_detector_full.onnx    -> BlazePoseRunner.poseLandmarker
+       (lite/heavy variants also work; lite is faster, heavy is more accurate)
+   Place the .onnx files in this folder. Unity imports them as ModelAsset automatically.
+
+3) Anchors CSV (detector priors, 2254 rows of "x,y,w,h"):
+   Get it from the Unity sentis-samples BlazeDetectionSample (Pose):
+     https://github.com/Unity-Technologies/sentis-samples
+     BlazeDetectionSample/Pose/Assets/StreamingAssets/pose_detection_anchors.csv  (or Resources)
+   Copy it here as anchors.csv -> BlazePoseRunner.anchorsCSV (TextAsset).
+
+4) On the BlazePoseRunner component, assign:
+     poseDetector, poseLandmarker, anchorsCSV.
+   The ImageTransform.compute shader is already in Assets/Resources/ComputeShaders/.
+
+   OR run the one-click scene wiring in Unity:
+     TENDOR > BlazePose > Setup Scene
+   (Also runs automatically once when Unity reimports scripts if .setup_pending exists.)
+
+Scene setup (after models are assigned):
+  Stage 1 (validate detection):
+    - Add a GameObject with BlazePoseRunner (assign the 3 model/anchor assets).
+    - Add BlazePose2DOverlay (it auto-finds the runner). Run on device; landmarks should track the person.
+      Tune flipX / flipY / swapXY until the overlay lines up with the camera background.
+  Stage 2 (world-space joints):
+    - Add an AROcclusionManager to the AR camera (enable environment depth / LiDAR).
+    - Add BlazePoseDepthLift (auto-finds runner + occlusion + camera) and BlazePose3DVisualizer.
+      Confirm the 3D spheres sit on the real person; tune the depth flip toggles to match the runner.
+  Stage 3 (record with BlazePose):
+    - On BodyTrackingRecorder, set "Pose Source" = BlazePose (it auto-finds BlazePoseDepthLift).
+      ARKit remains the default/fallback. Record + replay should now use BlazePose joints.
+
+Model I/O reference (no adaptation needed):
+  - Detector input:   (1, 224, 224, 3), output post-processed to (idx, score, box).
+  - Landmarker input: (1, 256, 256, 3), output "Identity" (1, 195) = 33 keypoints x (x, y, z, visibility, presence).
