@@ -88,16 +88,53 @@ namespace BodyTracking.Data
     [Serializable]
     public class HipRecording
     {
-        /// <summary>1 = legacy skeletonJoints only; 2 = recordedJoints (smoothed at record time).</summary>
+        /// <summary>
+        /// 1 = legacy skeletonJoints only; 2 = recordedJoints (smoothed at record time);
+        /// 3 = RouteRoot-local samples with map/route metadata and an explicit spatialSource.
+        /// </summary>
         public int recordingFormatVersion = 2;
 
         public List<HipFrame> frames = new List<HipFrame>();
         public float duration;
         public float frameRate;
+        /// <summary>
+        /// World pose of the reference frame at record time. For v1/v2 this is the AR image target;
+        /// for v3 this is the RouteRoot supplied by the active <c>IRouteRootProvider</c>. The per-joint
+        /// math is identical (points are stored in this frame's local space), so the fields are reused.
+        /// </summary>
         public Vector3 referenceImageTargetPosition;
         public Quaternion referenceImageTargetRotation;
         public Vector3 referenceImageTargetScale;
         public DateTime recordingTimestamp;
+
+        // --- v3 RouteRoot metadata ---
+        /// <summary>Spatial map id the RouteRoot was anchored to (Immersal map id, or image target name).</summary>
+        public string mapId;
+        /// <summary>Optional logical route/problem id this recording belongs to.</summary>
+        public string routeId;
+        /// <summary>"immersal" or "imageTarget". Empty/legacy recordings are treated as image-target.</summary>
+        public string spatialSource;
+
+        // --- Move AI fusion metadata ---
+        /// <summary>File name (no extension) of the paired video captured for Move AI processing, if any.</summary>
+        public string videoFileName;
+        /// <summary>
+        /// Seconds between the video's first frame and this recording's t=0, used to time-align the Move AI
+        /// motion with the ARKit samples during baking. 0 when capture started together.
+        /// </summary>
+        public float videoStartTimeOffset;
+        /// <summary>Move API job id once a fusion job has been submitted for this recording (empty otherwise).</summary>
+        public string moveJobId;
+        /// <summary>Last known Move API job state ("", NOT_STARTED, RUNNING, FINISHED, FAILED).</summary>
+        public string moveJobState;
+
+        /// <summary>True for recordings made before the RouteRoot/Immersal integration (v1/v2).</summary>
+        public bool IsLegacyFormat => recordingFormatVersion < 3;
+
+        /// <summary>True when the recording was anchored to an Immersal RouteRoot.</summary>
+        public bool IsImmersalSourced =>
+            !string.IsNullOrEmpty(spatialSource) &&
+            spatialSource.Equals("immersal", StringComparison.OrdinalIgnoreCase);
         
         public int FrameCount => frames.Count;
         public int ValidFrameCount
@@ -123,6 +160,19 @@ namespace BodyTracking.Data
         {
             if (recordingFormatVersion <= 0)
                 recordingFormatVersion = 1;
+        }
+        
+        /// <summary>
+        /// Timestamp of the first frame that contains tracked hip or skeleton data.
+        /// </summary>
+        public float GetFirstValidFrameTime()
+        {
+            for (int i = 0; i < frames.Count; i++)
+            {
+                if (frames[i].IsValid)
+                    return frames[i].timestamp;
+            }
+            return 0f;
         }
         
         /// <summary>

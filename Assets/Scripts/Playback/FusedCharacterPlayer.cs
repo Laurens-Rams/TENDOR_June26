@@ -34,20 +34,33 @@ namespace BodyTracking.Playback
         [Tooltip("Lateral offset in RouteRoot-local space (used for side-by-side compare with ARKit).")]
         [SerializeField] private Vector3 routeRootLocalOffset = Vector3.zero;
 
+        [Header("Fit")]
+        [Tooltip("Calibration multiplier on the auto-computed height scale. The auto scale matches the FBX's " +
+                 "head-to-toe BONE extent to the recording height, but the rendered MESH (skull cap, soles) " +
+                 "reaches past those joints so the model looks slightly taller than the orange skeleton. Nudge " +
+                 "below 1 to shrink the character onto the orange skeleton (e.g. ~0.9). Live-adjustable in play mode.")]
+        [SerializeField, Range(0.5f, 1.5f)] private float skeletonFitScale = 1f;
+        private float lastAppliedFitScale = float.NaN;
+
         private IRouteRootProvider routeRootProvider;
         private CoordinateFrame referenceFrame;
 
         private MoveAIFusionAsset asset;
         private HipRecording recording; // source ARKit recording, for pelvis anchor + facing
         private bool isPlaying;
+        private bool isPaused;
         private float playbackTime;
         private bool waitingForLocalization;
+#if UNITY_EDITOR || DEVELOPMENT_BUILD
         private int dbgFrame;
+#endif
         private bool readyToApply; // set in Update, consumed in LateUpdate so we win over the rig Animator
         private bool loggedPlacement; // one-shot placement diagnostic per playback
+#if UNITY_EDITOR || DEVELOPMENT_BUILD
         // #region agent log
         private bool loggedMapping; // one-shot joint->bone mapping dump
         // #endregion
+#endif
         private Animator characterAnimator; // disabled while we drive bones procedurally
         private FusedPoseSolver.AnchorState anchorState; // last-good ARKit anchor/facing through dropouts
 
@@ -71,6 +84,10 @@ namespace BodyTracking.Playback
         private bool hasRigBindAnatomical;
 
         public bool IsPlaying => isPlaying;
+        public bool IsPaused => isPaused;
+        /// <summary>The 180° yaw flip applied to the Move pose. The compare overlay reads this so the orange
+        /// skeleton and the driven character always share one facing (they both feed off FusedPoseSolver).</summary>
+        public bool InvertFacing => invertFacing;
         public bool IsWaitingForLocalization => waitingForLocalization;
         public float Duration => asset?.Duration ?? 0f;
         public float CurrentTime => playbackTime;
@@ -200,6 +217,7 @@ namespace BodyTracking.Playback
 
             DisableRigAnimator();
             isPlaying = true;
+            isPaused = false;
             playbackTime = 0f;
             readyToApply = false;
             loggedPlacement = false;
@@ -245,6 +263,11 @@ namespace BodyTracking.Playback
         {
             readyToApply = false;
             if (!isPlaying || asset == null) return;
+
+            // Live calibration: if the fit slider was nudged in the inspector during play mode, re-apply the
+            // uniform height scale (the ratio math is scale-invariant, so re-applying is stable, not cumulative).
+            if (characterRoot != null && !Mathf.Approximately(skeletonFitScale, lastAppliedFitScale))
+                ApplyRecordingHeightScale();
 
             bool localized = routeRootProvider == null || routeRootProvider.IsLocalized;
 #if UNITY_EDITOR || DEVELOPMENT_BUILD
@@ -507,15 +530,19 @@ namespace BodyTracking.Playback
         {
             if (characterRoot == null) return;
 
+            float fit = Mathf.Max(0.01f, skeletonFitScale);
+            lastAppliedFitScale = skeletonFitScale;
+
             // One uniform scale per recording: match the solved Move skeleton height (same metric as the orange
             // overlay). Hips are snapped every frame in OrientAndPlaceRoot, so different people's heights just
             // rescale the model — limb proportions stay the FBX's, overall height tracks the recording.
+            // skeletonFitScale then trims the model onto the orange skeleton (mesh extends past the bones).
             float targetHeight = EstimatePoseHeight(asset?.pose) * Mathf.Max(0.01f, asset?.scale ?? 1f);
             if (targetHeight <= 0.1f)
                 targetHeight = recordingHeightMeters;
             if (targetHeight <= 0.1f)
             {
-                characterRoot.localScale = Vector3.one * Mathf.Max(0.01f, asset?.scale ?? 1f);
+                characterRoot.localScale = Vector3.one * Mathf.Max(0.01f, (asset?.scale ?? 1f) * fit);
                 return;
             }
 
@@ -524,16 +551,16 @@ namespace BodyTracking.Playback
                 currentHeight = EstimateCharacterHeight(characterRoot);
             if (currentHeight <= 0.1f)
             {
-                characterRoot.localScale = Vector3.one * Mathf.Max(0.01f, asset?.scale ?? 1f);
+                characterRoot.localScale = Vector3.one * Mathf.Max(0.01f, (asset?.scale ?? 1f) * fit);
                 return;
             }
 
             float currentScale = Mathf.Max(0.01f, (characterRoot.localScale.x + characterRoot.localScale.y + characterRoot.localScale.z) / 3f);
-            float targetScale = Mathf.Max(0.01f, currentScale * targetHeight / currentHeight);
+            float targetScale = Mathf.Max(0.01f, currentScale * targetHeight / currentHeight * fit);
             characterRoot.localScale = Vector3.one * targetScale;
             Debug.Log($"[FusedCharacterPlayer] Character height scale={targetScale:F3} " +
                       $"(target {targetHeight:F2}m / model {currentHeight:F2}m, " +
-                      $"measure={(usingBoneHeight ? "joints" : "mesh-bounds")})");
+                      $"fit={fit:F2}, measure={(usingBoneHeight ? "joints" : "mesh-bounds")})");
         }
 
         /// <summary>

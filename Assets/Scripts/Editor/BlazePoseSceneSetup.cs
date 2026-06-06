@@ -4,6 +4,7 @@ using UnityEditor;
 using UnityEditor.SceneManagement;
 using UnityEngine;
 using UnityEngine.XR.ARFoundation;
+using Unity.XR.CoreUtils;
 
 namespace BodyTracking.Editor
 {
@@ -50,12 +51,13 @@ namespace BodyTracking.Editor
                 return false;
             }
 
-            var cameraManager = Object.FindAnyObjectByType<ARCameraManager>();
+            var xrOrigin = Object.FindAnyObjectByType<XROrigin>();
+            var cameraManager = MoveAIFusionSceneSetup.EnsureCameraManager(xrOrigin);
             if (cameraManager == null)
             {
-                Debug.LogError("[BlazePoseSceneSetup] ARCameraManager not found in scene.");
+                Debug.LogError("[BlazePoseSceneSetup] ARCameraManager not found and could not be created.");
                 if (showDialog)
-                    EditorUtility.DisplayDialog("BlazePose Setup", "ARCameraManager not found. Open NewVersion.unity first.", "OK");
+                    EditorUtility.DisplayDialog("BlazePose Setup", "ARCameraManager missing. Ensure XR Origin (AR Rig) with a Camera is in the scene.", "OK");
                 return false;
             }
 
@@ -162,7 +164,6 @@ namespace BodyTracking.Editor
             var envDepth = so.FindProperty("m_EnvironmentDepthMode");
             if (envDepth != null)
                 envDepth.intValue = 1; // Fastest
-
             so.ApplyModifiedPropertiesWithoutUndo();
         }
 

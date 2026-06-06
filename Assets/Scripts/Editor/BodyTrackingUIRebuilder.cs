@@ -19,7 +19,7 @@ namespace BodyTracking.Editor
         public static void Rebuild()
         {
             // Per project convention, use Object.FindObjectOfType (not the bare global) in editor scripts.
-            var ui = Object.FindObjectOfType<BodyTrackingUI>();
+            var ui = Object.FindFirstObjectByType<BodyTrackingUI>();
             if (ui == null)
             {
                 EditorUtility.DisplayDialog(
@@ -31,7 +31,7 @@ namespace BodyTracking.Editor
             }
 
             if (ui.controller == null)
-                ui.controller = Object.FindObjectOfType<BodyTrackingController>();
+                ui.controller = Object.FindFirstObjectByType<BodyTrackingController>();
 
             ui.BuildUI();
 

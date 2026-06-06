@@ -248,7 +248,7 @@ namespace BodyTracking.MoveAI
             if (motionDownloadError != null)
             {
                 Fail(result, onComplete, motionDownloadError);
-                yield break;
+                    yield break;
             }
             result.motionDataZip = motionBytes;
 
@@ -438,7 +438,7 @@ namespace BodyTracking.MoveAI
             if (motionDownloadError != null)
             {
                 Fail(result, onComplete, motionDownloadError);
-                yield break;
+                    yield break;
             }
             result.motionDataZip = motionBytes;
 
@@ -479,25 +479,25 @@ namespace BodyTracking.MoveAI
                 {
                     Debug.LogWarning($"[MoveApiClient] Retrying video upload ({attempt}/{MaxTransientRetries})");
                     yield return WaitRetryBackoff(attempt - 1);
-                }
+            }
 
-                // Move's presigned URLs are AWS SigV2 (AWSAccessKeyId/Signature/Expires query params). In SigV2 the
-                // Content-Type header is part of the signed StringToSign, and Move's docs show a bare PUT. Unity's
-                // UploadHandlerRaw defaults to "application/octet-stream", which changes the signature, so force the
-                // request header itself to an empty value. Do not retry with other content types; they are guaranteed
-                // to produce SignatureDoesNotMatch for Move's current URLs and hide the useful first response.
-                using var put = new UnityWebRequest(presignedUrl, UnityWebRequest.kHttpVerbPUT);
-                var upload = new UploadHandlerRaw(data);
-                upload.contentType = "";
-                put.uploadHandler = upload;
-                put.downloadHandler = new DownloadHandlerBuffer();
+            // Move's presigned URLs are AWS SigV2 (AWSAccessKeyId/Signature/Expires query params). In SigV2 the
+            // Content-Type header is part of the signed StringToSign, and Move's docs show a bare PUT. Unity's
+            // UploadHandlerRaw defaults to "application/octet-stream", which changes the signature, so force the
+            // request header itself to an empty value. Do not retry with other content types; they are guaranteed
+            // to produce SignatureDoesNotMatch for Move's current URLs and hide the useful first response.
+            using var put = new UnityWebRequest(presignedUrl, UnityWebRequest.kHttpVerbPUT);
+            var upload = new UploadHandlerRaw(data);
+            upload.contentType = "";
+            put.uploadHandler = upload;
+            put.downloadHandler = new DownloadHandlerBuffer();
                 put.timeout = UploadTimeoutSeconds;
-                put.SetRequestHeader("Content-Type", "");
+            put.SetRequestHeader("Content-Type", "");
 
-                yield return put.SendWebRequest();
+            yield return put.SendWebRequest();
 
-                if (put.result == UnityWebRequest.Result.Success)
-                    yield break;
+            if (put.result == UnityWebRequest.Result.Success)
+                yield break;
 
                 lastError = FormatUploadError(put, "(empty)");
                 if (!IsTransientNetworkFailure(put) || attempt >= MaxTransientRetries)
@@ -533,28 +533,28 @@ namespace BodyTracking.MoveAI
                     yield return WaitRetryBackoff(attempt - 1);
                 }
 
-                var bodyDict = new Dictionary<string, object> { { "query", query } };
-                string body = MiniJson.Serialize(bodyDict);
-                byte[] payload = System.Text.Encoding.UTF8.GetBytes(body);
+            var bodyDict = new Dictionary<string, object> { { "query", query } };
+            string body = MiniJson.Serialize(bodyDict);
+            byte[] payload = System.Text.Encoding.UTF8.GetBytes(body);
 
-                using var req = new UnityWebRequest(endpoint, "POST");
-                req.uploadHandler = new UploadHandlerRaw(payload);
-                req.downloadHandler = new DownloadHandlerBuffer();
-                req.timeout = GraphQlTimeoutSeconds;
-                req.SetRequestHeader("Content-Type", "application/json");
-                req.SetRequestHeader("Authorization", useBearerPrefix ? $"Bearer {apiKey}" : apiKey);
+            using var req = new UnityWebRequest(endpoint, "POST");
+            req.uploadHandler = new UploadHandlerRaw(payload);
+            req.downloadHandler = new DownloadHandlerBuffer();
+            req.timeout = GraphQlTimeoutSeconds;
+            req.SetRequestHeader("Content-Type", "application/json");
+            req.SetRequestHeader("Authorization", useBearerPrefix ? $"Bearer {apiKey}" : apiKey);
 
-                yield return req.SendWebRequest();
+            yield return req.SendWebRequest();
 
-                if (req.result != UnityWebRequest.Result.Success)
-                {
+            if (req.result != UnityWebRequest.Result.Success)
+            {
                     if (IsTransientNetworkFailure(req) && attempt < MaxTransientRetries)
                         continue;
-                    onResult?.Invoke(null);
-                    yield break;
-                }
+                onResult?.Invoke(null);
+                yield break;
+            }
 
-                onResult?.Invoke(MiniJson.AsObject(MiniJson.Parse(req.downloadHandler.text)));
+            onResult?.Invoke(MiniJson.AsObject(MiniJson.Parse(req.downloadHandler.text)));
                 yield break;
             }
         }
@@ -569,40 +569,40 @@ namespace BodyTracking.MoveAI
                     yield return WaitRetryBackoff(attempt - 1);
                 }
 
-                var bodyDict = new Dictionary<string, object> { { "query", query } };
-                string body = MiniJson.Serialize(bodyDict);
-                byte[] payload = System.Text.Encoding.UTF8.GetBytes(body);
+            var bodyDict = new Dictionary<string, object> { { "query", query } };
+            string body = MiniJson.Serialize(bodyDict);
+            byte[] payload = System.Text.Encoding.UTF8.GetBytes(body);
 
-                using var req = new UnityWebRequest(endpoint, "POST");
-                req.uploadHandler = new UploadHandlerRaw(payload);
-                req.downloadHandler = new DownloadHandlerBuffer();
-                req.timeout = GraphQlTimeoutSeconds;
-                req.SetRequestHeader("Content-Type", "application/json");
-                req.SetRequestHeader("Authorization", useBearerPrefix ? $"Bearer {apiKey}" : apiKey);
+            using var req = new UnityWebRequest(endpoint, "POST");
+            req.uploadHandler = new UploadHandlerRaw(payload);
+            req.downloadHandler = new DownloadHandlerBuffer();
+            req.timeout = GraphQlTimeoutSeconds;
+            req.SetRequestHeader("Content-Type", "application/json");
+            req.SetRequestHeader("Authorization", useBearerPrefix ? $"Bearer {apiKey}" : apiKey);
 
-                yield return req.SendWebRequest();
+            yield return req.SendWebRequest();
 
-                if (req.result != UnityWebRequest.Result.Success)
-                {
+            if (req.result != UnityWebRequest.Result.Success)
+            {
                     string transportError = $"{req.error} :: {req.downloadHandler?.text}";
                     if (IsTransientNetworkFailure(req) && attempt < MaxTransientRetries)
                         continue;
                     onError?.Invoke(transportError);
-                    yield break;
-                }
+                yield break;
+            }
 
-                var parsed = MiniJson.AsObject(MiniJson.Parse(req.downloadHandler.text));
-                if (parsed == null)
-                {
-                    onError?.Invoke("Unparseable GraphQL response");
-                    yield break;
-                }
-                if (parsed.TryGetValue("errors", out var errs) && errs != null)
-                {
-                    onError?.Invoke($"GraphQL errors: {MiniJson.Serialize(errs)}");
-                    yield break;
-                }
-                onOk?.Invoke(parsed);
+            var parsed = MiniJson.AsObject(MiniJson.Parse(req.downloadHandler.text));
+            if (parsed == null)
+            {
+                onError?.Invoke("Unparseable GraphQL response");
+                yield break;
+            }
+            if (parsed.TryGetValue("errors", out var errs) && errs != null)
+            {
+                onError?.Invoke($"GraphQL errors: {MiniJson.Serialize(errs)}");
+                yield break;
+            }
+            onOk?.Invoke(parsed);
                 yield break;
             }
         }

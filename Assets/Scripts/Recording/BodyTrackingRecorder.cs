@@ -1,23 +1,28 @@
 using UnityEngine;
 using UnityEngine.XR.ARFoundation;
-using UnityEngine.XR.ARSubsystems;
 using Unity.XR.CoreUtils;
 using BodyTracking.Data;
 using BodyTracking.Animation;
+using BodyTracking.Spatial;
+using BodyTracking.Utils;
 using System;
 using System.Collections.Generic;
 
 namespace BodyTracking.Recording
 {
     /// <summary>
-    /// Handles recording of AR hip joint position with proper coordinate system management
+    /// Records body pose (hip + full skeleton) into the stable RouteRoot frame. The actual skeleton comes from
+    /// <see cref="IBodyPoseSource"/> (ARKit human body tracking) without changing RouteRoot-local recording math
+    /// or the v3 file format.
     /// </summary>
     public class BodyTrackingRecorder : MonoBehaviour
     {
         [Header("Recording Settings")]
         [SerializeField] private float targetFrameRate = 30f;
         [SerializeField] private bool showVisualization = false;
-        [SerializeField] private int preferredHipJointIndex = 2;
+        // ARKit 3D skeleton: 0=Root, 1=Hips (pelvis center), 2=LeftUpLeg. Use Hips, not LeftUpLeg, so the
+        // recorded hip matches Move AI's pelvis Root for fusion alignment.
+        [SerializeField] private int preferredHipJointIndex = 1;
 
         [Header("Skeleton Visualization")]
         [SerializeField] private bool showSkeletonVisualization = true;
@@ -26,94 +31,118 @@ namespace BodyTracking.Recording
         [SerializeField] private float boneLineWidth = 0.03f;
         [SerializeField] private Color trackedJointColor = Color.green;
         [SerializeField] private Color boneColor = new Color(1f, 1f, 0f, 0.7f);
-        
+
         [Header("Character Integration")]
         [SerializeField] private FBXCharacterController characterController;
         [SerializeField] private bool autoFindCharacterController = false;
         [SerializeField] private bool driveCharacterDuringRecording = false;
 
-        [Header("Joint smoothing (before save, format v2)")]
-        [SerializeField] private bool enableJointSmoothingBeforeSave = true;
-        [Tooltip("0 = no smoothing (raw tracking), 1 = strongest damping.")]
-        [Range(0f, 1f)]
-        [SerializeField] private float jointSmoothingStrength = 0.55f;
-        [Tooltip("Per-joint speed in m/s (reference space) above which extra smoothing is applied.")]
-        [SerializeField] private float jointHighVelocityMetersPerSecond = 1.25f;
-        [Tooltip("Multiplier on blend toward raw when over the velocity threshold (lower = calmer fast motion).")]
-        [Range(0.02f, 1f)]
-        [SerializeField] private float highVelocitySmoothingScale = 0.15f;
-        
         // Dependencies
         private ARHumanBodyManager bodyManager;
-        private Transform imageTargetTransform;
+        // Supplies the stable wall frame (RouteRoot) recordings are stored relative to.
+        private IRouteRootProvider routeRootProvider;
         private CoordinateFrame referenceFrame;
-        
+        // The concrete provider (Immersal or image target) locked in at StartRecording so a RouteRootManager
+        // provider switch mid-recording can't corrupt stored coordinates.
+        private IRouteRootProvider activeRecordingProvider;
+
+        // Pose source (ARKit)
+        private ARKitBodyPoseSource arkitSource;
+        private IBodyPoseSource activeSource;
+        private readonly List<BodyPoseJoint> frameJoints = new List<BodyPoseJoint>(96);
+
         // Recording state
         private HipRecording currentRecording;
         private bool isRecording = false;
         private float recordingStartTime;
         private float nextRecordTime;
-        
+        private bool warnedNoJointsThisSession;
+
         // Visualization
         private GameObject hipVisualizationSphere;
         private GameObject skeletonRoot;
         private GameObject[] jointSpheres;
         private LineRenderer[] boneLines;
+        private Vector3[] jointWorldByIndex;
+        private bool[] jointPresentByIndex;
+        private int[] jointParentByIndex;
         private Material jointMaterial;
         private Material boneMaterial;
         private const float BoneOpacity = 0.7f;
 
-        // Body tracking diagnostics
-        private bool hasTrackedBody = false;
-        private int lastTrackedBodyCount = 0;
-        private int lastTrackedJointCount = 0;
-
-        // Smoothed joint positions in reference space (recording), keyed by XR joint index
-        private readonly Dictionary<int, Vector3> jointSmoothedReference = new Dictionary<int, Vector3>(64);
-        private float lastRecordedTimestamp = -1f;
-        private Vector3 lastHipSmoothedReference;
-        private bool hasSmoothedHipSample;
-        
         // Events
         public event System.Action<HipRecording> OnRecordingComplete;
         public event System.Action<float> OnRecordingProgress;
-        
+
         // Public properties
         public bool IsRecording => isRecording;
         public float RecordingDuration => isRecording ? Time.time - recordingStartTime : 0f;
         public HipRecording LastRecording => currentRecording;
-        public bool HasTrackedBody => hasTrackedBody;
-        public int LastTrackedBodyCount => lastTrackedBodyCount;
-        public int LastTrackedJointCount => lastTrackedJointCount;
+        public string ActiveSourceName => activeSource != null ? activeSource.SourceName : "none";
+        public bool HasTrackedBody => activeSource != null && activeSource.HasTrackedBody;
+        public int LastTrackedBodyCount => activeSource != null ? activeSource.TrackedBodyCount : 0;
+        public int LastTrackedJointCount => activeSource != null ? activeSource.TrackedJointCount : 0;
+
+        /// <summary>Force a pose poll this frame so <see cref="HasTrackedBody"/> is current (used while arming).</summary>
+        public void PollBodyDetection()
+        {
+            if (activeSource != null)
+                activeSource.TryGetCurrentPose(null, out _, out _);
+        }
 
         /// <summary>
-        /// Initialize the recorder with required dependencies
+        /// Show/hide the live joint+bone skeleton overlay (the green "dots") drawn while recording. Used by the
+        /// clean-view toggle so only the final character remains. Recording/joint capture is unaffected.
         /// </summary>
-        public bool Initialize(ARHumanBodyManager humanBodyManager, Transform imageTarget)
+        public void SetSkeletonVisible(bool visible)
+        {
+            showSkeletonVisualization = visible;
+            if (!visible)
+            {
+                HideSkeletonVisualization();
+                if (hipVisualizationSphere != null)
+                    hipVisualizationSphere.SetActive(false);
+            }
+        }
+
+        /// <summary>
+        /// Initialize the recorder. <paramref name="humanBodyManager"/> backs ARKit body tracking.
+        /// <paramref name="provider"/> supplies the RouteRoot frame recordings are stored relative to.
+        /// </summary>
+        public bool Initialize(ARHumanBodyManager humanBodyManager, IRouteRootProvider provider)
         {
             bodyManager = humanBodyManager;
-            imageTargetTransform = imageTarget;
-            
-            if (bodyManager == null)
+            routeRootProvider = provider;
+
+            if (routeRootProvider == null || routeRootProvider.RouteRoot == null)
             {
-               UnityEngine.Debug.LogError("[BodyTrackingRecorder] ARHumanBodyManager is required");
+                UnityEngine.Debug.LogError("[BodyTrackingRecorder] RouteRoot provider (with a RouteRoot transform) is required");
                 return false;
             }
-            
-            if (imageTargetTransform == null)
+
+            BuildPoseSources();
+            if (activeSource == null)
             {
-               UnityEngine.Debug.LogError("[BodyTrackingRecorder] Image target transform is required");
+                UnityEngine.Debug.LogError("[BodyTrackingRecorder] No pose source available — ARHumanBodyManager is required");
                 return false;
             }
-            
+
             // Store reference frame for coordinate transformations
-            referenceFrame = new CoordinateFrame(imageTargetTransform);
-            
+            referenceFrame = new CoordinateFrame(routeRootProvider.RouteRoot);
+
             // Setup character controller integration
             SetupCharacterController();
-            
-           UnityEngine.Debug.Log($"[BodyTrackingRecorder] Initialized - showVisualization: {showVisualization}, showSkeletonVisualization: {showSkeletonVisualization}, targetFrameRate: {targetFrameRate}");
+
+            UnityEngine.Debug.Log($"[BodyTrackingRecorder] Initialized - source: {activeSource.SourceName}, showSkeletonVisualization: {showSkeletonVisualization}, targetFrameRate: {targetFrameRate}");
             return true;
+        }
+
+        private void BuildPoseSources()
+        {
+            arkitSource = bodyManager != null
+                ? new ARKitBodyPoseSource(bodyManager, preferredHipJointIndex)
+                : null;
+            activeSource = arkitSource;
         }
 
         /// <summary>
@@ -123,13 +152,13 @@ namespace BodyTracking.Recording
         {
             if (characterController == null && autoFindCharacterController)
             {
-                characterController = FindObjectOfType<FBXCharacterController>();
+                characterController = FindFirstObjectByType<FBXCharacterController>();
                 if (characterController != null)
                 {
-                   UnityEngine.Debug.Log("[BodyTrackingRecorder] Found FBXCharacterController automatically");
+                    UnityEngine.Debug.Log("[BodyTrackingRecorder] Found FBXCharacterController automatically");
                 }
             }
-            
+
             if (characterController != null)
             {
                 if (!characterController.IsInitialized)
@@ -143,54 +172,71 @@ namespace BodyTracking.Recording
                         UnityEngine.Debug.LogError($"[BodyTrackingRecorder] Character controller init failed (recording can continue): {e.Message}");
                     }
                 }
-               UnityEngine.Debug.Log("[BodyTrackingRecorder] Character controller integration enabled");
+                UnityEngine.Debug.Log("[BodyTrackingRecorder] Character controller integration enabled");
             }
             else
             {
-               UnityEngine.Debug.Log("[BodyTrackingRecorder] No character controller found - hip tracking only");
+                UnityEngine.Debug.Log("[BodyTrackingRecorder] No character controller found - hip tracking only");
             }
         }
 
         /// <summary>
-        /// Start recording hip joint position
+        /// Start recording body pose
         /// </summary>
         public bool StartRecording()
         {
             if (isRecording)
             {
-               UnityEngine.Debug.LogWarning("[BodyTrackingRecorder] Already recording");
+                UnityEngine.Debug.LogWarning("[BodyTrackingRecorder] Already recording");
                 return false;
             }
-            
-            if (bodyManager == null || imageTargetTransform == null)
+
+            if (activeSource == null || routeRootProvider == null || routeRootProvider.RouteRoot == null)
             {
-               UnityEngine.Debug.LogError("[BodyTrackingRecorder] Not properly initialized");
+                UnityEngine.Debug.LogError("[BodyTrackingRecorder] Not properly initialized");
                 return false;
             }
-            
-            // Update reference frame at recording start
-            referenceFrame = new CoordinateFrame(imageTargetTransform);
-            
-            // Initialize recording
+
+            warnedNoJointsThisSession = false;
+
+            // Lock to the concrete active provider for this whole session.
+            activeRecordingProvider = ResolveConcreteProvider();
+
+            // Update reference frame at recording start from the current RouteRoot pose.
+            referenceFrame = new CoordinateFrame(activeRecordingProvider.RouteRoot);
+
+            string spatialSource = activeRecordingProvider.Source == SpatialSourceType.Immersal ? "immersal" : "imageTarget";
+
+            // Initialize recording (format v3: RouteRoot-local samples + map/route metadata).
             currentRecording = new HipRecording
             {
-                recordingFormatVersion = 2,
+                recordingFormatVersion = 3,
                 frameRate = targetFrameRate,
                 referenceImageTargetPosition = referenceFrame.position,
                 referenceImageTargetRotation = referenceFrame.rotation,
                 referenceImageTargetScale = referenceFrame.scale,
+                mapId = routeRootProvider.MapId,
+                routeId = routeRootProvider.RouteId,
+                spatialSource = spatialSource,
                 recordingTimestamp = DateTime.Now
             };
 
-            jointSmoothedReference.Clear();
-            lastRecordedTimestamp = -1f;
-            hasSmoothedHipSample = false;
-            
             isRecording = true;
             recordingStartTime = Time.time;
             nextRecordTime = 0f;
-            
+
             return true;
+        }
+
+        /// <summary>
+        /// Resolve the concrete provider behind the (possibly manager) RouteRoot provider, so recording is
+        /// pinned to one real anchor (Immersal or image target) instead of a manager that can switch.
+        /// </summary>
+        private IRouteRootProvider ResolveConcreteProvider()
+        {
+            if (routeRootProvider is RouteRootManager manager && manager.ActiveProvider != null)
+                return manager.ActiveProvider;
+            return routeRootProvider;
         }
 
         /// <summary>
@@ -200,43 +246,48 @@ namespace BodyTracking.Recording
         {
             if (!isRecording)
             {
-               UnityEngine.Debug.LogWarning("[BodyTrackingRecorder] Not currently recording");
+                UnityEngine.Debug.LogWarning("[BodyTrackingRecorder] Not currently recording");
                 return null;
             }
-            
+
             isRecording = false;
             currentRecording.duration = Time.time - recordingStartTime;
-            
-            // Hide visualization
+
             if (hipVisualizationSphere != null)
             {
                 hipVisualizationSphere.SetActive(false);
             }
-            
+
             OnRecordingComplete?.Invoke(currentRecording);
             return currentRecording;
         }
 
         void Update()
         {
-            if (bodyManager == null)
+            if (activeSource == null)
             {
                 HideSkeletonVisualization();
                 return;
             }
 
-            ARHumanBody trackedBody;
-            bool foundBody = TryGetBestTrackedBody(out trackedBody);
+            bool shouldSamplePose = isRecording || (showSkeletonVisualization && showSkeletonWhenNotRecording);
+            if (!shouldSamplePose)
+            {
+                // Avoid scanning ARKit body trackables while idle; arming refreshes detection explicitly.
+                HideSkeletonVisualization();
+                return;
+            }
+
+            // Sample the current pose once per frame and reuse it for both visualization and recording so the
+            // stored data exactly matches what was shown.
+            bool foundBody = activeSource.TryGetCurrentPose(frameJoints, out Vector3 hipWorld, out bool hipTracked);
+
             if (showSkeletonVisualization && (isRecording || showSkeletonWhenNotRecording))
             {
                 if (foundBody)
-                {
-                    UpdateSkeletonVisualization(trackedBody);
-                }
+                    UpdateSkeletonVisualization(frameJoints);
                 else
-                {
                     HideSkeletonVisualization();
-                }
             }
             else
             {
@@ -244,30 +295,23 @@ namespace BodyTracking.Recording
             }
 
             if (!isRecording) return;
-            
+
             float currentTime = Time.time - recordingStartTime;
-            
+
             // Record at target frame rate
             if (currentTime >= nextRecordTime)
             {
-                RecordCurrentFrame(currentTime, trackedBody);
+                RecordCurrentFrame(currentTime, foundBody, hipWorld, hipTracked);
                 nextRecordTime += 1f / targetFrameRate;
-                
-                // Notify progress
                 OnRecordingProgress?.Invoke(currentTime);
             }
         }
 
         /// <summary>
-        /// Record the current frame's hip position
+        /// Record the current frame's pose into the live RouteRoot frame.
         /// </summary>
-        private void RecordCurrentFrame(float timestamp, ARHumanBody trackedBody)
+        private void RecordCurrentFrame(float timestamp, bool foundBody, Vector3 hipWorld, bool hipTracked)
         {
-            float dt = 1f / Mathf.Max(0.001f, targetFrameRate);
-            if (lastRecordedTimestamp >= 0f)
-                dt = Mathf.Max(timestamp - lastRecordedTimestamp, 1e-5f);
-            lastRecordedTimestamp = timestamp;
-
             var frame = new HipFrame
             {
                 timestamp = timestamp,
@@ -275,175 +319,48 @@ namespace BodyTracking.Recording
                 skeletonJoints = null,
                 recordedJoints = new List<RecordedJointSample>()
             };
-            
+
             bool foundValidJoint = false;
 
-            if (trackedBody != null)
-            {
-                var joints = trackedBody.joints;
-                RecordSmoothedRecordedJoints(trackedBody, joints, frame.recordedJoints, dt);
-                
-                // ARKit joint anchorPose is in human-body anchor space; localPose is parent-joint space.
-                Vector3? bestJointPosition = GetBestHipJointAnchorPosition(joints);
+            // Sample the RouteRoot pose live for this frame (matches playback, survives Immersal re-anchoring).
+            // Use the provider locked in at StartRecording so the frame can't switch anchors mid-recording.
+            var frameProvider = activeRecordingProvider ?? routeRootProvider;
+            CoordinateFrame liveFrame = (frameProvider != null && frameProvider.RouteRoot != null)
+                ? new CoordinateFrame(frameProvider.RouteRoot)
+                : referenceFrame;
 
-                if (bestJointPosition.HasValue)
+            if (foundBody)
+            {
+                // Store every tracked joint in RouteRoot-local space (raw, no smoothing).
+                for (int i = 0; i < frameJoints.Count; i++)
                 {
-                    // Transform from AR session space to world space  
-                    Vector3 worldPosition = trackedBody.transform.TransformPoint(bestJointPosition.Value);
-                    
-                    // Transform to reference frame space
-                    Vector3 referencePosition = referenceFrame.InverseTransformPoint(worldPosition);
-                    Vector3 smoothedReference = SmoothHipReference(referencePosition, dt);
-                    
-                    frame.hipJoint = new HipJointData(
-                        smoothedReference,
-                        1.0f, // Could use actual confidence if available
-                        true
-                    );
-                    
+                    var j = frameJoints[i];
+                    Vector3 rawReference = liveFrame.InverseTransformPoint(j.worldPosition);
+                    frame.recordedJoints.Add(new RecordedJointSample(j.jointIndex, j.parentIndex, rawReference, j.isTracked));
+                }
+
+                if (hipTracked)
+                {
+                    Vector3 referencePosition = liveFrame.InverseTransformPoint(hipWorld);
+                    frame.hipJoint = new HipJointData(referencePosition, 1.0f, true);
                     foundValidJoint = true;
-                    
-                    // Update visualization
+
                     if (showVisualization)
                     {
-                        Vector3 smoothedWorld = referenceFrame.TransformPoint(smoothedReference);
-                        UpdateVisualization(smoothedWorld);
+                        Vector3 rawWorld = liveFrame.TransformPoint(referencePosition);
+                        UpdateVisualization(rawWorld);
                     }
                 }
             }
-            
-            // Debug logging for tracking issues
-            if (!foundValidJoint && !frame.HasSkeleton && currentRecording.FrameCount % 30 == 0)
+
+            if (!foundValidJoint && !frame.HasSkeleton && !warnedNoJointsThisSession)
             {
-               UnityEngine.Debug.LogWarning($"[BodyTrackingRecorder] No valid joint data found at frame {currentRecording.FrameCount}");
+                warnedNoJointsThisSession = true;
+                UnityEngine.Debug.LogWarning("[BodyTrackingRecorder] No body/hip tracked yet — keep climber in frame (landscape helps).");
             }
-            
+
             // Always add frame (even if no body detected) to maintain timing
             currentRecording.frames.Add(frame);
-        }
-
-        private void RecordSmoothedRecordedJoints(ARHumanBody trackedBody, Unity.Collections.NativeArray<XRHumanBodyJoint> joints, List<RecordedJointSample> output, float dt)
-        {
-            if (!joints.IsCreated || output == null) return;
-
-            for (int i = 0; i < joints.Length; i++)
-            {
-                XRHumanBodyJoint joint = joints[i];
-                if (!IsUsableJoint(joint)) continue;
-
-                Vector3 worldPosition = trackedBody.transform.TransformPoint(joint.anchorPose.position);
-                Vector3 rawReference = referenceFrame.InverseTransformPoint(worldPosition);
-                Vector3 smoothedReference = SmoothJointReference(i, rawReference, dt);
-                output.Add(new RecordedJointSample(i, joint.parentIndex, smoothedReference, true));
-            }
-        }
-
-        private Vector3 SmoothJointReference(int jointIndex, Vector3 rawReference, float dt)
-        {
-            if (!enableJointSmoothingBeforeSave || jointSmoothingStrength <= 0.001f)
-            {
-                jointSmoothedReference[jointIndex] = rawReference;
-                return rawReference;
-            }
-
-            if (!jointSmoothedReference.TryGetValue(jointIndex, out Vector3 prev))
-            {
-                jointSmoothedReference[jointIndex] = rawReference;
-                return rawReference;
-            }
-
-            float t = BlendTowardRaw();
-            Vector3 delta = rawReference - prev;
-            float speed = delta.magnitude / dt;
-            if (speed > jointHighVelocityMetersPerSecond)
-                t *= Mathf.Clamp01(highVelocitySmoothingScale);
-
-            Vector3 smoothed = Vector3.Lerp(prev, rawReference, t);
-            jointSmoothedReference[jointIndex] = smoothed;
-            return smoothed;
-        }
-
-        private Vector3 SmoothHipReference(Vector3 rawReference, float dt)
-        {
-            if (!enableJointSmoothingBeforeSave || jointSmoothingStrength <= 0.001f)
-            {
-                lastHipSmoothedReference = rawReference;
-                hasSmoothedHipSample = true;
-                return rawReference;
-            }
-
-            if (!hasSmoothedHipSample)
-            {
-                lastHipSmoothedReference = rawReference;
-                hasSmoothedHipSample = true;
-                return rawReference;
-            }
-
-            float t = BlendTowardRaw();
-            Vector3 delta = rawReference - lastHipSmoothedReference;
-            float speed = delta.magnitude / dt;
-            if (speed > jointHighVelocityMetersPerSecond)
-                t *= Mathf.Clamp01(highVelocitySmoothingScale);
-
-            lastHipSmoothedReference = Vector3.Lerp(lastHipSmoothedReference, rawReference, t);
-            return lastHipSmoothedReference;
-        }
-
-        /// <summary>
-        /// Returns Lerp factor toward raw sample: 1 = instant (no smooth), lower = heavier smoothing.
-        /// </summary>
-        private float BlendTowardRaw()
-        {
-            float smooth01 = Mathf.Clamp01(jointSmoothingStrength);
-            if (smooth01 <= 0.001f)
-                return 1f;
-            float minBlendWhenSlow = Mathf.Lerp(0.42f, 0.025f, smooth01);
-            return Mathf.Lerp(1f, minBlendWhenSlow, smooth01);
-        }
-
-        private bool TryGetBestTrackedBody(out ARHumanBody trackedBody)
-        {
-            trackedBody = null;
-            hasTrackedBody = false;
-            lastTrackedBodyCount = 0;
-            lastTrackedJointCount = 0;
-
-            foreach (var humanBody in bodyManager.trackables)
-            {
-                if (humanBody == null || humanBody.trackingState == TrackingState.None)
-                    continue;
-
-                var joints = humanBody.joints;
-                if (!joints.IsCreated || joints.Length == 0)
-                    continue;
-
-                int trackedJointCount = CountTrackedJoints(joints);
-                if (trackedJointCount == 0)
-                    continue;
-
-                lastTrackedBodyCount++;
-                if (trackedBody == null || trackedJointCount > lastTrackedJointCount)
-                {
-                    trackedBody = humanBody;
-                    lastTrackedJointCount = trackedJointCount;
-                }
-            }
-
-            hasTrackedBody = trackedBody != null;
-            return hasTrackedBody;
-        }
-
-        private int CountTrackedJoints(Unity.Collections.NativeArray<XRHumanBodyJoint> joints)
-        {
-            int count = 0;
-            for (int i = 0; i < joints.Length; i++)
-            {
-                if (IsUsableJoint(joints[i]))
-                {
-                    count++;
-                }
-            }
-            return count;
         }
 
         /// <summary>
@@ -453,124 +370,105 @@ namespace BodyTracking.Recording
         {
             if (hipVisualizationSphere == null)
             {
-                // Create red sphere for hip visualization
                 hipVisualizationSphere = GameObject.CreatePrimitive(PrimitiveType.Sphere);
                 hipVisualizationSphere.name = "HipVisualization_AR";
                 hipVisualizationSphere.transform.localScale = Vector3.one * 0.3f;
-                
-                // Parent to XR Origin for proper AR sync
-                var xrOrigin = FindObjectOfType<XROrigin>();
+
+                var xrOrigin = FindFirstObjectByType<XROrigin>();
                 if (xrOrigin != null)
                 {
                     hipVisualizationSphere.transform.SetParent(xrOrigin.transform);
-                   UnityEngine.Debug.Log("[BodyTrackingRecorder] Parented hip sphere to XR Origin");
                 }
-                
-                // Make it bright red using AR-compatible shader
+
                 var renderer = hipVisualizationSphere.GetComponent<Renderer>();
                 if (renderer != null)
                 {
-                    var material = new Material(Shader.Find("Unlit/Color"));
-                    material.color = Color.red;
-                    renderer.material = material;
-                   UnityEngine.Debug.Log("[BodyTrackingRecorder] Applied red material to hip sphere");
+                    var material = DebugVisualizationMaterials.CreateSolidColorMaterial(Color.red);
+                    if (material != null)
+                        renderer.material = material;
                 }
-                
-                // Remove collider
+
                 var collider = hipVisualizationSphere.GetComponent<Collider>();
                 if (collider != null)
                 {
                     Destroy(collider);
                 }
-                
-               UnityEngine.Debug.Log($"[BodyTrackingRecorder] Created hip visualization sphere at {worldPosition}");
             }
-            
+
             hipVisualizationSphere.transform.position = worldPosition;
             hipVisualizationSphere.SetActive(true);
-            
-            // Update character position if controller is available
+
             if (driveCharacterDuringRecording && characterController != null && characterController.IsInitialized)
             {
                 characterController.SetTargetHipPosition(worldPosition);
             }
-            
-            // Log sphere position every few frames to verify it's being updated
-            if (Time.frameCount % 60 == 0)
-            {
-               UnityEngine.Debug.Log($"[BodyTrackingRecorder] Hip sphere at {worldPosition:F3}, active: {hipVisualizationSphere.activeInHierarchy}");
-                if (driveCharacterDuringRecording && characterController != null)
-                {
-                   UnityEngine.Debug.Log($"[BodyTrackingRecorder] Character hip updated to {worldPosition:F3}");
-                }
-            }
         }
 
-        private Vector3? GetBestHipJointAnchorPosition(Unity.Collections.NativeArray<XRHumanBodyJoint> joints)
+        /// <summary>
+        /// Draw the current frame's skeleton from a generic joint list (works for any pose source). Joints are
+        /// keyed by their topology index so bones can connect to their parent regardless of which source emitted
+        /// them.
+        /// </summary>
+        private void UpdateSkeletonVisualization(List<BodyPoseJoint> joints)
         {
-            if (preferredHipJointIndex >= 0 &&
-                preferredHipJointIndex < joints.Length &&
-                IsUsableJoint(joints[preferredHipJointIndex]))
-            {
-                return joints[preferredHipJointIndex].anchorPose.position;
-            }
-
-            for (int i = 0; i < joints.Length; i++)
-            {
-                if (IsUsableJoint(joints[i]))
-                {
-                    return joints[i].anchorPose.position;
-                }
-            }
-
-            return null;
-        }
-
-        private bool IsUsableJoint(XRHumanBodyJoint joint)
-        {
-            return joint.tracked && joint.anchorPose.position != Vector3.zero;
-        }
-
-        private void UpdateSkeletonVisualization(ARHumanBody humanBody)
-        {
-            var joints = humanBody.joints;
-            if (!joints.IsCreated || joints.Length == 0)
+            if (joints == null || joints.Count == 0)
             {
                 HideSkeletonVisualization();
                 return;
             }
 
-            EnsureSkeletonObjects(joints.Length);
-
-            for (int i = 0; i < joints.Length; i++)
+            int capacity = 0;
+            for (int i = 0; i < joints.Count; i++)
             {
-                XRHumanBodyJoint joint = joints[i];
-                bool jointVisible = IsUsableJoint(joint);
+                capacity = Mathf.Max(capacity, joints[i].jointIndex + 1);
+                if (joints[i].parentIndex >= 0)
+                    capacity = Mathf.Max(capacity, joints[i].parentIndex + 1);
+            }
+            if (capacity == 0)
+            {
+                HideSkeletonVisualization();
+                return;
+            }
+
+            EnsureSkeletonObjects(capacity);
+
+            for (int i = 0; i < jointPresentByIndex.Length; i++)
+                jointPresentByIndex[i] = false;
+
+            for (int i = 0; i < joints.Count; i++)
+            {
+                var j = joints[i];
+                if (j.jointIndex < 0 || j.jointIndex >= jointPresentByIndex.Length)
+                    continue;
+                jointPresentByIndex[j.jointIndex] = true;
+                jointWorldByIndex[j.jointIndex] = j.worldPosition;
+                jointParentByIndex[j.jointIndex] = j.parentIndex;
+            }
+
+            for (int i = 0; i < jointSpheres.Length; i++)
+            {
+                bool visible = i < jointPresentByIndex.Length && jointPresentByIndex[i];
 
                 if (jointSpheres[i] != null)
                 {
-                    jointSpheres[i].SetActive(jointVisible);
-                    if (jointVisible)
-                    {
-                        jointSpheres[i].transform.position = humanBody.transform.TransformPoint(joint.anchorPose.position);
-                    }
+                    jointSpheres[i].SetActive(visible);
+                    if (visible)
+                        jointSpheres[i].transform.position = jointWorldByIndex[i];
                 }
 
                 if (boneLines[i] != null)
                 {
-                    int parentIndex = joint.parentIndex;
-                    bool lineVisible = jointVisible &&
+                    int parentIndex = visible ? jointParentByIndex[i] : -1;
+                    bool lineVisible = visible &&
                                        parentIndex >= 0 &&
-                                       parentIndex < joints.Length &&
-                                       IsUsableJoint(joints[parentIndex]);
+                                       parentIndex < jointPresentByIndex.Length &&
+                                       jointPresentByIndex[parentIndex];
 
                     boneLines[i].gameObject.SetActive(lineVisible);
                     if (lineVisible)
                     {
-                        Vector3 jointPosition = humanBody.transform.TransformPoint(joint.anchorPose.position);
-                        Vector3 parentPosition = humanBody.transform.TransformPoint(joints[parentIndex].anchorPose.position);
-                        boneLines[i].SetPosition(0, parentPosition);
-                        boneLines[i].SetPosition(1, jointPosition);
+                        boneLines[i].SetPosition(0, jointWorldByIndex[parentIndex]);
+                        boneLines[i].SetPosition(1, jointWorldByIndex[i]);
                     }
                 }
             }
@@ -580,8 +478,8 @@ namespace BodyTracking.Recording
         {
             if (skeletonRoot == null)
             {
-                skeletonRoot = new GameObject("ARKitSkeletonVisualization");
-                var xrOrigin = FindObjectOfType<XROrigin>();
+                skeletonRoot = new GameObject("BodyPoseSkeletonVisualization");
+                var xrOrigin = FindFirstObjectByType<XROrigin>();
                 if (xrOrigin != null)
                 {
                     skeletonRoot.transform.SetParent(xrOrigin.transform);
@@ -589,31 +487,30 @@ namespace BodyTracking.Recording
             }
 
             if (jointMaterial == null)
-            {
-                jointMaterial = new Material(Shader.Find("Unlit/Color"));
-                jointMaterial.color = trackedJointColor;
-            }
+                jointMaterial = DebugVisualizationMaterials.CreateSolidColorMaterial(trackedJointColor);
 
             if (boneMaterial == null)
             {
-                boneMaterial = new Material(Shader.Find("Sprites/Default"));
                 var c = boneColor;
                 c.a = BoneOpacity;
-                boneMaterial.color = c;
+                boneMaterial = DebugVisualizationMaterials.CreateLineMaterial(c);
             }
 
-            if (jointSpheres != null && jointSpheres.Length == jointCount)
+            if (jointSpheres != null && jointSpheres.Length >= jointCount)
                 return;
 
             ClearSkeletonObjects();
 
             jointSpheres = new GameObject[jointCount];
             boneLines = new LineRenderer[jointCount];
+            jointWorldByIndex = new Vector3[jointCount];
+            jointPresentByIndex = new bool[jointCount];
+            jointParentByIndex = new int[jointCount];
 
             for (int i = 0; i < jointCount; i++)
             {
                 var jointSphere = GameObject.CreatePrimitive(PrimitiveType.Sphere);
-                jointSphere.name = $"ARKitJoint_{i}";
+                jointSphere.name = $"Joint_{i}";
                 jointSphere.transform.SetParent(skeletonRoot.transform);
                 jointSphere.transform.localScale = Vector3.one * jointRadius;
                 jointSphere.SetActive(false);
@@ -632,7 +529,7 @@ namespace BodyTracking.Recording
 
                 jointSpheres[i] = jointSphere;
 
-                var boneObject = new GameObject($"ARKitBone_{i}");
+                var boneObject = new GameObject($"Bone_{i}");
                 boneObject.transform.SetParent(skeletonRoot.transform);
                 var line = boneObject.AddComponent<LineRenderer>();
                 line.positionCount = 2;
@@ -656,9 +553,7 @@ namespace BodyTracking.Recording
                 for (int i = 0; i < jointSpheres.Length; i++)
                 {
                     if (jointSpheres[i] != null)
-                    {
                         jointSpheres[i].SetActive(false);
-                    }
                 }
             }
 
@@ -667,9 +562,7 @@ namespace BodyTracking.Recording
                 for (int i = 0; i < boneLines.Length; i++)
                 {
                     if (boneLines[i] != null)
-                    {
                         boneLines[i].gameObject.SetActive(false);
-                    }
                 }
             }
         }
@@ -681,9 +574,7 @@ namespace BodyTracking.Recording
                 for (int i = 0; i < jointSpheres.Length; i++)
                 {
                     if (jointSpheres[i] != null)
-                    {
                         Destroy(jointSpheres[i]);
-                    }
                 }
             }
 
@@ -692,16 +583,13 @@ namespace BodyTracking.Recording
                 for (int i = 0; i < boneLines.Length; i++)
                 {
                     if (boneLines[i] != null)
-                    {
                         Destroy(boneLines[i].gameObject);
-                    }
                 }
             }
         }
 
         void OnDestroy()
         {
-            // Clean up visualization
             if (hipVisualizationSphere != null)
             {
                 Destroy(hipVisualizationSphere);
@@ -713,4 +601,4 @@ namespace BodyTracking.Recording
             }
         }
     }
-} 
+}

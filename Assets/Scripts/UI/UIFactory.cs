@@ -95,7 +95,7 @@ namespace BodyTracking.UI
             tmp.fontSize = fontSize;
             tmp.color = color;
             tmp.alignment = alignment;
-            tmp.enableWordWrapping = false;
+            tmp.textWrappingMode = TMPro.TextWrappingModes.NoWrap;
             tmp.overflowMode = TextOverflowModes.Ellipsis;
             tmp.raycastTarget = false;
             return tmp;

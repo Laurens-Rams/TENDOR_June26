@@ -140,7 +140,7 @@ namespace BodyTracking.AI
                 bool hasDepth = m_DepthValid[i];
                 float depth = hasDepth
                     ? m_SampledDepth[i]
-                    : bodyDepth + lm.zRelative * fallbackZScale / Mathf.Max(1f, result.textureHeight);
+                                       : bodyDepth + lm.zRelative * fallbackZScale / Mathf.Max(1f, result.textureHeight);
 
                 Vector2 px = BlazePoseOrientation.SensorUvToPixel(lm.imageUV, intrinsics.resolution, remap);
                 float x = (px.x - intrinsics.principalPoint.x) / intrinsics.focalLength.x * depth;

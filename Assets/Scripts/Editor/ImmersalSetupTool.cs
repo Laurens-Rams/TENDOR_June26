@@ -63,7 +63,7 @@ namespace BodyTracking.Editor
 
         void OnEnable()
         {
-            var sdk = Object.FindObjectOfType<ImmersalSDK>();
+            var sdk = Object.FindFirstObjectByType<ImmersalSDK>();
             if (sdk != null && !string.IsNullOrEmpty(sdk.developerToken))
                 token = sdk.developerToken;
             else if (PlayerPrefs.HasKey("token"))
@@ -120,14 +120,14 @@ namespace BodyTracking.Editor
         {
             GUILayout.Label("Scene status", EditorStyles.boldLabel);
 
-            var sdk = Object.FindObjectOfType<ImmersalSDK>();
+            var sdk = Object.FindFirstObjectByType<ImmersalSDK>();
             DrawStatus("ImmersalSDK in scene", sdk != null);
             DrawStatus("Developer token set", sdk != null && !string.IsNullOrEmpty(sdk.developerToken));
-            DrawStatus("XR Space", Object.FindObjectOfType<XRSpace>() != null);
-            DrawStatus("XR Map(s)", Object.FindObjectsOfType<XRMap>().Length > 0);
-            DrawStatus("RouteRoot provider", Object.FindObjectOfType<ImmersalRouteRootProvider>() != null);
-            DrawStatus("AR Session", Object.FindObjectOfType<ARSession>() != null);
-            DrawStatus("XR Origin", Object.FindObjectOfType<XROrigin>() != null);
+            DrawStatus("XR Space", Object.FindFirstObjectByType<XRSpace>() != null);
+            DrawStatus("XR Map(s)", Object.FindObjectsByType<XRMap>(FindObjectsSortMode.None).Length > 0);
+            DrawStatus("RouteRoot provider", Object.FindFirstObjectByType<ImmersalRouteRootProvider>() != null);
+            DrawStatus("AR Session", Object.FindFirstObjectByType<ARSession>() != null);
+            DrawStatus("XR Origin", Object.FindFirstObjectByType<XROrigin>() != null);
         }
 
         private static void DrawStatus(string label, bool ok)
@@ -165,28 +165,28 @@ namespace BodyTracking.Editor
             pendingLoginRequest = null;
 
 #if UNITY_2020_1_OR_NEWER
-            if (request.result != UnityWebRequest.Result.Success)
+                if (request.result != UnityWebRequest.Result.Success)
 #else
-            if (request.isNetworkError || request.isHttpError)
+                if (request.isNetworkError || request.isHttpError)
 #endif
-            {
-                statusMessage = $"Login failed: {request.error}\n{request.downloadHandler.text}";
-                Debug.LogError(statusMessage);
-            }
-            else
-            {
-                var loginResult = JsonUtility.FromJson<SDKLoginResult>(request.downloadHandler.text);
-                if (loginResult.error == "none" && !string.IsNullOrEmpty(loginResult.token))
                 {
-                    token = loginResult.token;
-                    ApplyToken(token);
-                    statusMessage = "Login successful. Token applied to ImmersalSDK in scene.";
-                    Debug.Log("[ImmersalSetupTool] Login successful.");
+                    statusMessage = $"Login failed: {request.error}\n{request.downloadHandler.text}";
+                    Debug.LogError(statusMessage);
                 }
                 else
                 {
-                    statusMessage = $"Login rejected: {loginResult.error}";
-                    Debug.LogError(statusMessage);
+                    var loginResult = JsonUtility.FromJson<SDKLoginResult>(request.downloadHandler.text);
+                    if (loginResult.error == "none" && !string.IsNullOrEmpty(loginResult.token))
+                    {
+                        token = loginResult.token;
+                        ApplyToken(token);
+                        statusMessage = "Login successful. Token applied to ImmersalSDK in scene.";
+                        Debug.Log("[ImmersalSetupTool] Login successful.");
+                    }
+                    else
+                    {
+                        statusMessage = $"Login rejected: {loginResult.error}";
+                        Debug.LogError(statusMessage);
                 }
             }
 
@@ -196,7 +196,7 @@ namespace BodyTracking.Editor
 
         private static string GetServerUrl()
         {
-            var sdk = Object.FindObjectOfType<ImmersalSDK>();
+            var sdk = Object.FindFirstObjectByType<ImmersalSDK>();
             return sdk != null ? sdk.localizationServer : DefaultServer;
         }
 
@@ -224,7 +224,7 @@ namespace BodyTracking.Editor
 
         private static ImmersalSDK EnsureImmersalSdkInScene()
         {
-            var existing = Object.FindObjectOfType<ImmersalSDK>();
+            var existing = Object.FindFirstObjectByType<ImmersalSDK>();
             if (existing != null)
                 return existing;
 
@@ -243,7 +243,7 @@ namespace BodyTracking.Editor
 
         private static void EnsureXrSpaceInScene()
         {
-            if (Object.FindObjectOfType<XRSpace>() != null)
+            if (Object.FindFirstObjectByType<XRSpace>() != null)
                 return;
 
             var go = new GameObject("XR Space");
@@ -253,11 +253,11 @@ namespace BodyTracking.Editor
 
         private static void EnsureRouteRootProvider()
         {
-            if (Object.FindObjectOfType<ImmersalRouteRootProvider>() != null)
+            if (Object.FindFirstObjectByType<ImmersalRouteRootProvider>() != null)
                 return;
 
-            var controller = Object.FindObjectOfType<BodyTrackingController>();
-            var host = controller != null ? controller.gameObject : Object.FindObjectOfType<RouteRootManager>()?.gameObject;
+            var controller = Object.FindFirstObjectByType<BodyTrackingController>();
+            var host = controller != null ? controller.gameObject : Object.FindFirstObjectByType<RouteRootManager>()?.gameObject;
             if (host == null)
                 host = new GameObject("SpatialSystems");
 

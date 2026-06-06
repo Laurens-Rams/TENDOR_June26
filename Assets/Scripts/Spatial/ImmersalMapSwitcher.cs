@@ -241,7 +241,7 @@ namespace BodyTracking.Spatial
                 yield break;
             }
 
-            var sdk = ImmersalSDK.Instance;
+                var sdk = ImmersalSDK.Instance;
             if (sdk == null)
             {
                 SetStatus("Immersal SDK missing from scene", StatusSeverity.Error);

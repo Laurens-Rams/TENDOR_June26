@@ -6,6 +6,7 @@ using UnityEngine.UI;
 using BodyTracking;
 using BodyTracking.Spatial;
 using BodyTracking.Storage;
+using BodyTracking.Animation;
 
 namespace BodyTracking.UI
 {
@@ -69,8 +70,9 @@ namespace BodyTracking.UI
         private Button visibilityToggleButton;
         private Button realignButton;
         private RectTransform visibilityToggleIcon;
-        private Button cleanViewButton;
-        private TextMeshProUGUI cleanViewLabel;
+        private CharacterSwitcher characterSwitcher;
+        private Button debugToggleButton;
+        private RectTransform debugToggleIcon;
         private DebugVisualsController debugVisuals;
         private ImmersalMapSwitcher mapSwitcher;
         private Button mapToggleButton;
@@ -78,6 +80,7 @@ namespace BodyTracking.UI
         private GameObject mapPanel;
         private TMP_InputField mapIdInput;
         private Button mapLoadButton;
+        private TextMeshProUGUI mapLoadButtonLabel;
         private TextMeshProUGUI mapStatusLabel;
         private bool mapPanelVisible;
 
@@ -86,12 +89,16 @@ namespace BodyTracking.UI
         private int selectedRecordingIndex;
         private bool mainUiVisible = true;
         private bool suppressScrubCallback;
+        private const float TransportRefreshInterval = 0.1f;
+        private float nextTransportRefreshTime;
+#if UNITY_EDITOR || DEVELOPMENT_BUILD
         private int transportDbgFrame;
+#endif
 
         void Start()
         {
             if (controller == null)
-                controller = UnityEngine.Object.FindObjectOfType<BodyTrackingController>();
+                controller = UnityEngine.Object.FindFirstObjectByType<BodyTrackingController>();
 
             if (controller == null)
                 UnityEngine.Debug.LogError("[BodyTrackingUI] BodyTrackingController not found");
@@ -128,11 +135,19 @@ namespace BodyTracking.UI
 
         void Update()
         {
+            // Map id can sync after Start(); keep the toggle label current even when the transport bar is hidden.
+            if (Time.frameCount % 10 == 0)
+                UpdateMapToggleLabel();
+
             if (!mainUiVisible)
                 return;
 
-            // Timeline/scrub state changes every frame; status pills can update less often.
-            UpdateTransportTime();
+            // Text and slider updates allocate/layout; 10 Hz is responsive enough for transport feedback.
+            if (Time.unscaledTime >= nextTransportRefreshTime)
+            {
+                nextTransportRefreshTime = Time.unscaledTime + TransportRefreshInterval;
+                UpdateTransportTime();
+            }
 
             if (Time.frameCount % 10 == 0)
                 UpdateUI();
@@ -169,7 +184,6 @@ namespace BodyTracking.UI
             BuildTopStatusArea(uiRoot);
             BuildBottomTransportBar(uiRoot);
             BuildVisibilityToggle(uiRoot);
-            BuildCleanViewToggle(uiRoot);
             BuildMapSwitcher(uiRoot);
 
             ApplyMainUiVisibility();
@@ -198,7 +212,7 @@ namespace BodyTracking.UI
         {
             var canvas = GetComponentInParent<Canvas>();
             if (canvas == null)
-                canvas = UnityEngine.Object.FindObjectOfType<Canvas>();
+                canvas = UnityEngine.Object.FindFirstObjectByType<Canvas>();
 
             if (canvas == null)
             {
@@ -232,7 +246,7 @@ namespace BodyTracking.UI
 
         private void EnsureEventSystem()
         {
-            if (UnityEngine.Object.FindObjectOfType<EventSystem>() == null)
+            if (UnityEngine.Object.FindFirstObjectByType<EventSystem>() == null)
                 new GameObject("EventSystem", typeof(EventSystem), typeof(StandaloneInputModule));
         }
 
@@ -302,7 +316,7 @@ namespace BodyTracking.UI
             moveLabel = pill.label;
             if (moveLabel != null)
             {
-                moveLabel.enableWordWrapping = false;
+                moveLabel.textWrappingMode = TMPro.TextWrappingModes.NoWrap;
                 moveLabel.overflowMode = TextOverflowModes.Ellipsis;
             }
         }
@@ -426,56 +440,61 @@ namespace BodyTracking.UI
             if (!createToggleIfMissing)
                 return;
 
-            visibilityToggleButton = UIFactory.CreateCircleButton("VisibilityToggle", root, 34f, UITokens.SurfaceElevated);
-            var rect = (RectTransform)visibilityToggleButton.transform;
-            rect.anchorMin = new Vector2(1f, 1f);
-            rect.anchorMax = new Vector2(1f, 1f);
-            rect.pivot = new Vector2(1f, 1f);
-            rect.anchoredPosition = new Vector2(-UITokens.Space12, -(UITokens.Space8 + UITokens.PillHeight * 2f + UITokens.Space4 + 4f));
+            float topY = -(UITokens.Space8 + UITokens.PillHeight * 2f + UITokens.Space4 + 4f);
 
-            visibilityToggleIcon = (RectTransform)UIFactory.AddPlayIcon(rect, 12f, UITokens.OnSurface).transform;
-            visibilityToggleIcon.localRotation = Quaternion.Euler(0f, 0f, -90f); // chevron down = hide
-            visibilityToggleButton.onClick.AddListener(ToggleMainUiVisibility);
-        }
+            // Top-right circle: cycle through the available playback characters.
+            visibilityToggleButton = UIFactory.CreateCircleButton("CharacterCycleButton", root, 34f, UITokens.SurfaceElevated);
+            var cycleRect = (RectTransform)visibilityToggleButton.transform;
+            cycleRect.anchorMin = new Vector2(1f, 1f);
+            cycleRect.anchorMax = new Vector2(1f, 1f);
+            cycleRect.pivot = new Vector2(1f, 1f);
+            cycleRect.anchoredPosition = new Vector2(-UITokens.Space12, topY);
+            visibilityToggleIcon = (RectTransform)UIFactory.AddPlayIcon(cycleRect, 12f, UITokens.OnSurface).transform;
 
-        /// <summary>
-        /// Top-left pill that toggles all developer/debug visuals (Immersal point-cloud dots, skeletons,
-        /// BlazePose overlays, image-target debug quad) on/off, leaving the playback UI + final character.
-        /// </summary>
-        private void BuildCleanViewToggle(RectTransform root)
-        {
-            debugVisuals = UnityEngine.Object.FindObjectOfType<DebugVisualsController>();
+            characterSwitcher = UnityEngine.Object.FindFirstObjectByType<CharacterSwitcher>();
+            visibilityToggleButton.onClick.AddListener(OnCycleCharacterClicked);
+
+            // Second circle just below: toggle the AR debug visuals (skeletons, Immersal/AR-plane dots, overlays).
+            debugVisuals = UnityEngine.Object.FindFirstObjectByType<DebugVisualsController>();
             if (debugVisuals == null)
                 debugVisuals = gameObject.AddComponent<DebugVisualsController>();
 
-            cleanViewButton = UIFactory.CreatePillButton("CleanViewToggle", root, "Hide AR debug", ghost: false);
-            var rect = (RectTransform)cleanViewButton.transform;
-            rect.sizeDelta = new Vector2(132f, 34f);
-            rect.anchorMin = new Vector2(0f, 1f);
-            rect.anchorMax = new Vector2(0f, 1f);
-            rect.pivot = new Vector2(0f, 1f);
-            // Sit in the same clear left-column slot the Map button uses (proven visible), below the status pills.
-            rect.anchoredPosition = new Vector2(UITokens.Space12, -(UITokens.Space8 + UITokens.PillHeight * 2f + UITokens.Space4 + 4f) - 42f);
+            debugToggleButton = UIFactory.CreateCircleButton("DebugToggleButton", root, 34f, UITokens.Primary);
+            var dbgRect = (RectTransform)debugToggleButton.transform;
+            dbgRect.anchorMin = new Vector2(1f, 1f);
+            dbgRect.anchorMax = new Vector2(1f, 1f);
+            dbgRect.pivot = new Vector2(1f, 1f);
+            dbgRect.anchoredPosition = new Vector2(-UITokens.Space12, topY - 42f);
+            debugToggleIcon = (RectTransform)UIFactory.AddPlayIcon(dbgRect, 12f, Color.white).transform;
 
-            cleanViewLabel = cleanViewButton.GetComponentInChildren<TextMeshProUGUI>();
-            cleanViewButton.onClick.AddListener(OnCleanViewClicked);
-
-            UpdateCleanViewLabel();
+            debugToggleButton.onClick.AddListener(OnToggleDebugVisualsClicked);
+            UpdateDebugToggleIcon();
         }
 
-        private void OnCleanViewClicked()
+        private void OnCycleCharacterClicked()
+        {
+            if (characterSwitcher == null)
+                characterSwitcher = UnityEngine.Object.FindFirstObjectByType<CharacterSwitcher>();
+            if (characterSwitcher != null)
+                characterSwitcher.CycleCharacter();
+            else
+                UnityEngine.Debug.LogWarning("[BodyTrackingUI] No CharacterSwitcher found in scene — cannot cycle characters.");
+        }
+
+        private void OnToggleDebugVisualsClicked()
         {
             if (debugVisuals != null)
                 debugVisuals.Toggle();
-            UpdateCleanViewLabel();
+            UpdateDebugToggleIcon();
         }
 
-        private void UpdateCleanViewLabel()
+        private void UpdateDebugToggleIcon()
         {
-            if (cleanViewLabel == null)
+            if (debugToggleIcon == null)
                 return;
             bool showing = debugVisuals == null || debugVisuals.VisualsVisible;
-            cleanViewLabel.text = showing ? "Hide AR debug" : "Show AR debug";
+            // Point the chevron down while debug visuals are shown (tap to hide), up once hidden.
+            debugToggleIcon.localRotation = Quaternion.Euler(0f, 0f, showing ? -90f : 90f);
         }
 
         /// <summary>
@@ -484,7 +503,7 @@ namespace BodyTracking.UI
         /// </summary>
         private void BuildMapSwitcher(RectTransform root)
         {
-            mapSwitcher = UnityEngine.Object.FindObjectOfType<ImmersalMapSwitcher>();
+            mapSwitcher = UnityEngine.Object.FindFirstObjectByType<ImmersalMapSwitcher>();
             if (mapSwitcher == null && controller != null && controller.routeRootManager != null)
                 mapSwitcher = controller.routeRootManager.gameObject.AddComponent<ImmersalMapSwitcher>();
 
@@ -496,13 +515,13 @@ namespace BodyTracking.UI
 
             float topY = -(UITokens.Space8 + UITokens.PillHeight * 2f + UITokens.Space4 + 4f);
 
-            mapToggleButton = UIFactory.CreatePillButton("MapToggle", root, "Map", ghost: true);
+            mapToggleButton = UIFactory.CreatePillButton("MapToggle", root, "Map —", ghost: true);
             var toggleRect = (RectTransform)mapToggleButton.transform;
-            toggleRect.sizeDelta = new Vector2(88f, 34f);
+            toggleRect.sizeDelta = new Vector2(120f, 34f);
             toggleRect.anchorMin = new Vector2(0f, 1f);
             toggleRect.anchorMax = new Vector2(0f, 1f);
             toggleRect.pivot = new Vector2(0f, 1f);
-            toggleRect.anchoredPosition = new Vector2(UITokens.Space12, topY - 84f);
+            toggleRect.anchoredPosition = new Vector2(UITokens.Space12, topY - 42f);
             mapToggleLabel = mapToggleButton.GetComponentInChildren<TextMeshProUGUI>();
             mapToggleButton.onClick.AddListener(ToggleMapPanel);
 
@@ -511,9 +530,12 @@ namespace BodyTracking.UI
             panelRect.anchorMin = new Vector2(0f, 1f);
             panelRect.anchorMax = new Vector2(0f, 1f);
             panelRect.pivot = new Vector2(0f, 1f);
-            panelRect.sizeDelta = new Vector2(248f, 132f);
-            panelRect.anchoredPosition = new Vector2(UITokens.Space12, topY - 122f);
-            mapPanel.GetComponent<Image>().raycastTarget = true;
+            panelRect.sizeDelta = new Vector2(280f, 168f);
+            panelRect.anchoredPosition = new Vector2(UITokens.Space12, topY - 80f);
+            var panelImage = mapPanel.GetComponent<Image>();
+            panelImage.raycastTarget = true;
+            // Keep the map panel above transport controls so Load is always tappable.
+            panelRect.SetAsLastSibling();
 
             var column = mapPanel.AddComponent<VerticalLayoutGroup>();
             column.padding = new RectOffset((int)UITokens.Space12, (int)UITokens.Space12, (int)UITokens.Space8, (int)UITokens.Space8);
@@ -524,13 +546,14 @@ namespace BodyTracking.UI
             column.childForceExpandWidth = true;
             column.childForceExpandHeight = false;
 
-            mapStatusLabel = UIFactory.CreateText("MapStatus", mapPanel.transform, "Enter Immersal map ID", UITokens.FontCaption, UITokens.Muted, TextAlignmentOptions.Left);
-            SetLayout(mapStatusLabel.gameObject, prefH: 18f);
+            mapStatusLabel = UIFactory.CreateText("MapStatus", mapPanel.transform, "Tap Load after entering map ID", UITokens.FontCaption, UITokens.Muted, TextAlignmentOptions.Left);
+            SetLayout(mapStatusLabel.gameObject, prefH: 36f);
+            mapStatusLabel.textWrappingMode = TMPro.TextWrappingModes.Normal;
 
-            mapIdInput = UIFactory.CreateInputField("MapIdInput", mapPanel.transform, "e.g. 147158");
+            mapIdInput = UIFactory.CreateInputField("MapIdInput", mapPanel.transform, "e.g. 147190");
             SetLayout(mapIdInput.gameObject, prefH: 40f);
-            if (mapSwitcher.ActiveMapId > 0)
-                mapIdInput.text = mapSwitcher.ActiveMapId.ToString();
+            mapIdInput.onSubmit.AddListener(_ => OnMapLoadClicked());
+            SyncMapInputFromSwitcher();
 
             var row = UIFactory.CreateRect("MapActions", mapPanel.transform);
             SetLayout(row.gameObject, prefH: 40f);
@@ -544,11 +567,13 @@ namespace BodyTracking.UI
 
             mapLoadButton = UIFactory.CreatePillButton("MapLoadButton", row, "Load map", ghost: false);
             SetLayout(mapLoadButton.gameObject, flexW: 1f, prefH: 40f);
+            mapLoadButtonLabel = mapLoadButton.GetComponentInChildren<TextMeshProUGUI>();
             mapLoadButton.onClick.AddListener(OnMapLoadClicked);
 
             mapPanelVisible = false;
             mapPanel.SetActive(false);
             UpdateMapToggleLabel();
+            UpdateMapControls();
         }
 
         private void ToggleMapPanel()
@@ -561,10 +586,60 @@ namespace BodyTracking.UI
         private void OnMapLoadClicked()
         {
             if (mapSwitcher == null || mapIdInput == null)
+            {
+                ShowMapFeedback("Map switcher not ready", error: true);
+                return;
+            }
+
+            // Keyboard focus pauses AR on iOS; dismiss before starting a network-heavy map load.
+            mapIdInput.DeactivateInputField();
+            if (TouchScreenKeyboard.isSupported)
+                TouchScreenKeyboard.hideInput = true;
+
+            string idText = mapIdInput.text?.Trim();
+            if (string.IsNullOrEmpty(idText))
+            {
+                ShowMapFeedback("Enter a numeric map ID first", error: true);
+                return;
+            }
+
+            if (controller != null && (controller.IsRecording || controller.IsPlaying))
+            {
+                ShowMapFeedback("Stop recording/playback before switching maps", error: true);
+                return;
+            }
+
+            mapPanelVisible = true;
+            if (mapPanel != null)
+                mapPanel.SetActive(true);
+
+            ShowMapFeedback($"Loading map {idText}…", error: false);
+            mapSwitcher.SwitchToMapFromInput(idText);
+            UpdateMapControls();
+        }
+
+        private void ShowMapFeedback(string message, bool error)
+        {
+            if (mapStatusLabel != null)
+            {
+                mapStatusLabel.text = message;
+                mapStatusLabel.color = error ? UITokens.Danger : UITokens.OnSurface;
+            }
+
+            if (statusText != null)
+                statusText.text = message;
+        }
+
+        private void SyncMapInputFromSwitcher()
+        {
+            if (mapIdInput == null || mapSwitcher == null)
                 return;
 
-            mapSwitcher.SwitchToMapFromInput(mapIdInput.text);
-            UpdateMapControls();
+            int id = mapSwitcher.ActiveMapId > 0
+                ? mapSwitcher.ActiveMapId
+                : (mapSwitcher.PendingMapId > 0 ? mapSwitcher.PendingMapId : -1);
+            if (id > 0)
+                mapIdInput.text = id.ToString();
         }
 
         private void OnMapSwitcherStatusChanged(string message)
@@ -588,31 +663,72 @@ namespace BodyTracking.UI
                         break;
                 }
             }
+
+            // Mirror map progress on the main status line so feedback is visible even when the panel is closed.
+            if (statusText != null && mapSwitcher != null &&
+                mapSwitcher.LastStatusSeverity != ImmersalMapSwitcher.StatusSeverity.Info)
+                statusText.text = message;
+
             UpdateMapToggleLabel();
             UpdateMapControls();
         }
 
         private void OnMapSwitched(int mapId)
         {
+            if (mapIdInput != null)
+                mapIdInput.text = mapId.ToString();
+
+            UpdateMapToggleLabel();
             if (controller != null)
                 controller.LoadLatestRecording();
             RefreshRecordingsList();
             UpdateUI();
         }
 
+        private string GetDisplayedMapId()
+        {
+            if (mapSwitcher != null && mapSwitcher.ActiveMapId > 0)
+                return mapSwitcher.ActiveMapId.ToString();
+
+            string fromController = controller != null ? controller.GetActiveMapId() : "";
+            if (!string.IsNullOrWhiteSpace(fromController))
+                return fromController.Trim();
+
+            return "—";
+        }
+
         private void UpdateMapToggleLabel()
         {
-            if (mapToggleLabel == null || mapSwitcher == null)
+            if (mapToggleLabel == null)
                 return;
 
-            string id = mapSwitcher.ActiveMapId > 0 ? mapSwitcher.ActiveMapId.ToString() : "—";
-            mapToggleLabel.text = mapSwitcher.IsSwitching ? "Map…" : $"Map {id}";
+            string id = GetDisplayedMapId();
+            bool switching = mapSwitcher != null && mapSwitcher.IsSwitching;
+            mapToggleLabel.text = switching ? $"Map {id}…" : $"Map {id}";
         }
 
         private void UpdateMapControls()
         {
-            if (mapLoadButton != null && mapSwitcher != null)
-                mapLoadButton.interactable = !mapSwitcher.IsSwitching;
+            if (mapSwitcher == null)
+                return;
+
+            bool switching = mapSwitcher.IsSwitching;
+            int pending = mapSwitcher.PendingMapId;
+
+            // Always allow Load — requests queue instead of being dropped silently.
+            if (mapLoadButton != null)
+                mapLoadButton.interactable = true;
+
+            if (mapLoadButtonLabel != null)
+            {
+                if (switching && pending > 0 && pending != mapSwitcher.ActiveMapId)
+                    mapLoadButtonLabel.text = $"Queue {pending}";
+                else if (switching)
+                    mapLoadButtonLabel.text = "Loading…";
+                else
+                    mapLoadButtonLabel.text = "Load map";
+            }
+
             UpdateMapToggleLabel();
         }
 
@@ -709,6 +825,8 @@ namespace BodyTracking.UI
 
             if (scrubSlider != null)
                 scrubSlider.interactable = isPlaying;
+
+            UpdateMapControls();
         }
 
         private void UpdateStatusPills()
@@ -819,6 +937,7 @@ namespace BodyTracking.UI
                 current = controller.FusedCurrentTime;
                 total = controller.FusedDuration;
                 progress = total > 0f ? Mathf.Clamp01(current / total) : 0f;
+#if UNITY_EDITOR || DEVELOPMENT_BUILD
                 // #region agent log
                 if ((transportDbgFrame++ % 60) == 0)
                     BodyTracking.DebugTools.DebugSessionLog.Log("D", "BodyTrackingUI.cs:UpdateTransportTime",
@@ -826,6 +945,7 @@ namespace BodyTracking.UI
                         "{\"fusedCurrentTime\":" + current.ToString("F2") +
                         ",\"fusedDuration\":" + total.ToString("F2") + "}");
                 // #endregion
+#endif
             }
             else if (controller.IsPlaying && controller.player != null)
             {
@@ -951,20 +1071,11 @@ namespace BodyTracking.UI
         // VISIBILITY TOGGLE
         // ============================================================================================
 
-        private void ToggleMainUiVisibility()
-        {
-            mainUiVisible = !mainUiVisible;
-            ApplyMainUiVisibility();
-            if (mainUiVisible) UpdateUI();
-        }
-
         private void ApplyMainUiVisibility()
         {
             if (mainUiPanel != null)
                 mainUiPanel.SetActive(mainUiVisible);
-
-            if (visibilityToggleIcon != null)
-                visibilityToggleIcon.localRotation = Quaternion.Euler(0f, 0f, mainUiVisible ? -90f : 90f);
+            // Icon rotation is now driven by the debug-visuals toggle (see UpdateDebugToggleIcon).
         }
 
         // ============================================================================================

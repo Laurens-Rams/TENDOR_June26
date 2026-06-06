@@ -1,0 +1,40 @@
+fileFormatVersion: 2
+guid: 8f460aca83a14bd493519060c2740481
+PluginImporter:
+  externalObjects: {}
+  serializedVersion: 2
+  iconMap: {}
+  executionOrder: {}
+  defineConstraints: []
+  isPreloaded: 0
+  isOverridable: 0
+  isExplicitlyReferenced: 0
+  validateReferences: 1
+  platformData:
+  - first:
+      Any: 
+    second:
+      enabled: 0
+      settings:
+        Exclude Editor: 1
+        Exclude iOS: 0
+  - first:
+      Editor: Editor
+    second:
+      enabled: 0
+      settings:
+        DefaultValueInitialized: true
+  - first:
+      iPhone: iOS
+    second:
+      enabled: 1
+      settings:
+        AddToEmbeddedBinaries: false
+        CPU: AnyCPU
+        CompileFlags: 
+        FrameworkDependencies:
+        - Vision
+        - CoreVideo
+  userData: 
+  assetBundleName: 
+  assetBundleVariant: 

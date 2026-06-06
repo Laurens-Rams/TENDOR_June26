@@ -1,6 +1,8 @@
 using UnityEngine;
 using BodyTracking.Data;
 using BodyTracking.Animation;
+using BodyTracking.Spatial;
+using BodyTracking.Utils;
 
 namespace BodyTracking.Playback
 {
@@ -29,15 +31,20 @@ namespace BodyTracking.Playback
         [SerializeField] private bool useFbxCharacterPlayback = false;
         
         // Dependencies
-        private Transform imageTargetTransform;
-        private CoordinateFrame currentImageTargetFrame;
+        // Supplies the RouteRoot frame recorded points are mapped back through. The provider itself owns
+        // live-follow vs frozen vs world-map-anchor behaviour, so the player just reads RouteRoot each frame.
+        private IRouteRootProvider routeRootProvider;
+        private CoordinateFrame currentReferenceFrame;
+        private bool hasReferenceFrame = false;
         
         // Playback state
         private HipRecording recording;
         private bool isPlaying = false;
+        private bool isPaused = false;
         private float playbackStartTime;
         private float currentPlaybackTime = 0f;
         private int lastPlaybackDebugFrame = -9999;
+        private bool waitingForLocalization = false;
         
         // Visualization
         private GameObject hipSphere;
@@ -57,34 +64,61 @@ namespace BodyTracking.Playback
         
         // Public properties
         public bool IsPlaying => isPlaying;
+        public bool IsPaused => isPaused;
         public float PlaybackProgress => recording != null ? Mathf.Clamp01(currentPlaybackTime / recording.duration) : 0f;
         public float CurrentTime => currentPlaybackTime;
         public float Duration => recording?.duration ?? 0f;
 
         /// <summary>
-        /// Re-bind the tracked image target (call when re-detecting the marker or before playback).
+        /// Bind/replace the RouteRoot provider used to map recorded points back to world space.
         /// </summary>
-        public void SetImageTarget(Transform imageTarget)
+        public void SetRouteRootProvider(IRouteRootProvider provider)
         {
-            if (imageTarget == null) return;
-            imageTargetTransform = imageTarget;
-            currentImageTargetFrame = new CoordinateFrame(imageTargetTransform);
+            if (provider == null) return;
+            routeRootProvider = provider;
+            var root = routeRootProvider.RouteRoot;
+            if (root != null)
+            {
+                currentReferenceFrame = new CoordinateFrame(root);
+                hasReferenceFrame = true;
+            }
         }
 
+        public bool HasReferenceFrame => hasReferenceFrame;
+
         /// <summary>
-        /// Initialize the player with required dependencies
+        /// Show/hide the recorded dot+line skeleton "ghost" drawn during playback. Used by the clean-view
+        /// toggle so only the final character remains visible.
         /// </summary>
-        public bool Initialize(Transform imageTarget)
+        public void SetSkeletonVisible(bool visible)
         {
-            imageTargetTransform = imageTarget;
-            
-            if (imageTargetTransform == null)
+            showRecordedSkeleton = visible;
+            if (!visible)
             {
-               UnityEngine.Debug.LogError("[BodyTrackingPlayer] Image target transform is required");
+                HideRecordedSkeleton();
+                if (hipSphere != null)
+                    hipSphere.SetActive(false);
+            }
+        }
+
+        /// <summary>True when playback is loaded/running but the RouteRoot is not yet localized.</summary>
+        public bool IsWaitingForLocalization => waitingForLocalization;
+
+        /// <summary>
+        /// Initialize the player with the RouteRoot provider (Immersal primary, image target fallback).
+        /// </summary>
+        public bool Initialize(IRouteRootProvider provider)
+        {
+            routeRootProvider = provider;
+            
+            if (routeRootProvider == null || routeRootProvider.RouteRoot == null)
+            {
+               UnityEngine.Debug.LogError("[BodyTrackingPlayer] RouteRoot provider (with a RouteRoot transform) is required");
                 return false;
             }
             
-            currentImageTargetFrame = new CoordinateFrame(imageTargetTransform);
+            currentReferenceFrame = new CoordinateFrame(routeRootProvider.RouteRoot);
+            hasReferenceFrame = true;
             
             if (showVisualization)
             {
@@ -106,7 +140,7 @@ namespace BodyTracking.Playback
         {
             if (characterController == null && autoFindCharacterController)
             {
-                characterController = FindObjectOfType<FBXCharacterController>();
+                characterController = FindFirstObjectByType<FBXCharacterController>();
                 if (characterController != null)
                 {
                    UnityEngine.Debug.Log("[BodyTrackingPlayer] Found FBXCharacterController automatically");
@@ -182,19 +216,38 @@ namespace BodyTracking.Playback
                 return;
             }
 
-            if (imageTargetTransform == null)
+            if (routeRootProvider == null || routeRootProvider.RouteRoot == null)
             {
-               UnityEngine.Debug.LogError("[BodyTrackingPlayer] No playback reference transform. Wait for world-map relocalization or image target lock, then try again.");
+               UnityEngine.Debug.LogError("[BodyTrackingPlayer] No RouteRoot provider. Wait for Immersal/image-target localization, then try again.");
                 return;
             }
             
-            // Map recorded reference-space points through this transform (image marker or world-map anchor).
-            currentImageTargetFrame = new CoordinateFrame(imageTargetTransform);
-            UnityEngine.Debug.Log($"[BodyTrackingPlayer] StartPlayback with reference pos={imageTargetTransform.position}, rot={imageTargetTransform.rotation.eulerAngles}, scale={imageTargetTransform.localScale}, duration={recording.duration:F2}s, frames={recording.FrameCount}");
+            // Map recorded RouteRoot-local points through the current RouteRoot pose.
+            var startRoot = routeRootProvider.RouteRoot;
+            currentReferenceFrame = new CoordinateFrame(startRoot);
+            hasReferenceFrame = true;
+            // Ghost stays hidden until the RouteRoot is localized; rendering resumes automatically.
+            waitingForLocalization = !routeRootProvider.IsLocalized;
+            UnityEngine.Debug.Log($"[BodyTrackingPlayer] StartPlayback source={routeRootProvider.Source}, localized={routeRootProvider.IsLocalized}, pos={startRoot.position}, rot={startRoot.rotation.eulerAngles}, duration={recording.duration:F2}s, frames={recording.FrameCount}");
+
+            // Frame-shift diagnostic: compare the RouteRoot world pose captured at RECORD time (stored in the
+            // recording) against the RouteRoot world pose NOW. A large delta = the anchor landed in a different
+            // place than when recorded (bad Immersal lock or cross-session variance) and is exactly the offset
+            // the played-back body will show.
+            {
+                Vector3 recPos = recording.referenceImageTargetPosition;
+                Quaternion recRot = recording.referenceImageTargetRotation;
+                float dPos = Vector3.Distance(recPos, startRoot.position);
+                float dRot = Quaternion.Angle(recRot, startRoot.rotation);
+                UnityEngine.Debug.Log($"[BodyTrackingPlayer] Frame-shift vs record-time RouteRoot: dPos={dPos:F2}m dRot={dRot:F1}deg " +
+                    $"(recorded pos={recPos} rot={recRot.eulerAngles}). If dPos/dRot are large, the body will be offset by this much.");
+            }
             
             isPlaying = true;
-            playbackStartTime = Time.time;
-            currentPlaybackTime = 0f;
+            isPaused = false;
+            float startTime = recording.GetFirstValidFrameTime();
+            currentPlaybackTime = startTime;
+            playbackStartTime = Time.time - startTime / playbackSpeed;
             HideVisualization();
             
             // Start animation playback only when FBX playback is explicitly enabled.
@@ -213,11 +266,18 @@ namespace BodyTracking.Playback
             
             OnPlaybackStarted?.Invoke();
 
-            // Draw the first recorded skeleton immediately instead of waiting for the next frame.
-            var firstFrame = recording.GetFrameAtTime(0f);
-            if (firstFrame.IsValid)
+            // Draw the first valid recorded skeleton immediately (unless we are waiting for localization).
+            if (!waitingForLocalization)
             {
-                UpdatePlaybackFrame(firstFrame);
+                var firstFrame = recording.GetFrameAtTime(startTime);
+                if (firstFrame.IsValid)
+                {
+                    UpdatePlaybackFrame(firstFrame);
+                }
+            }
+            else
+            {
+                HideRecordedSkeleton();
             }
         }
 
@@ -229,6 +289,7 @@ namespace BodyTracking.Playback
             if (!isPlaying) return;
             
             isPlaying = false;
+            isPaused = false;
             
             if (showVisualization)
             {
@@ -245,6 +306,26 @@ namespace BodyTracking.Playback
             }
             
             OnPlaybackStopped?.Invoke();
+        }
+
+        /// <summary>
+        /// Pause playback in place (freezes the timeline without resetting it).
+        /// </summary>
+        public void PausePlayback()
+        {
+            if (!isPlaying || isPaused) return;
+            isPaused = true;
+        }
+
+        /// <summary>
+        /// Resume playback from where it was paused.
+        /// </summary>
+        public void ResumePlayback()
+        {
+            if (!isPlaying || !isPaused) return;
+            isPaused = false;
+            // Re-anchor the clock so the timeline continues from the paused position.
+            playbackStartTime = Time.time - currentPlaybackTime / playbackSpeed;
         }
 
         /// <summary>
@@ -265,6 +346,41 @@ namespace BodyTracking.Playback
         void Update()
         {
             if (!isPlaying || recording == null) return;
+
+            // Gate the ghost on localization: hide it (but keep the timeline advancing) until the
+            // RouteRoot reports a usable, wall-aligned pose. When localization returns, rendering resumes.
+            bool localized = routeRootProvider == null || routeRootProvider.IsLocalized;
+            if (!localized)
+            {
+                if (!waitingForLocalization)
+                {
+                    waitingForLocalization = true;
+                    HideRecordedSkeleton();
+                    if (hipSphere != null) hipSphere.SetActive(false);
+                }
+            }
+            else
+            {
+                waitingForLocalization = false;
+            }
+
+            // Track the live RouteRoot pose each frame (Immersal scene updates / image target follow).
+            // Raw: snap directly to the live frame every frame (no smoothing).
+            if (routeRootProvider != null && routeRootProvider.RouteRoot != null)
+            {
+                currentReferenceFrame = new CoordinateFrame(routeRootProvider.RouteRoot);
+                hasReferenceFrame = true;
+            }
+
+            // While paused, keep the skeleton anchored at the frozen frame (so it stays aligned if the phone
+            // moves) but do not advance the timeline.
+            if (isPaused)
+            {
+                var pausedFrame = recording.GetFrameAtTime(currentPlaybackTime);
+                if (pausedFrame.IsValid && !waitingForLocalization)
+                    UpdatePlaybackFrame(pausedFrame);
+                return;
+            }
             
             // Update playback time
             float elapsedTime = (Time.time - playbackStartTime) * playbackSpeed;
@@ -295,7 +411,7 @@ namespace BodyTracking.Playback
             // Get current frame
             var currentFrame = recording.GetFrameAtTime(currentPlaybackTime);
             
-            if (currentFrame.IsValid)
+            if (currentFrame.IsValid && !waitingForLocalization)
             {
                 UpdatePlaybackFrame(currentFrame);
             }
@@ -318,9 +434,9 @@ namespace BodyTracking.Playback
             var renderer = hipSphere.GetComponent<Renderer>();
             if (renderer != null)
             {
-                var material = new Material(Shader.Find("Unlit/Color"));
-                material.color = Color.blue;
-                renderer.material = material;
+                var material = DebugVisualizationMaterials.CreateSolidColorMaterial(Color.blue);
+                if (material != null)
+                    renderer.material = material;
             }
             
             // Remove collider
@@ -337,7 +453,7 @@ namespace BodyTracking.Playback
                 var pathLineObject = new GameObject("HipPathLine");
                 pathLine = pathLineObject.AddComponent<LineRenderer>();
                 
-                pathLine.material = new Material(Shader.Find("Sprites/Default"));
+                pathLine.material = DebugVisualizationMaterials.CreateLineMaterial(Color.cyan);
                 pathLine.startColor = Color.cyan;
                 pathLine.endColor = Color.cyan;
                 pathLine.startWidth = 0.03f;
@@ -391,12 +507,12 @@ namespace BodyTracking.Playback
         }
 
         /// <summary>
-        /// Transform recorded hip position to current image target space
+        /// Transform a recorded RouteRoot-local point to current world space via the live RouteRoot frame.
         /// </summary>
         private Vector3 TransformRecordedPointToCurrentSpace(Vector3 recordedPosition)
         {
-            // Transform from recorded reference space to current world space
-            return currentImageTargetFrame.TransformPoint(recordedPosition);
+            // Transform from recorded RouteRoot-local space to current world space (math unchanged).
+            return currentReferenceFrame.TransformPoint(recordedPosition);
         }
 
         private void UpdateRecordedSkeleton(HipFrame frame)
@@ -536,20 +652,20 @@ namespace BodyTracking.Playback
             if (skeletonRoot == null)
             {
                 skeletonRoot = new GameObject("RecordedSkeletonPlayback");
+                // Parent the ghost under the RouteRoot (Immersal XR Space child) so SDK scene updates keep
+                // it aligned. Joint world positions are still set explicitly, so parenting is organizational.
+                if (routeRootProvider != null && routeRootProvider.RouteRoot != null)
+                    skeletonRoot.transform.SetParent(routeRootProvider.RouteRoot, false);
             }
 
             if (skeletonJointMaterial == null)
-            {
-                skeletonJointMaterial = new Material(Shader.Find("Unlit/Color"));
-                skeletonJointMaterial.color = skeletonJointColor;
-            }
+                skeletonJointMaterial = DebugVisualizationMaterials.CreateSolidColorMaterial(skeletonJointColor);
 
             if (skeletonBoneMaterial == null)
             {
-                skeletonBoneMaterial = new Material(Shader.Find("Sprites/Default"));
                 var c = skeletonBoneColor;
                 c.a = BoneOpacity;
-                skeletonBoneMaterial.color = c;
+                skeletonBoneMaterial = DebugVisualizationMaterials.CreateLineMaterial(c);
             }
 
             if (skeletonJointSpheres != null && skeletonJointSpheres.Length >= jointCount)

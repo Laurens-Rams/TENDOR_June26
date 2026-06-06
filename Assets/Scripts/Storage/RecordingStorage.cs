@@ -91,7 +91,7 @@ namespace BodyTracking.Storage
                 switch (format)
                 {
                     case StorageFormat.JSON:
-                        return LoadFromJSON(filePath);
+                        return LoadFromJSON(filePath, logResult: true);
                     case StorageFormat.Binary:
                         return LoadFromBinary(filePath);
                     default:
@@ -107,9 +107,10 @@ namespace BodyTracking.Storage
         }
 
         /// <summary>
-        /// Get list of available recordings
+        /// Get list of available recordings. When <paramref name="mapId"/> is set, only recordings
+        /// captured on that Immersal map (matching <see cref="HipRecording.mapId"/>) are returned.
         /// </summary>
-        public static List<string> GetAvailableRecordings(StorageFormat format = StorageFormat.JSON)
+        public static List<string> GetAvailableRecordings(StorageFormat format = StorageFormat.JSON, string mapId = null)
         {
             var recordings = new List<string>();
             
@@ -124,19 +125,53 @@ namespace BodyTracking.Storage
                 string fileName = Path.GetFileNameWithoutExtension(file);
                 if (format == StorageFormat.JSON)
                 {
-                    var recording = LoadFromJSON(file);
-                    if (recording != null && recording.IsValid)
-                    {
+                    var metadata = GetRecordingMetadata(fileName, format);
+                    if (metadata == null || metadata.validFrameCount <= 0 || metadata.frameCount <= 0 || metadata.duration <= 0f)
+                        continue;
+                    if (!string.IsNullOrEmpty(mapId) && !MapIdMatches(metadata.mapId, mapId))
+                        continue;
                         recordings.Add(fileName);
-                    }
                 }
                 else
                 {
+                    if (!string.IsNullOrEmpty(mapId))
+                        continue;
                     recordings.Add(fileName);
                 }
             }
             
             return recordings;
+        }
+
+        /// <summary>Most recent valid recording for the given map id, or null if none.</summary>
+        public static string GetLatestRecordingForMap(string mapId, StorageFormat format = StorageFormat.JSON)
+        {
+            if (string.IsNullOrEmpty(mapId))
+                return null;
+
+            var recordings = GetAvailableRecordings(format, mapId);
+            if (recordings.Count == 0)
+                return null;
+
+            string bestFile = null;
+            DateTime bestTimestamp = DateTime.MinValue;
+
+            foreach (var fileName in recordings)
+            {
+                var metadata = GetRecordingMetadata(fileName, format);
+                if (metadata != null && metadata.recordingTimestamp > bestTimestamp)
+                {
+                    bestTimestamp = metadata.recordingTimestamp;
+                    bestFile = fileName;
+                }
+            }
+
+            return bestFile ?? recordings[recordings.Count - 1];
+        }
+
+        private static bool MapIdMatches(string recordingMapId, string filterMapId)
+        {
+            return string.Equals(recordingMapId?.Trim(), filterMapId?.Trim(), StringComparison.Ordinal);
         }
 
         /// <summary>
@@ -197,7 +232,9 @@ namespace BodyTracking.Storage
                         frameRate = recording.frameRate,
                         recordingTimestamp = recording.recordingTimestamp,
                         fileSizeBytes = fileInfo.Length,
-                        format = format
+                        format = format,
+                        mapId = recording.mapId ?? "",
+                        spatialSource = recording.spatialSource ?? ""
                     };
                 }
                 
@@ -248,7 +285,7 @@ namespace BodyTracking.Storage
             string json = JsonUtility.ToJson(recording, true);
             File.WriteAllText(filePath, json);
             
-           UnityEngine.Debug.Log($"[RecordingStorage] Saved hip recording as JSON: {filePath} ({new FileInfo(filePath).Length} bytes)");
+           UnityEngine.Debug.Log($"[RecordingStorage] Saved {Path.GetFileName(filePath)} ({recording.ValidFrameCount}/{recording.FrameCount} valid frames)");
             return true;
         }
 
@@ -260,13 +297,18 @@ namespace BodyTracking.Storage
             return SaveAsJSON(recording, filePath.Replace(BINARY_EXTENSION, FILE_EXTENSION));
         }
 
-        private static HipRecording LoadFromJSON(string filePath)
+        private static HipRecording LoadFromJSON(string filePath, bool logResult = false)
         {
             string json = File.ReadAllText(filePath);
             var recording = JsonUtility.FromJson<HipRecording>(json);
             recording?.NormalizeFormatAfterLoad();
-            
-           UnityEngine.Debug.Log($"[RecordingStorage] Loaded hip recording from JSON: {recording.FrameCount} frames, {recording.duration:F2}s");
+
+            if (logResult && recording != null)
+            {
+                UnityEngine.Debug.Log(
+                    $"[RecordingStorage] Loaded {Path.GetFileName(filePath)}: {recording.ValidFrameCount}/{recording.FrameCount} valid, {recording.duration:F2}s");
+            }
+
             return recording;
         }
 
@@ -295,6 +337,8 @@ namespace BodyTracking.Storage
         public DateTime recordingTimestamp;
         public long fileSizeBytes;
         public RecordingStorage.StorageFormat format;
+        public string mapId;
+        public string spatialSource;
         
         public string FormattedFileSize
         {

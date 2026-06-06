@@ -1,5 +1,4 @@
-#if UNITY_IOS && UNITY_2017_1_OR_NEWER
-using System.Collections.Generic;
+#if UNITY_EDITOR
 using System.IO;
 using System.Text.RegularExpressions;
 using UnityEngine;
@@ -16,20 +15,12 @@ namespace RenderHeads.Media.AVProMovieCapture.Editor
 {
 	public class PostProcessBuild_iOS
 	{
-		/// <summary>
-		/// Unity exports native plugins under various <c>Libraries/</c> or <c>Frameworks/</c> paths depending on
-		/// Unity version and where the asset lives under <c>Assets/</c>. The stock AVPro script only checked the
-		/// old default path under <c>Plugins/RenderHeads/...</c>, which breaks when the package is under e.g.
-		/// <c>Assets/3rdParty/AVProMovieCapture/...</c> — the framework never gets embedded and iOS fails at
-		/// launch with: Library not loaded: @rpath/AVProMovieCapture.framework/AVProMovieCapture.
-		/// </summary>
-		static string FindAvproMovieCaptureFrameworkGuid(PBXProject project, string projectPath)
+		static string FindAvproMovieCaptureFrameworkGuid(PBXProject project, string buildPath, string projectPath)
 		{
 			var candidates = new[]
 			{
-				// Original RenderHeads default install path
 				"Frameworks/Plugins/RenderHeads/AVProMovieCapture/Runtime/Plugins/iOS/AVProMovieCapture.framework",
-				// Typical Unity export when plugin lives under Assets/.../Runtime/Plugins/iOS
+				"Frameworks/3rdParty/AVProMovieCapture/Runtime/Plugins/iOS/AVProMovieCapture.framework",
 				"Libraries/3rdParty/AVProMovieCapture/Runtime/Plugins/iOS/AVProMovieCapture.framework",
 				"Libraries/AVProMovieCapture/Runtime/Plugins/iOS/AVProMovieCapture.framework",
 				"Libraries/Plugins/iOS/AVProMovieCapture.framework",
@@ -45,23 +36,54 @@ namespace RenderHeads.Media.AVProMovieCapture.Editor
 					return guid;
 			}
 
-			// Last resort: parse PBXFileReference line for AVProMovieCapture.framework (Unity path string varies).
+			// Match exported folder on disk to a project path (Unity 2022+ path strings vary).
+			if (Directory.Exists(buildPath))
+			{
+				foreach (var dir in Directory.GetDirectories(buildPath, "AVProMovieCapture.framework", SearchOption.AllDirectories))
+				{
+					var rel = dir.Substring(buildPath.Length).TrimStart('/', '\\').Replace('\\', '/');
+					var guid = project.FindFileGuidByProjectPath(rel);
+					if (!string.IsNullOrEmpty(guid))
+						return guid;
+				}
+			}
+
 			var text = File.ReadAllText(projectPath);
-			var m = Regex.Match(
+
+			var named = Regex.Match(
 				text,
-				@"^([0-9A-Fa-f]{24}) /\* AVProMovieCapture\.framework \*/ = \{isa = PBXFileReference;",
+				@"^([0-9A-Fa-f]{24}) /\* [^*]*AVProMovieCapture\.framework[^*]* \*/ = \{isa = PBXFileReference;",
 				RegexOptions.Multiline);
-			return m.Success ? m.Groups[1].Value : null;
+			if (named.Success)
+				return named.Groups[1].Value;
+
+			// Any PBXFileReference block whose path mentions AVProMovieCapture.framework.
+			foreach (Match block in Regex.Matches(
+				text,
+				@"^([0-9A-Fa-f]{24}) /\* .+? \*/ = \{isa = PBXFileReference;.*?path = (?:""?)?([^;""]+?)(?:""?)?;.*?\};",
+				RegexOptions.Multiline | RegexOptions.Singleline))
+			{
+				if (block.Groups[2].Value.Contains("AVProMovieCapture.framework"))
+					return block.Groups[1].Value;
+			}
+
+			return null;
 		}
 
-		[PostProcessBuild]
+		[PostProcessBuild(999)]
 		public static void ModifyProject(BuildTarget buildTarget, string path)
 		{
 			if (buildTarget != BuildTarget.iOS)
 				return;
 
-			string projectPath = path + "/Unity-iPhone.xcodeproj/project.pbxproj";
-			PBXProject project = new PBXProject();
+			string projectPath = Path.Combine(path, "Unity-iPhone.xcodeproj/project.pbxproj");
+			if (!File.Exists(projectPath))
+			{
+				Debug.LogWarning("[AVProMovieCapture] Xcode project not found; skipping framework embed.");
+				return;
+			}
+
+			var project = new PBXProject();
 			project.ReadFromFile(projectPath);
 
 #if UNITY_2019_3_OR_NEWER
@@ -71,25 +93,32 @@ namespace RenderHeads.Media.AVProMovieCapture.Editor
 			string targetGuid = project.TargetGuidByName(PBXProject.GetUnityTargetName());
 			string unityFrameworkTargetGuid = null;
 #endif
-			string fileGuid = FindAvproMovieCaptureFrameworkGuid(project, projectPath);
-			if (!string.IsNullOrEmpty(fileGuid))
+
+			string fileGuid = FindAvproMovieCaptureFrameworkGuid(project, path, projectPath);
+			if (string.IsNullOrEmpty(fileGuid))
 			{
-				PBXProjectExtensions.AddFileToEmbedFrameworks(project, targetGuid, fileGuid);
+				Debug.LogError(
+					"[AVProMovieCapture] Could not find AVProMovieCapture.framework in the Xcode project. " +
+					"The app will crash on launch. Rebuild from Unity, or in Xcode set AVProMovieCapture.framework to Embed & Sign.");
+				return;
+			}
+
 #if UNITY_2019_3_OR_NEWER
-				// UnityFramework loads this dylib; ensure runpath can resolve sibling frameworks in the app bundle.
-				if (!string.IsNullOrEmpty(unityFrameworkTargetGuid))
-				{
-					const string runpaths = "$(inherited) @executable_path/Frameworks @loader_path/Frameworks";
-					project.SetBuildProperty(unityFrameworkTargetGuid, "LD_RUNPATH_SEARCH_PATHS", runpaths);
-				}
+			if (!string.IsNullOrEmpty(unityFrameworkTargetGuid))
+				project.AddFileToBuild(unityFrameworkTargetGuid, fileGuid);
 #endif
-			}
-			else
-			{
-				Debug.LogWarning("Failed to find AVProMovieCapture.framework in the generated Xcode project. Embed AVProMovieCapture.framework manually (Embed & Sign), or fix PostProcessBuild_iOS path detection.");
-			}
-			project.SetBuildProperty(targetGuid, "LD_RUNPATH_SEARCH_PATHS", "$(inherited) @executable_path/Frameworks");
+
+				PBXProjectExtensions.AddFileToEmbedFrameworks(project, targetGuid, fileGuid);
+
+			const string runpaths = "$(inherited) @executable_path/Frameworks @loader_path/Frameworks";
+			project.SetBuildProperty(targetGuid, "LD_RUNPATH_SEARCH_PATHS", runpaths);
+#if UNITY_2019_3_OR_NEWER
+				if (!string.IsNullOrEmpty(unityFrameworkTargetGuid))
+					project.SetBuildProperty(unityFrameworkTargetGuid, "LD_RUNPATH_SEARCH_PATHS", runpaths);
+#endif
+
 			project.WriteToFile(projectPath);
+			Debug.Log("[AVProMovieCapture] Embedded AVProMovieCapture.framework for iOS (Embed & Sign).");
 		}
 
 		[PostProcessBuild]
@@ -114,9 +143,7 @@ namespace RenderHeads.Media.AVProMovieCapture.Editor
 
 			PlistElementDict rootDict = plist.root;
 
-			// Enable file sharing so that files can be pulled off of the device with iTunes
 			rootDict.SetBoolean("UIFileSharingEnabled", true);
-			// Enable this so that the files app can access the captured movies
 			rootDict.SetBoolean("LSSupportsOpeningDocumentsInPlace", true);
 
 			SerializedObject settings = Settings.GetSerializedSettings();
@@ -143,4 +170,4 @@ namespace RenderHeads.Media.AVProMovieCapture.Editor
 		}
 	}
 }
-#endif // UNITY_IOS && UNITY_2017_1_OR_NEWER
+#endif // UNITY_EDITOR

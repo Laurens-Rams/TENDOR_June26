@@ -390,35 +390,64 @@ namespace BodyTracking.Spatial
             bool manual = manualRealignRequested;
             manualRealignRequested = false;
 
-            if (!manual)
+            // Manual re-align always applies (no size band, any mode) so you can deliberately re-sync.
+            if (manual)
             {
-                if (!autoRealign || SuppressAutoRealign || !confidentlyLocalized)
-                    return;
-                if (Time.time - lastRealignTime < autoRealignMinIntervalSeconds)
-                    return;
+                Pose mtarget = GetImmersalTargetPose();
+                BeginRealign(mtarget);
+                averagedPose = mtarget;
+                hasAveragedPose = true;
+                Debug.Log("[ImmersalRouteRootProvider] Manual re-align applied.");
+                return;
             }
+
+            // Mode-gated automatic behaviour. FreezeOnly never moves on its own.
+            if (stabilityMode == AnchorStabilityMode.FreezeOnly)
+                return;
+            if (SuppressAutoRealign || !confidentlyLocalized)
+                return;
 
             Pose target = GetImmersalTargetPose();
             Pose current = new Pose(routeRootObject.transform.position, routeRootObject.transform.rotation);
             float dPos = Vector3.Distance(current.position, target.position);
             float dRot = Quaternion.Angle(current.rotation, target.rotation);
 
-            if (manual)
-            {
-                // Manual re-align always applies (no size band) so you can deliberately re-sync.
-                BeginRealign(target);
-                Debug.Log($"[ImmersalRouteRootProvider] Manual re-align: dPos={dPos:F3}m dRot={dRot:F1}deg.");
-                return;
-            }
-
-            // Auto re-align only for meaningful-but-not-wild corrections.
-            if (dPos < autoRealignMinCorrectionMeters && dRot < 1f)
-                return;
+            // Reject wild fixes (bad localization / moved to a new area) in every auto mode.
             if (dPos > autoRealignMaxCorrectionMeters || dRot > autoRealignMaxCorrectionDegrees)
                 return;
 
+            if (stabilityMode == AnchorStabilityMode.SlowConvergeAverage)
+            {
+                // Maintain a running average of Immersal fixes and ease the anchor toward it. No interval gating,
+                // no hard band — the slow easing makes corrections imperceptible while alignment keeps improving.
+                float w = Mathf.Clamp01(convergeSampleWeight);
+                if (!hasAveragedPose)
+                {
+                    averagedPose = target;
+                    hasAveragedPose = true;
+                }
+                else
+                {
+                    averagedPose.position = Vector3.Lerp(averagedPose.position, target.position, w);
+                    averagedPose.rotation = Quaternion.Slerp(averagedPose.rotation, target.rotation, w);
+                }
+
+                float k = Mathf.Clamp01(convergeRatePerSecond * Time.deltaTime);
+                Vector3 p = Vector3.Lerp(current.position, averagedPose.position, k);
+                Quaternion r = Quaternion.Slerp(current.rotation, averagedPose.rotation, k);
+                SetRouteRootWorld(new Pose(p, r));
+                return;
+            }
+
+            // ContinuousRealign: original behaviour — periodic, meaningful-but-not-wild corrections, blended.
+            if (!autoRealign)
+                return;
+            if (Time.time - lastRealignTime < autoRealignMinIntervalSeconds)
+                return;
+            if (dPos < autoRealignMinCorrectionMeters && dRot < 1f)
+                return;
+
             BeginRealign(target);
-            Debug.Log($"[ImmersalRouteRootProvider] Auto re-align: dPos={dPos:F3}m dRot={dRot:F1}deg.");
         }
 
         private void BeginRealign(Pose target)

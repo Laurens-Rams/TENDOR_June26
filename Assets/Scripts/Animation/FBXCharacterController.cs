@@ -1,5 +1,6 @@
 using UnityEngine;
 using BodyTracking.Data;
+using BodyTracking.Utils;
 using System.Collections.Generic;
 
 namespace BodyTracking.Animation
@@ -25,6 +26,8 @@ namespace BodyTracking.Animation
         
         [Header("Debug")]
         [SerializeField] private bool enableLogging = true;
+        [Tooltip("When off, the character model is NOT spawned/initialized automatically on Start (skeleton-only mode). Initialize() can still be called explicitly.")]
+        [SerializeField] private bool spawnCharacterOnStart = false;
         
         [Header("Animation Management")]
         [SerializeField] private AnimatorOverrideController animatorOverrideController;
@@ -57,7 +60,14 @@ namespace BodyTracking.Animation
 
         void Start()
         {
-            Initialize();
+            if (spawnCharacterOnStart)
+            {
+                Initialize();
+            }
+            else if (enableLogging)
+            {
+                Debug.Log("[FBXCharacterController] spawnCharacterOnStart is off - skeleton-only mode, character model not spawned.");
+            }
         }
 
         /// <summary>
@@ -209,7 +219,7 @@ namespace BodyTracking.Animation
                 Debug.Log($"[FBXCharacterController] Character '{characterRoot.name}' at {characterRoot.transform.position:F3}");
                 
                 // Check if character is visible to camera
-                Camera arCamera = Camera.main ?? FindObjectOfType<Camera>();
+                Camera arCamera = Camera.main ?? FindFirstObjectByType<Camera>();
                 if (arCamera != null)
                 {
                     Vector3 relativePos = arCamera.transform.InverseTransformPoint(characterRoot.transform.position);
@@ -452,8 +462,8 @@ namespace BodyTracking.Animation
             var renderer = debugSphere.GetComponent<Renderer>();
             if (renderer != null)
             {
-                var material = new Material(Shader.Find("Unlit/Color"));
-                material.color = Color.yellow;
+                var material = DebugVisualizationMaterials.CreateSolidColorMaterial(Color.yellow);
+                if (material != null)
                 renderer.material = material;
             }
             
@@ -559,7 +569,7 @@ namespace BodyTracking.Animation
         [System.Diagnostics.Conditional("UNITY_EDITOR")]
         public static void MakeNewBodyVisible()
         {
-            FBXCharacterController controller = FindObjectOfType<FBXCharacterController>();
+            FBXCharacterController controller = FindFirstObjectByType<FBXCharacterController>();
             if (controller != null)
             {
                 // Re-initialize to ensure character is properly instantiated
@@ -585,7 +595,7 @@ namespace BodyTracking.Animation
         [System.Diagnostics.Conditional("UNITY_EDITOR")]
         public static void LoadAnimationFromPath(string fbxPath, string animationName = "IMG_36822")
         {
-            FBXCharacterController controller = FindObjectOfType<FBXCharacterController>();
+            FBXCharacterController controller = FindFirstObjectByType<FBXCharacterController>();
             if (controller != null)
             {
                 bool success = controller.LoadAnimationFromFBX(fbxPath, animationName);
@@ -610,7 +620,7 @@ namespace BodyTracking.Animation
         [System.Diagnostics.Conditional("UNITY_EDITOR")]
         public static void SetHipBoneByName(string boneName)
         {
-            FBXCharacterController controller = FindObjectOfType<FBXCharacterController>();
+            FBXCharacterController controller = FindFirstObjectByType<FBXCharacterController>();
             if (controller != null)
             {
                 Transform bone = controller.FindChildRecursive(controller.characterRoot.transform, boneName);
@@ -640,7 +650,7 @@ namespace BodyTracking.Animation
             Debug.Log("[FBXCharacterController] Making character visible for testing...");
             
             // Position in front of camera
-            Camera arCamera = Camera.main ?? FindObjectOfType<Camera>();
+            Camera arCamera = Camera.main ?? FindFirstObjectByType<Camera>();
             if (arCamera != null)
             {
                 Vector3 frontPos = arCamera.transform.position + arCamera.transform.forward * 2.0f;
@@ -761,7 +771,7 @@ namespace BodyTracking.Animation
         [System.Diagnostics.Conditional("UNITY_EDITOR")]
         public static void TestAnimationPlayback()
         {
-            FBXCharacterController controller = FindObjectOfType<FBXCharacterController>();
+            FBXCharacterController controller = FindFirstObjectByType<FBXCharacterController>();
             if (controller != null)
             {
                 Debug.Log("[FBXCharacterController] === MANUAL ANIMATION TEST ===");
@@ -787,7 +797,7 @@ namespace BodyTracking.Animation
         [System.Diagnostics.Conditional("UNITY_EDITOR")]
         public static void CheckAnimatorStatus()
         {
-            FBXCharacterController controller = FindObjectOfType<FBXCharacterController>();
+            FBXCharacterController controller = FindFirstObjectByType<FBXCharacterController>();
             if (controller != null && controller.characterAnimator != null)
             {
                 var animator = controller.characterAnimator;
@@ -827,7 +837,7 @@ namespace BodyTracking.Animation
         public static void FindRuntimeCharacter()
         {
             #if UNITY_EDITOR
-            FBXCharacterController controller = FindObjectOfType<FBXCharacterController>();
+            FBXCharacterController controller = FindFirstObjectByType<FBXCharacterController>();
             if (controller != null && controller.characterRoot != null)
             {
                 Debug.Log($"[FBXCharacterController] === RUNTIME CHARACTER FOUND ===");
@@ -868,7 +878,7 @@ namespace BodyTracking.Animation
         [System.Diagnostics.Conditional("UNITY_EDITOR")]
         public static void MakeCharacterVisible()
         {
-            FBXCharacterController controller = FindObjectOfType<FBXCharacterController>();
+            FBXCharacterController controller = FindFirstObjectByType<FBXCharacterController>();
             if (controller != null)
             {
                 controller.MakeCharacterVisibleForTesting();
@@ -893,7 +903,7 @@ namespace BodyTracking.Animation
         [System.Diagnostics.Conditional("UNITY_EDITOR")]
         public static void ForceReloadAnimationFromNewAnimationFBX()
         {
-            FBXCharacterController controller = FindObjectOfType<FBXCharacterController>();
+            FBXCharacterController controller = FindFirstObjectByType<FBXCharacterController>();
             if (controller != null)
             {
                 Debug.Log("[FBXCharacterController] === FORCE RELOADING ANIMATION ===");

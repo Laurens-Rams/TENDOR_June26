@@ -63,12 +63,17 @@ namespace BodyTracking.Editor
                 CreateBodyTrackingSystem();
             }
 
+            if (GUILayout.Button("Setup Move AI Fusion + Video Capture"))
+            {
+                MoveAIFusionSceneSetup.SetupScene(showDialog: true);
+            }
+
             EditorGUILayout.EndScrollView();
         }
 
         private void ValidateComponent<T>(string componentName) where T : Component
         {
-            T component = Object.FindObjectOfType<T>();
+            T component = Object.FindFirstObjectByType<T>();
             if (component != null)
             {
                 EditorGUILayout.BeginHorizontal();
@@ -89,7 +94,7 @@ namespace BodyTracking.Editor
 
         private void ValidateUISetup()
         {
-            var ui = Object.FindObjectOfType<BodyTrackingUI>();
+            var ui = Object.FindFirstObjectByType<BodyTrackingUI>();
             if (ui == null)
             {
                 EditorGUILayout.LabelField("❌ BodyTrackingUI script not found");
@@ -123,7 +128,7 @@ namespace BodyTracking.Editor
         private void AutoFixMissingComponents()
         {
             // Find or create XR Origin
-            var xrOrigin = Object.FindObjectOfType<XROrigin>();
+            var xrOrigin = Object.FindFirstObjectByType<XROrigin>();
             if (xrOrigin == null)
             {
                 Debug.LogError("XR Origin not found. Please add AR Foundation XR Origin prefab to scene.");
@@ -137,6 +142,8 @@ namespace BodyTracking.Editor
                 Debug.Log("Added ARHumanBodyManager to XR Origin");
             }
 
+            EnsureArCameraManager(xrOrigin);
+
             if (xrOrigin.GetComponent<ARTrackedImageManager>() == null)
             {
                 xrOrigin.gameObject.AddComponent<ARTrackedImageManager>();
@@ -144,7 +151,7 @@ namespace BodyTracking.Editor
             }
 
             // Find or create AR Session
-            if (Object.FindObjectOfType<ARSession>() == null)
+            if (Object.FindFirstObjectByType<ARSession>() == null)
             {
                 var sessionGO = new GameObject("AR Session");
                 sessionGO.AddComponent<ARSession>();
@@ -154,10 +161,28 @@ namespace BodyTracking.Editor
             Debug.Log("Auto-fix completed. Please manually configure component references.");
         }
 
+        static void EnsureArCameraManager(XROrigin xrOrigin)
+        {
+            if (Object.FindAnyObjectByType<ARCameraManager>() != null)
+                return;
+
+            Camera cam = xrOrigin.Camera;
+            if (cam == null)
+                cam = xrOrigin.GetComponentInChildren<Camera>(true);
+            if (cam == null)
+            {
+                Debug.LogWarning("Auto-fix: no Camera under XR Origin — cannot add ARCameraManager.");
+                return;
+            }
+
+            cam.gameObject.AddComponent<ARCameraManager>();
+            Debug.Log($"Added ARCameraManager to '{cam.gameObject.name}'");
+        }
+
         private void CreateBodyTrackingSystem()
         {
             // Check if already exists
-            if (Object.FindObjectOfType<BodyTrackingController>() != null)
+            if (Object.FindFirstObjectByType<BodyTrackingController>() != null)
             {
                 Debug.LogWarning("BodyTrackingController already exists in scene");
                 return;
@@ -173,7 +198,7 @@ namespace BodyTracking.Editor
             var player = systemGO.AddComponent<BodyTracking.Playback.BodyTrackingPlayer>();
 
             // Try to auto-connect references
-            var xrOrigin = Object.FindObjectOfType<XROrigin>();
+            var xrOrigin = Object.FindFirstObjectByType<XROrigin>();
             if (xrOrigin != null)
             {
                 var humanBodyManager = xrOrigin.GetComponent<ARHumanBodyManager>();

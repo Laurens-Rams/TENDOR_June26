@@ -18,7 +18,7 @@ namespace BodyTracking.EditorTools
         Vector2 scroll;
         string lastLog = "";
 
-        [MenuItem("TENDOR/Characters/Setup Character FBX...", priority = 0)]
+        // Menu entry lives in CharacterMaterialFixer (TENDOR/Characters/Setup Character FBX...), which calls Open().
         public static void Open()
         {
             var window = GetWindow<CharacterFbxSetupWindow>("Character FBX Setup");

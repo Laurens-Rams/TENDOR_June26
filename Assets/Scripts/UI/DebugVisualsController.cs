@@ -2,7 +2,6 @@ using UnityEngine;
 using UnityEngine.XR.ARFoundation;
 using BodyTracking.Recording;
 using BodyTracking.Playback;
-using BodyTracking.AI;
 using Immersal.XR;
 using TENDOR.AR;
 
@@ -11,8 +10,8 @@ namespace BodyTracking.UI
     /// <summary>
     /// One switch for a clean presentation view. Hides every developer/debug visual — the AR Foundation plane
     /// detection visuals (dots/mesh on surfaces), the Immersal area-mapping point cloud (dots), the live recording
-    /// skeleton, the recorded playback "ghost" skeleton, the Move AI compare overlay, the BlazePose validation
-    /// overlays, and the tracked-image debug quad — so only the playback UI and the final 3D character remain.
+    /// skeleton, the recorded playback "ghost" skeleton, the Move AI compare overlay, and the tracked-image debug
+    /// quad — so only the playback UI and the final 3D character remain.
     /// Fully reversible at runtime.
     /// </summary>
     public class DebugVisualsController : MonoBehaviour
@@ -66,30 +65,9 @@ namespace BodyTracking.UI
             foreach (var cmp in FindObjectsByType<PlaybackCompareVisualizer>(FindObjectsInactive.Include, FindObjectsSortMode.None))
                 cmp.SetSuppressed(!visible);
 
-            // BlazePose validation overlays: disabling the component stops updates; deactivating the spawned
-            // root also hides any dots already drawn (disabling alone leaves them frozen on screen).
-            foreach (var overlay in FindObjectsByType<BlazePose2DOverlay>(FindObjectsInactive.Include, FindObjectsSortMode.None))
-            {
-                overlay.enabled = visible;
-                SetChildActive(overlay.transform, "BlazePoseOverlayCanvas", visible);
-            }
-            foreach (var vis in FindObjectsByType<BlazePose3DVisualizer>(FindObjectsInactive.Include, FindObjectsSortMode.None))
-            {
-                vis.enabled = visible;
-                SetChildActive(vis.transform, "BlazePose3D", visible);
-            }
-
             // Tracked-image debug quad (translucent rectangle on the marker). Disabling destroys its quads.
             foreach (var quad in FindObjectsByType<ARTrackedImageDebugQuad>(FindObjectsInactive.Include, FindObjectsSortMode.None))
                 quad.enabled = visible;
-        }
-
-        private static void SetChildActive(Transform parent, string childName, bool active)
-        {
-            if (parent == null) return;
-            var child = parent.Find(childName);
-            if (child != null)
-                child.gameObject.SetActive(active);
         }
     }
 }

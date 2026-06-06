@@ -51,7 +51,7 @@ namespace BodyTracking.Animation
             CollectCharacters();
 
             if (fusedPlayer == null)
-                fusedPlayer = FindObjectOfType<FusedCharacterPlayer>(true);
+                fusedPlayer = FindFirstObjectByType<FusedCharacterPlayer>(FindObjectsInactive.Include);
 
             if (characters.Count == 0)
             {

@@ -208,7 +208,7 @@ public class VideoRecorder : MonoBehaviour
         if (Globals.CameraManager != null)
             cameraManager = Globals.CameraManager;
         else
-            cameraManager = FindObjectOfType<ARCameraManager>();
+            cameraManager = FindFirstObjectByType<ARCameraManager>();
         return cameraManager;
     }
 

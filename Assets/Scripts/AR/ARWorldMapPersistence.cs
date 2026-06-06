@@ -35,7 +35,8 @@ namespace BodyTracking.AR
         const string ManifestSuffix = "_manifest.json";
 
         [SerializeField] ARSession arSession;
-        [SerializeField] float relocalizationWarmupSeconds = 2.0f;
+        [SerializeField] float relocalizationWarmupSeconds = 1.0f;
+        [SerializeField] float maxRelocalizationSeconds = 15f;
 
         GameObject worldMapPlaybackAnchor;
 
@@ -194,8 +195,23 @@ namespace BodyTracking.AR
                 yield return null;
             }
 
-            IsRelocalized = true;
-            SucceedLoad($"WorldMap relocalization window completed for '{recordingId}'");
+            elapsed = 0f;
+            while (elapsed < maxRelocalizationSeconds)
+            {
+                var mappingStatus = sessionSubsystem.worldMappingStatus;
+                if (mappingStatus == ARWorldMappingStatus.Mapped)
+                {
+                    IsRelocalized = true;
+                    SucceedLoad($"WorldMap relocalized for '{recordingId}' ({mappingStatus})");
+                    yield break;
+                }
+
+                elapsed += Time.deltaTime;
+                yield return null;
+            }
+
+            IsRelocalized = false;
+            Fail($"WorldMap relocalization timed out for '{recordingId}' (last status: {sessionSubsystem.worldMappingStatus})");
 #else
             yield break;
 #endif
