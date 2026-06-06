@@ -34,11 +34,25 @@ namespace BodyTracking.Playback
         [Tooltip("Lateral offset in RouteRoot-local space (used for side-by-side compare with ARKit).")]
         [SerializeField] private Vector3 routeRootLocalOffset = Vector3.zero;
 
+        /// <summary>How the single uniform character scale is chosen.</summary>
+        public enum HeightFitMode
+        {
+            // Fit the character's RENDERED height — the crown of the mesh (hair included) down to the soles — to
+            // the recorded climber height. The orange/cyan skeletons only reach the Head JOINT (well below the
+            // crown) and the toe JOINT (above the sole), so this stops the visible mesh overshooting top/bottom.
+            RenderedMeshHeight,
+            // Fit the foot->head BONE-CHAIN (joint to joint) to the skeleton. Lands the character's joints on the
+            // orange joints, but lets the mesh crown/soles stick out past the skeleton (character looks taller).
+            BoneChain,
+        }
+
         [Header("Fit")]
-        [Tooltip("Optional fine-tune multiplier on the auto-computed height scale. The auto scale matches the " +
-                 "FBX's foot->head bone-chain length to the orange skeleton's, so with roughly-matched " +
-                 "proportions the head and feet already land on the orange joints. Leave at 1 unless you want to " +
-                 "trim slightly (e.g. the rendered mesh reaches a hair past the joints). Live-adjustable in play mode.")]
+        [Tooltip("How the one uniform character scale is chosen. RenderedMeshHeight (default) matches the visible " +
+                 "mesh — hair/crown down to the soles — to the recorded climber height, so the character stops " +
+                 "looking too tall. BoneChain matches joint-to-joint and lets the mesh overshoot the skeleton.")]
+        [SerializeField] private HeightFitMode heightFitMode = HeightFitMode.RenderedMeshHeight;
+        [Tooltip("Optional fine-tune multiplier on the auto-computed height scale. Leave at 1 for an exact fit; " +
+                 "nudge down/up if the mesh still reads slightly large/small. Live-adjustable in play mode.")]
         [SerializeField, Range(0.5f, 1.5f)] private float skeletonFitScale = 1f;
         private float lastAppliedFitScale = float.NaN;
 
@@ -535,6 +549,28 @@ namespace BodyTracking.Playback
 
             float currentScale = Mathf.Max(0.01f, (characterRoot.localScale.x + characterRoot.localScale.y + characterRoot.localScale.z) / 3f);
 
+            // Preferred (default): match the character's RENDERED height — the crown of the mesh (hair included)
+            // down to the soles — to the recorded climber's height. The orange/cyan skeletons only reach the Head
+            // JOINT (well below the crown) and the toe JOINT (above the sole), so a joint-to-joint chain fit leaves
+            // the mesh overshooting top and bottom and the character looks too tall. Fitting the mesh extent makes
+            // the visible character sit inside the skeleton instead. Hips stay pinned every frame in OrientAndPlaceRoot.
+            if (heightFitMode == HeightFitMode.RenderedMeshHeight)
+            {
+                float meshTarget = recordingHeightMeters;
+                if (meshTarget <= 0.1f)
+                    meshTarget = EstimatePoseHeight(asset?.pose) * Mathf.Max(0.01f, asset?.scale ?? 1f);
+
+                if (meshTarget > 0.1f && TryEstimateCharacterMeshHeight(out float meshHeight) && meshHeight > 0.1f)
+                {
+                    float meshScale = Mathf.Max(0.01f, currentScale * meshTarget / meshHeight * fit);
+                    characterRoot.localScale = Vector3.one * meshScale;
+                    Debug.Log($"[FusedCharacterPlayer] Character mesh-height fit scale={meshScale:F3} " +
+                              $"(climber {meshTarget:F2}m / mesh crown-to-sole {meshHeight:F2}m, fit={fit:F2})");
+                    return;
+                }
+                // Mesh bounds couldn't be measured — fall through to the bone-chain / extent estimate below.
+            }
+
             // Preferred fit: match the FBX's foot->head BONE-CHAIN length to the orange (Move) skeleton's, both
             // measured over the SAME mapped joints. Chain lengths are pose-invariant (segment lengths are fixed),
             // so with roughly-matched proportions a single uniform scale lands BOTH the head and the feet on the
@@ -664,6 +700,49 @@ namespace BodyTracking.Playback
             }
 
             if (counted < 2 || max <= min) return false;
+            height = max - min;
+            return height > 0.1f;
+        }
+
+        /// <summary>
+        /// The character's RENDERED vertical extent (crown of the mesh/hair down to the soles) in world meters at
+        /// the current scale. Uses each skinned mesh's bind-pose <c>sharedMesh.bounds</c> (pose-invariant and valid
+        /// even while the model is hidden), so it captures the hair/crown that sits above the Head joint — the part
+        /// the bone-chain fit ignores and that makes the character look too tall.
+        /// </summary>
+        bool TryEstimateCharacterMeshHeight(out float height)
+        {
+            height = 0f;
+            if (characterRoot == null) return false;
+
+            var renderers = characterRoot.GetComponentsInChildren<SkinnedMeshRenderer>(true);
+            if (renderers == null || renderers.Length == 0) return false;
+
+            float min = float.MaxValue;
+            float max = float.MinValue;
+            bool any = false;
+
+            foreach (var smr in renderers)
+            {
+                if (smr == null || smr.sharedMesh == null) continue;
+                Bounds b = smr.sharedMesh.bounds;
+                Vector3 c = b.center;
+                Vector3 e = b.extents;
+                Matrix4x4 m = smr.transform.localToWorldMatrix;
+
+                // Transform all 8 corners so non-axis-aligned rigs are measured correctly.
+                for (int sx = -1; sx <= 1; sx += 2)
+                for (int sy = -1; sy <= 1; sy += 2)
+                for (int sz = -1; sz <= 1; sz += 2)
+                {
+                    Vector3 w = m.MultiplyPoint3x4(c + new Vector3(e.x * sx, e.y * sy, e.z * sz));
+                    min = Mathf.Min(min, w.y);
+                    max = Mathf.Max(max, w.y);
+                    any = true;
+                }
+            }
+
+            if (!any || max <= min) return false;
             height = max - min;
             return height > 0.1f;
         }
