@@ -15,6 +15,7 @@ namespace BodyTracking.EditorTools
     public static class AvaturnMaterialBinder
     {
         private const string DefaultFbxPath = "Assets/DeepMotion/priyal/model.fbx";
+        private const string CharactersFolder = "Assets/DeepMotion/Characters";
 
         static readonly string[] MaterialSuffixes =
         {
@@ -23,6 +24,47 @@ namespace BodyTracking.EditorTools
 
         [MenuItem("TENDOR/Characters/Bind Avaturn Textures (model.fbx)", priority = 5)]
         public static void BindDefaultModel() => Bind(DefaultFbxPath);
+
+        [MenuItem("TENDOR/Characters/Bind All In Characters Folder", priority = 4)]
+        public static void BindAllInCharactersFolder()
+        {
+            if (!AssetDatabase.IsValidFolder(CharactersFolder))
+            {
+                Debug.LogError($"[AvaturnMaterialBinder] Folder not found: '{CharactersFolder}'.");
+                return;
+            }
+
+            // Every FBX directly handled here gets its own per-model materials folder + texture set, so models
+            // sharing the directory (model.fbx, modelme.fbx, ...) never overwrite each other's materials.
+            string[] guids = AssetDatabase.FindAssets("t:Model", new[] { CharactersFolder });
+            var fbxPaths = guids
+                .Select(AssetDatabase.GUIDToAssetPath)
+                .Where(p => Path.GetExtension(p).ToLowerInvariant() == ".fbx")
+                .Distinct()
+                .OrderBy(p => p, StringComparer.Ordinal)
+                .ToList();
+
+            if (fbxPaths.Count == 0)
+            {
+                Debug.LogWarning($"[AvaturnMaterialBinder] No .fbx models found under '{CharactersFolder}'.");
+                return;
+            }
+
+            var log = new StringBuilder();
+            int totalBound = 0, modelsProcessed = 0;
+            foreach (string fbxPath in fbxPaths)
+            {
+                log.AppendLine($"{Path.GetFileName(fbxPath)}:");
+                int bound = Bind(fbxPath, null, log);
+                totalBound += bound;
+                if (bound > 0) modelsProcessed++;
+            }
+
+            AssetDatabase.SaveAssets();
+            AssetDatabase.Refresh();
+            Debug.Log($"[AvaturnMaterialBinder] Bound all in '{CharactersFolder}': {totalBound} material(s) across " +
+                      $"{modelsProcessed}/{fbxPaths.Count} model(s).\n{log}");
+        }
 
         [MenuItem("TENDOR/Characters/Bind Avaturn Textures (selected FBX)", priority = 6)]
         public static void BindSelected()
@@ -73,8 +115,13 @@ namespace BodyTracking.EditorTools
 
             if (string.IsNullOrEmpty(materialsOutputFolder))
             {
+                // Per-MODEL subfolder, not a shared "{fbxDir}/Materials". Avaturn models reuse the same slot
+                // names (avaturn_body, avaturn_look_0, ...), so two models in the same directory would otherwise
+                // write to the same .mat files and clobber each other — one model would end up showing the
+                // other's textures. Scoping by model name keeps each model's materials isolated.
                 string fbxDir = Path.GetDirectoryName(fbxPath)?.Replace('\\', '/');
-                materialsOutputFolder = $"{fbxDir}/Materials";
+                string modelName = Path.GetFileNameWithoutExtension(fbxPath);
+                materialsOutputFolder = $"{fbxDir}/Materials/{modelName}";
             }
 
             EnsureFolder(materialsOutputFolder);
@@ -242,12 +289,10 @@ namespace BodyTracking.EditorTools
                 mat.DisableKeyword("_NORMALMAP");
             }
 
-            if (metallic != null && mat.HasProperty("_MetallicGlossMap"))
-            {
-                mat.SetTexture("_MetallicGlossMap", metallic);
-                mat.EnableKeyword("_METALLICSPECGLOSSMAP");
-            }
-            else
+            // Matte look: do NOT assign the metallic/gloss map — its alpha channel feeds smoothness in URP/Lit and
+            // is the main source of the plastic shine. Drive smoothness from a single low scalar instead, and read
+            // it from the albedo alpha so a stray texture can't re-introduce gloss.
+            if (mat.HasProperty("_MetallicGlossMap"))
             {
                 mat.SetTexture("_MetallicGlossMap", null);
                 mat.DisableKeyword("_METALLICSPECGLOSSMAP");
@@ -256,18 +301,86 @@ namespace BodyTracking.EditorTools
             if (mat.HasProperty("_Metallic"))
                 mat.SetFloat("_Metallic", 0f);
 
+            if (mat.HasProperty("_SmoothnessTextureChannel"))
+                mat.SetFloat("_SmoothnessTextureChannel", 1f); // 1 = Albedo Alpha (not metallic map alpha)
+
             if (mat.HasProperty("_Smoothness"))
             {
-                float smoothness = roughness != null ? 0.25f : 0.35f;
-                if (textureKey.Contains("body"))
-                    smoothness = 0.2f;
+                // Low, but not dead-zero, so skin/cloth still catch a faint, realistic light falloff. Eyes get a
+                // touch more so they don't look like paper.
+                float smoothness = textureKey.Contains("eye") ? 0.2f : 0.08f;
                 mat.SetFloat("_Smoothness", smoothness);
+            }
+
+            // Kill the hard specular hotspot entirely for a fully matte surface (diffuse + normal detail remain).
+            if (mat.HasProperty("_SpecularHighlights"))
+            {
+                mat.SetFloat("_SpecularHighlights", 0f);
+                mat.DisableKeyword("_SPECULARHIGHLIGHTS_OFF");
+                if (textureKey.Contains("eye")) // keep a small highlight on eyes only
+                    mat.SetFloat("_SpecularHighlights", 1f);
+                else
+                    mat.EnableKeyword("_SPECULARHIGHLIGHTS_OFF");
+            }
+
+            if (mat.HasProperty("_EnvironmentReflections"))
+            {
+                bool isEye = textureKey.Contains("eye");
+                mat.SetFloat("_EnvironmentReflections", isEye ? 1f : 0f);
+                if (isEye) mat.DisableKeyword("_ENVIRONMENTREFLECTIONS_OFF");
+                else mat.EnableKeyword("_ENVIRONMENTREFLECTIONS_OFF");
             }
 
             if (mat.HasProperty("_Surface"))
                 mat.SetFloat("_Surface", 0f);
 
+            // Eye-occlusion / cornea shells are meant to be SEE-THROUGH overlays. Left opaque they render as a
+            // solid blob over the iris (reads as black/white eyes). Make them transparent so the real eye shows.
+            if (textureKey.Contains("eyeao") || textureKey.Contains("occlusion") || textureKey.Contains("cornea"))
+                SetTransparent(mat, baseColor != null ? 0.5f : 0f);
+
+            // Eyelashes / eyebrows / hair are a strand texture on a card with a transparent background. Opaque,
+            // that background renders as a solid (black) patch around the eyes. Alpha-clip so only the strands show.
+            else if (textureKey.Contains("lash") || textureKey.Contains("brow") || textureKey.Contains("hair"))
+            {
+                SetAlphaClip(mat, 0.33f);
+                if (baseColor != null) EnsureAlphaIsTransparency(baseColor);
+            }
+
             EditorUtility.SetDirty(mat);
+        }
+
+        /// <summary>Switch a URP/Lit material to alpha-blended transparency, with the given base-color alpha.</summary>
+        static void SetTransparent(Material mat, float alpha)
+        {
+            if (mat.HasProperty("_Surface")) mat.SetFloat("_Surface", 1f);   // 0 = Opaque, 1 = Transparent
+            if (mat.HasProperty("_Blend")) mat.SetFloat("_Blend", 0f);       // 0 = Alpha
+            if (mat.HasProperty("_SrcBlend")) mat.SetFloat("_SrcBlend", (float)UnityEngine.Rendering.BlendMode.SrcAlpha);
+            if (mat.HasProperty("_DstBlend")) mat.SetFloat("_DstBlend", (float)UnityEngine.Rendering.BlendMode.OneMinusSrcAlpha);
+            if (mat.HasProperty("_ZWrite")) mat.SetFloat("_ZWrite", 0f);
+            mat.SetOverrideTag("RenderType", "Transparent");
+            mat.EnableKeyword("_SURFACE_TYPE_TRANSPARENT");
+            mat.DisableKeyword("_ALPHATEST_ON");
+            mat.renderQueue = (int)UnityEngine.Rendering.RenderQueue.Transparent;
+
+            if (mat.HasProperty("_BaseColor"))
+            {
+                Color c = mat.GetColor("_BaseColor");
+                c.a = alpha;
+                mat.SetColor("_BaseColor", c);
+            }
+        }
+
+        /// <summary>Enable alpha-test cutout on a URP/Lit material so a strand/cutout texture's transparent
+        /// background disappears (used for eyelashes, eyebrows, hair) while staying in the cheap opaque pass.</summary>
+        static void SetAlphaClip(Material mat, float cutoff)
+        {
+            if (mat.HasProperty("_Surface")) mat.SetFloat("_Surface", 0f); // stays "opaque" surface, just alpha-tested
+            if (mat.HasProperty("_AlphaClip")) mat.SetFloat("_AlphaClip", 1f);
+            if (mat.HasProperty("_Cutoff")) mat.SetFloat("_Cutoff", cutoff);
+            mat.EnableKeyword("_ALPHATEST_ON");
+            mat.SetOverrideTag("RenderType", "TransparentCutout");
+            mat.renderQueue = (int)UnityEngine.Rendering.RenderQueue.AlphaTest;
         }
 
         static void ClearMaterialRemaps(ModelImporter importer)
@@ -285,14 +398,23 @@ namespace BodyTracking.EditorTools
             string dir = Path.GetDirectoryName(fbxPath).Replace('\\', '/');
             string fbm = $"{dir}/{Path.GetFileNameWithoutExtension(fbxPath)}.fbm";
 
+            // Use ONLY the model's own ".fbm" sidecar when it exists. FindAssets recurses, so also scanning the
+            // parent directory would pull in sibling models' ".fbm" textures (model.fbm vs modelme.fbm) — and
+            // because Avaturn reuses texture names across models (avaturn_look_0_base_color.jpg, etc.) the wrong
+            // model's textures would win. Fall back to the directory only when there's no .fbm folder at all.
             var searchFolders = new List<string>();
             if (AssetDatabase.IsValidFolder(fbm)) searchFolders.Add(fbm);
-            if (AssetDatabase.IsValidFolder(dir)) searchFolders.Add(dir);
+            else if (AssetDatabase.IsValidFolder(dir)) searchFolders.Add(dir);
             if (searchFolders.Count == 0) return result;
 
+            // FindAssets recurses into subfolders. Restrict to textures that live DIRECTLY in a search folder so
+            // a nested "Materials" output folder or a sibling model's folder can never feed in the wrong images.
+            var allowed = new HashSet<string>(searchFolders, StringComparer.Ordinal);
             foreach (string guid in AssetDatabase.FindAssets("t:Texture2D", searchFolders.ToArray()))
             {
                 string path = AssetDatabase.GUIDToAssetPath(guid);
+                string parent = Path.GetDirectoryName(path)?.Replace('\\', '/');
+                if (parent == null || !allowed.Contains(parent)) continue;
                 var tex = AssetDatabase.LoadAssetAtPath<Texture2D>(path);
                 if (tex == null) continue;
                 string nameKey = Path.GetFileNameWithoutExtension(path).ToLowerInvariant();
@@ -331,6 +453,19 @@ namespace BodyTracking.EditorTools
             var mat = new Material(shader) { name = safe };
             AssetDatabase.CreateAsset(mat, path);
             return mat;
+        }
+
+        /// <summary>Make sure a cutout texture (lash/hair) imports its alpha and dilates color into transparent
+        /// texels, so alpha-tested edges don't fringe to black.</summary>
+        static void EnsureAlphaIsTransparency(Texture2D tex)
+        {
+            string path = AssetDatabase.GetAssetPath(tex);
+            var ti = AssetImporter.GetAtPath(path) as TextureImporter;
+            if (ti == null) return;
+            bool dirty = false;
+            if (ti.alphaSource != TextureImporterAlphaSource.FromInput) { ti.alphaSource = TextureImporterAlphaSource.FromInput; dirty = true; }
+            if (!ti.alphaIsTransparency) { ti.alphaIsTransparency = true; dirty = true; }
+            if (dirty) ti.SaveAndReimport();
         }
 
         static void EnsureNormalMap(Texture2D normal)

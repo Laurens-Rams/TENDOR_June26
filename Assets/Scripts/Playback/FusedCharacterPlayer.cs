@@ -35,10 +35,10 @@ namespace BodyTracking.Playback
         [SerializeField] private Vector3 routeRootLocalOffset = Vector3.zero;
 
         [Header("Fit")]
-        [Tooltip("Calibration multiplier on the auto-computed height scale. The auto scale matches the FBX's " +
-                 "head-to-toe BONE extent to the recording height, but the rendered MESH (skull cap, soles) " +
-                 "reaches past those joints so the model looks slightly taller than the orange skeleton. Nudge " +
-                 "below 1 to shrink the character onto the orange skeleton (e.g. ~0.9). Live-adjustable in play mode.")]
+        [Tooltip("Optional fine-tune multiplier on the auto-computed height scale. The auto scale matches the " +
+                 "FBX's foot->head bone-chain length to the orange skeleton's, so with roughly-matched " +
+                 "proportions the head and feet already land on the orange joints. Leave at 1 unless you want to " +
+                 "trim slightly (e.g. the rendered mesh reaches a hair past the joints). Live-adjustable in play mode.")]
         [SerializeField, Range(0.5f, 1.5f)] private float skeletonFitScale = 1f;
         private float lastAppliedFitScale = float.NaN;
 
@@ -533,10 +533,23 @@ namespace BodyTracking.Playback
             float fit = Mathf.Max(0.01f, skeletonFitScale);
             lastAppliedFitScale = skeletonFitScale;
 
-            // One uniform scale per recording: match the solved Move skeleton height (same metric as the orange
-            // overlay). Hips are snapped every frame in OrientAndPlaceRoot, so different people's heights just
-            // rescale the model — limb proportions stay the FBX's, overall height tracks the recording.
-            // skeletonFitScale then trims the model onto the orange skeleton (mesh extends past the bones).
+            float currentScale = Mathf.Max(0.01f, (characterRoot.localScale.x + characterRoot.localScale.y + characterRoot.localScale.z) / 3f);
+
+            // Preferred fit: match the FBX's foot->head BONE-CHAIN length to the orange (Move) skeleton's, both
+            // measured over the SAME mapped joints. Chain lengths are pose-invariant (segment lengths are fixed),
+            // so with roughly-matched proportions a single uniform scale lands BOTH the head and the feet on the
+            // orange joints automatically — the hips are already pinned every frame in OrientAndPlaceRoot.
+            if (TryMatchChainHeight(out float chainScale))
+            {
+                float chainTarget = Mathf.Max(0.01f, chainScale * fit);
+                characterRoot.localScale = Vector3.one * chainTarget;
+                Debug.Log($"[FusedCharacterPlayer] Character chain-fit scale={chainTarget:F3} " +
+                          $"(foot->head chain match, fit={fit:F2})");
+                return;
+            }
+
+            // Fallback: overall head-to-foot extent vs the solved Move height (used when the foot/head joints
+            // can't be resolved on this rig).
             float targetHeight = EstimatePoseHeight(asset?.pose) * Mathf.Max(0.01f, asset?.scale ?? 1f);
             if (targetHeight <= 0.1f)
                 targetHeight = recordingHeightMeters;
@@ -555,12 +568,76 @@ namespace BodyTracking.Playback
                 return;
             }
 
-            float currentScale = Mathf.Max(0.01f, (characterRoot.localScale.x + characterRoot.localScale.y + characterRoot.localScale.z) / 3f);
             float targetScale = Mathf.Max(0.01f, currentScale * targetHeight / currentHeight * fit);
             characterRoot.localScale = Vector3.one * targetScale;
             Debug.Log($"[FusedCharacterPlayer] Character height scale={targetScale:F3} " +
                       $"(target {targetHeight:F2}m / model {currentHeight:F2}m, " +
                       $"fit={fit:F2}, measure={(usingBoneHeight ? "joints" : "mesh-bounds")})");
+        }
+
+        /// <summary>
+        /// Uniform localScale that makes the character's foot->head bone-chain length equal the orange (Move)
+        /// skeleton's, measured over the same mapped joints. Returns false if the head/foot joints or enough of
+        /// the chain can't be resolved on this rig (caller then falls back to the extent-based estimate).
+        /// </summary>
+        bool TryMatchChainHeight(out float scale)
+        {
+            scale = 0f;
+            if (asset?.pose == null || boneByJoint.Count == 0 || asset.pose.FrameCount == 0)
+                return false;
+
+            var pose = asset.pose;
+            int headIdx = pose.IndexOfJoint("Head");
+            if (headIdx < 0) headIdx = pose.IndexOfJoint("Neck");
+            int footIdx = pose.IndexOfJoint("Left_toe");
+            if (footIdx < 0) footIdx = pose.IndexOfJoint("Left_ankle");
+            if (footIdx < 0) footIdx = pose.IndexOfJoint("Right_toe");
+            if (footIdx < 0) footIdx = pose.IndexOfJoint("Right_ankle");
+            if (headIdx < 0 || footIdx < 0) return false;
+
+            // Move joint world positions (rest is fine — bone lengths are constant), scaled the same way the
+            // orange skeleton is drawn (asset.scale).
+            Vector3[] fk = pose.ForwardKinematics(pose.frames[0]);
+            if (fk == null || fk.Length == 0) return false;
+            float poseScale = Mathf.Max(0.01f, asset.scale);
+
+            float moveLen = 0f, charLen = 0f;
+            bool ok = AccumulateChain(headIdx, fk, ref moveLen, ref charLen) &
+                      AccumulateChain(footIdx, fk, ref moveLen, ref charLen);
+            if (!ok || moveLen <= 0.05f || charLen <= 0.05f) return false;
+
+            float currentScale = Mathf.Max(0.01f, (characterRoot.localScale.x + characterRoot.localScale.y + characterRoot.localScale.z) / 3f);
+            scale = Mathf.Max(0.01f, currentScale * (moveLen * poseScale) / charLen);
+            return true;
+        }
+
+        /// <summary>
+        /// Walk from <paramref name="leaf"/> up the Move parent chain to the root, summing segment lengths over
+        /// joints that are mapped to a character bone — accumulating the Move length (from <paramref name="fk"/>)
+        /// and the character length (from the bound bone world positions) over the SAME consecutive joints so the
+        /// two are directly comparable. Returns false if fewer than two chain joints are mapped.
+        /// </summary>
+        bool AccumulateChain(int leaf, Vector3[] fk, ref float moveLen, ref float charLen)
+        {
+            var pose = asset.pose;
+            int prev = -1;
+            int counted = 0;
+            int guard = 0;
+            for (int j = leaf; j >= 0 && guard < 128; guard++)
+            {
+                if (boneByJoint.TryGetValue(j, out var bone) && bone != null && j < fk.Length)
+                {
+                    if (prev >= 0)
+                    {
+                        moveLen += Vector3.Distance(fk[prev], fk[j]);
+                        charLen += Vector3.Distance(boneByJoint[prev].position, bone.position);
+                        counted++;
+                    }
+                    prev = j;
+                }
+                j = j < pose.jointParents.Count ? pose.jointParents[j] : -1;
+            }
+            return counted > 0;
         }
 
         /// <summary>

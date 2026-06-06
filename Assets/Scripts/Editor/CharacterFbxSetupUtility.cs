@@ -1,6 +1,5 @@
 using System;
 using System.Collections.Generic;
-using System.IO;
 using System.Text;
 using BodyTracking.Animation;
 using BodyTracking.MoveAI;
@@ -136,12 +135,9 @@ namespace BodyTracking.EditorTools
             if (AssetImporter.GetAtPath(fbxPath) as ModelImporter == null)
                 return 0;
 
-            if (string.IsNullOrEmpty(materialsOutputFolder))
-            {
-                string fbxDir = Path.GetDirectoryName(fbxPath)?.Replace('\\', '/');
-                materialsOutputFolder = $"{fbxDir}/Materials";
-            }
-
+            // Pass the folder straight through. When it's null, AvaturnMaterialBinder writes to a per-MODEL
+            // subfolder and reads textures only from this model's own folder, so two models can't share or
+            // overwrite each other's materials.
             return AvaturnMaterialBinder.Bind(fbxPath, materialsOutputFolder, log);
         }
 

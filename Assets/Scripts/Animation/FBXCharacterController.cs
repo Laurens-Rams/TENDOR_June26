@@ -114,6 +114,11 @@ namespace BodyTracking.Animation
             isInitialized = true;
 
             ApplyCharacterWorldScale();
+
+            // Hide Avaturn/RPM eye ambient-occlusion shell meshes that otherwise read as a black ring around the eyes.
+            int hiddenShells = BodyTracking.LookDev.CharacterLookLab.DisableOcclusionShells(characterRoot.transform);
+            if (hiddenShells > 0 && enableLogging)
+                Debug.Log($"[FBXCharacterController] Disabled {hiddenShells} eye-occlusion shell mesh(es).");
             
             // Ensure character uses normal materials (not debug cyan)
             RestoreNormalMaterials();

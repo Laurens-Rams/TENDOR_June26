@@ -26,20 +26,33 @@ namespace BodyTracking.EditorTools
             window.Show();
         }
 
-        [MenuItem("TENDOR/Characters/Setup Selected FBX (Quick)", priority = 1)]
-        public static void SetupSelectedQuick()
+        /// <summary>
+        /// The single do-everything entry: select a character .fbx in the Project window and run this. It sets the
+        /// rig to Humanoid (+ avatar), builds URP materials from THIS model's own textures into a per-model folder,
+        /// generates the Move AI retarget map, and wires the open scene — all in one reimport.
+        /// </summary>
+        [MenuItem("TENDOR/Characters/Import Character (All-In-One)", priority = 0)]
+        public static void ImportCharacterAllInOne()
         {
             string path = GetSelectedFbxPath();
             if (path == null)
             {
-                EditorUtility.DisplayDialog("Character FBX Setup", "Select a .fbx in the Project window first.", "OK");
+                EditorUtility.DisplayDialog("Import Character",
+                    "Select the character .fbx in the Project window first, then run this again.", "OK");
                 return;
             }
 
-            var result = CharacterFbxSetupUtility.SetupCharacterFbx(path);
+            var result = CharacterFbxSetupUtility.SetupCharacterFbx(
+                path,
+                configureHumanoid: true,
+                bindMaterials: true,
+                buildRetargetMap: true,
+                assignScene: true,
+                materialsOutputFolder: null); // null => per-model materials folder from this model's own textures
+
             Debug.Log(result.log);
             EditorUtility.DisplayDialog(
-                result.success ? "Character FBX Setup" : "Character FBX Setup — Issues",
+                result.success ? "Import Character — Done" : "Import Character — Issues",
                 result.log,
                 "OK");
         }
