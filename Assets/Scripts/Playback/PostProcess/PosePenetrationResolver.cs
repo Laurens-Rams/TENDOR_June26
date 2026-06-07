@@ -21,9 +21,16 @@ namespace BodyTracking.Playback.PostProcess
         [Tooltip("Penetration depth (m) that maps to full IK weight; shallower clips get a gentler nudge.")]
         public float penetrationForFullWeight;
 
-        [Header("Whole-body fallback")]
-        [Tooltip("If more than this fraction of joints are behind the wall, push the whole body out along the normal instead of bending single limbs.")]
+        [Header("Whole-body fallback (opt-in)")]
+        [Tooltip("Push the entire skeleton out along the wall normal when many hands/feet are deep in the wall. " +
+                 "Off by default — turning on the master penetration fix alone only runs floor + limb IK.")]
+        public bool enableWholeBodyPush;
+        [Tooltip("Hands/feet must penetrate at least this deep (m) before they count toward a whole-body push.")]
+        public float minWholeBodyPenetration;
+        [Tooltip("If more than this fraction of wall-contact joints (hands/feet) are deep in the wall, push the whole body.")]
         [Range(0f, 1f)] public float wholeBodyPenetrationFraction;
+        [Tooltip("Cap the whole-body push per frame (m) so a bad surface probe can't teleport the character forward.")]
+        public float maxWholeBodyPushMeters;
 
         [Tooltip("Skip all penetration fixes while the character is jumping (so a jump isn't snapped to the floor).")]
         public bool skipDuringJump;
@@ -41,7 +48,10 @@ namespace BodyTracking.Playback.PostProcess
             enableWallFootIK = true,
             maxIkWeight = 1f,
             penetrationForFullWeight = 0.08f,
-            wholeBodyPenetrationFraction = 0.5f,
+            enableWholeBodyPush = false,
+            minWholeBodyPenetration = 0.04f,
+            wholeBodyPenetrationFraction = 0.75f,
+            maxWholeBodyPushMeters = 0.12f,
             skipDuringJump = true,
             debugDraw = false,
         };
@@ -67,27 +77,38 @@ namespace BodyTracking.Playback.PostProcess
         /// World-array phase. <paramref name="footWorldIndices"/> are joint indices of the feet (ankles/toes).
         /// Mutates <paramref name="world"/> in place. Returns the standing/climbing classification.
         /// </summary>
-        public bool ResolveBodyAndFloor(Vector3[] world, int rootIndex, int[] footWorldIndices, bool jumping, in PenetrationSettings s)
+        public bool ResolveBodyAndFloor(Vector3[] world, int rootIndex, int[] footWorldIndices, int[] wallContactIndices,
+            bool jumping, in PenetrationSettings s)
         {
             if (world == null || probe == null) return lastStanding;
 
-            // Whole-body-in-wall: push everything out along the wall normal by the deepest penetration.
-            float deepest = 0f;
-            Vector3 pushNormal = Vector3.zero;
-            int inside = 0;
-            for (int i = 0; i < world.Length; i++)
+            // Whole-body push is opt-in: only when hands/feet are genuinely deep in the wall, not on every master-toggle on.
+            if (s.enableWholeBodyPush && wallContactIndices != null && wallContactIndices.Length > 0)
             {
-                if (probe.TryWall(world[i], out var h) && h.inside)
+                float deepest = 0f;
+                Vector3 pushNormal = Vector3.zero;
+                int deepContacts = 0;
+                float minPen = Mathf.Max(0.005f, s.minWholeBodyPenetration);
+                foreach (int i in wallContactIndices)
                 {
-                    inside++;
-                    if (h.penetration > deepest) { deepest = h.penetration; pushNormal = h.normal; }
+                    if (i < 0 || i >= world.Length) continue;
+                    if (!probe.TryWall(world[i], out var h) || !h.inside || h.penetration < minPen) continue;
+                    deepContacts++;
+                    if (h.penetration > deepest)
+                    {
+                        deepest = h.penetration;
+                        pushNormal = h.normal;
+                    }
                 }
-            }
-            bool wholeBody = world.Length > 0 && inside >= Mathf.CeilToInt(world.Length * Mathf.Clamp01(s.wholeBodyPenetrationFraction));
-            if (wholeBody && deepest > 0f && pushNormal.sqrMagnitude > 1e-6f)
-            {
-                Vector3 push = pushNormal.normalized * deepest;
-                for (int i = 0; i < world.Length; i++) world[i] += push;
+
+                int need = Mathf.Max(1, Mathf.CeilToInt(wallContactIndices.Length * Mathf.Clamp01(s.wholeBodyPenetrationFraction)));
+                if (deepContacts >= need && deepest > 0f && pushNormal.sqrMagnitude > 1e-6f)
+                {
+                    float cap = Mathf.Max(0.01f, s.maxWholeBodyPushMeters);
+                    deepest = Mathf.Min(deepest, cap);
+                    Vector3 push = pushNormal.normalized * deepest;
+                    for (int i = 0; i < world.Length; i++) world[i] += push;
+                }
             }
 
             // Standing classification + floor lift.

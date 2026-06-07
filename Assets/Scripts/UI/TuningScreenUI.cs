@@ -200,6 +200,13 @@ namespace BodyTracking.UI
             }
 
             AddSection("Position / trajectory");
+            // TEST: drive world movement straight from the Move AI GLB root motion (anchored once to ARKit).
+            AddToggle("Use Move AI movement (test)",
+                () => p.PlaybackAnchorMode == FusedPoseSolver.AnchorMode.FollowMoveGlbRoot,
+                v => p.PlaybackAnchorMode = v
+                    ? FusedPoseSolver.AnchorMode.FollowMoveGlbRoot
+                    : FusedPoseSolver.AnchorMode.FollowBakedRoot);
+            AddButton("Re-align Move movement now", () => p.RealignMoveMovement());
             AddModeToggle("World position source",
                 () => p.PlaybackAnchorMode == FusedPoseSolver.AnchorMode.FollowBakedRoot ? "Baked" : "Live",
                 () =>
@@ -247,12 +254,18 @@ namespace BodyTracking.UI
                 v => { var s = p.PenetrationSettingsLive; s.enableWallHandIK = v; p.PenetrationSettingsLive = s; });
             AddToggle("Wall foot IK", () => p.PenetrationSettingsLive.enableWallFootIK,
                 v => { var s = p.PenetrationSettingsLive; s.enableWallFootIK = v; p.PenetrationSettingsLive = s; });
+            AddToggle("Whole-body wall push", () => p.PenetrationSettingsLive.enableWholeBodyPush,
+                v => { var s = p.PenetrationSettingsLive; s.enableWholeBodyPush = v; p.PenetrationSettingsLive = s; });
+            AddSlider("Min whole-body depth (m)", 0.01f, 0.15f, () => p.PenetrationSettingsLive.minWholeBodyPenetration,
+                v => { var s = p.PenetrationSettingsLive; s.minWholeBodyPenetration = v; p.PenetrationSettingsLive = s; }, "0.000");
+            AddSlider("Whole-body contact fraction", 0f, 1f, () => p.PenetrationSettingsLive.wholeBodyPenetrationFraction,
+                v => { var s = p.PenetrationSettingsLive; s.wholeBodyPenetrationFraction = v; p.PenetrationSettingsLive = s; }, "0.00");
+            AddSlider("Max whole-body push (m)", 0.02f, 0.3f, () => p.PenetrationSettingsLive.maxWholeBodyPushMeters,
+                v => { var s = p.PenetrationSettingsLive; s.maxWholeBodyPushMeters = v; p.PenetrationSettingsLive = s; }, "0.000");
             AddSlider("Max IK weight", 0f, 1f, () => p.PenetrationSettingsLive.maxIkWeight,
                 v => { var s = p.PenetrationSettingsLive; s.maxIkWeight = v; p.PenetrationSettingsLive = s; }, "0.00");
             AddSlider("Penetration for full weight (m)", 0.02f, 0.2f, () => p.PenetrationSettingsLive.penetrationForFullWeight,
                 v => { var s = p.PenetrationSettingsLive; s.penetrationForFullWeight = v; p.PenetrationSettingsLive = s; }, "0.000");
-            AddSlider("Whole-body push fraction", 0f, 1f, () => p.PenetrationSettingsLive.wholeBodyPenetrationFraction,
-                v => { var s = p.PenetrationSettingsLive; s.wholeBodyPenetrationFraction = v; p.PenetrationSettingsLive = s; }, "0.00");
             AddToggle("Skip during jump", () => p.PenetrationSettingsLive.skipDuringJump,
                 v => { var s = p.PenetrationSettingsLive; s.skipDuringJump = v; p.PenetrationSettingsLive = s; });
             AddToggle("Debug draw", () => p.PenetrationSettingsLive.debugDraw,

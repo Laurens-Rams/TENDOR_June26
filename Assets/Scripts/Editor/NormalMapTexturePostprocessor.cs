@@ -34,14 +34,12 @@ namespace BodyTracking.EditorTools
             if (LooksLikeNormalMap(assetPath) && importer.textureType != TextureImporterType.NormalMap)
                 importer.textureType = TextureImporterType.NormalMap;
 
-            // Crisper character textures: Avaturn ships 1024² maps, so we can't add resolution, but the soft/blocky
-            // look comes from low-quality compression + no anisotropic filtering. Bump both for any texture that
-            // lives in a character's .fbm folder.
+            // Character textures: Avaturn ships 1024² maps. Prefer high-quality compression only — do not bump
+            // aniso here; CharacterCameraMatch applies runtime softness (mipmap bias + FXAA) to match the AR feed.
             if (assetPath != null && assetPath.Replace('\\', '/').Contains(".fbm/"))
             {
-                importer.compressionQuality = 100;                 // best block-compression search
+                importer.compressionQuality = 100;
                 importer.textureCompression = TextureImporterCompression.CompressedHQ;
-                importer.anisoLevel = Mathf.Max(importer.anisoLevel, 4); // sharper at grazing angles
                 importer.mipmapEnabled = true;
             }
         }

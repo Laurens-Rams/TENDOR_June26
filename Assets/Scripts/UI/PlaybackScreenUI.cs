@@ -3,6 +3,7 @@ using TMPro;
 using UnityEngine;
 using UnityEngine.UI;
 using BodyTracking;
+using BodyTracking.Animation;
 using BodyTracking.Playback;
 
 namespace BodyTracking.UI
@@ -14,6 +15,10 @@ namespace BodyTracking.UI
     public class PlaybackScreenUI : MonoBehaviour
     {
         private const string RootName = "PlaybackUIRoot";
+        private const float TimelineColumnWidth = 72f;
+        private const float CharacterCycleButtonSize = 44f;
+        private const float TimelineHeightFraction = 0.82f;
+        private const float PlaybackEdgeInset = UITokens.Space12;
 
         [Header("System")]
         public BodyTrackingController controller;
@@ -35,6 +40,8 @@ namespace BodyTracking.UI
         private GameObject pauseIcon;
         private Button backToRecordButton;
         private Button tuneButton;
+        private Button characterCycleButton;
+        private CharacterSwitcher characterSwitcher;
         private Button finishButton;
         private Image finishCircle;
         private GameObject finishCheckmark;
@@ -148,15 +155,33 @@ namespace BodyTracking.UI
 
         private void BuildVerticalTimeline(RectTransform root)
         {
+            const float switchTimelineGap = UITokens.Space16;
+            float finishTopPad = UITokens.TransportPrimaryDiameter * 0.5f + UITokens.Space8;
+            float timelineCenterX = -(PlaybackEdgeInset + TimelineColumnWidth * 0.5f);
+
             var column = UIFactory.CreateRect("VerticalTimeline", root);
             column.anchorMin = new Vector2(1f, 0f);
-            column.anchorMax = new Vector2(1f, 1f);
-            column.pivot = new Vector2(1f, 0.5f);
-            column.anchoredPosition = new Vector2(-UITokens.Space12, 18f);
-            column.sizeDelta = new Vector2(72f, -UITokens.Space24 * 2f);
+            column.anchorMax = new Vector2(1f, TimelineHeightFraction);
+            column.pivot = new Vector2(1f, 0f);
+            column.offsetMin = new Vector2(-(TimelineColumnWidth + PlaybackEdgeInset), PlaybackEdgeInset);
+            column.offsetMax = new Vector2(-PlaybackEdgeInset, 0f);
+
+            characterCycleButton = UIFactory.CreateCircleButton(
+                "CharacterCycle", root, CharacterCycleButtonSize, UITokens.PlaybackTransportBtn);
+            var cycleRect = (RectTransform)characterCycleButton.transform;
+            cycleRect.anchorMin = new Vector2(1f, TimelineHeightFraction);
+            cycleRect.anchorMax = new Vector2(1f, TimelineHeightFraction);
+            cycleRect.pivot = new Vector2(0.5f, 0f);
+            cycleRect.anchoredPosition = new Vector2(timelineCenterX, switchTimelineGap);
+            UIFactory.AddSwitchIcon(cycleRect, CharacterCycleButtonSize * 0.46f, UITokens.OnSurface);
+            characterSwitcher = Object.FindFirstObjectByType<CharacterSwitcher>();
+            characterCycleButton.onClick.AddListener(OnCycleCharacterClicked);
 
             trackArea = UIFactory.CreateRect("TrackArea", column);
-            UIFactory.Stretch(trackArea, UITokens.Space8);
+            trackArea.anchorMin = Vector2.zero;
+            trackArea.anchorMax = Vector2.one;
+            trackArea.offsetMin = new Vector2(UITokens.Space8, UITokens.Space8);
+            trackArea.offsetMax = new Vector2(-UITokens.Space8, -(finishTopPad + UITokens.Space8));
 
             // White vertical track line.
             var lineRect = UIFactory.CreateRect("TrackLine", trackArea);
@@ -302,7 +327,7 @@ namespace BodyTracking.UI
             clusterRect.anchorMin = new Vector2(0f, 0f);
             clusterRect.anchorMax = new Vector2(0f, 0f);
             clusterRect.pivot = new Vector2(0f, 0f);
-            clusterRect.anchoredPosition = new Vector2(UITokens.Space12, UITokens.Space12);
+            clusterRect.anchoredPosition = new Vector2(PlaybackEdgeInset, PlaybackEdgeInset);
             clusterRect.sizeDelta = new Vector2(272f, UITokens.TransportPrimaryDiameter);
 
             var layout = clusterRect.gameObject.AddComponent<HorizontalLayoutGroup>();
@@ -439,6 +464,16 @@ namespace BodyTracking.UI
         {
             controller?.CyclePlaybackLoopMode();
             RefreshAll();
+        }
+
+        private void OnCycleCharacterClicked()
+        {
+            if (characterSwitcher == null)
+                characterSwitcher = Object.FindFirstObjectByType<CharacterSwitcher>();
+            if (characterSwitcher != null)
+                characterSwitcher.CycleCharacter();
+            else
+                UnityEngine.Debug.LogWarning("[PlaybackScreenUI] No CharacterSwitcher found — cannot cycle characters.");
         }
 
         // ============================================================================================

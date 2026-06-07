@@ -33,31 +33,53 @@ namespace BodyTracking.Playback
         HumanPoseHandler handler;
         Dictionary<HumanBodyBones, Transform> humanBones;
 
-        // --- Optional muscle-space jitter smoothing (Step 2b: removes GLB body/finger jitter that the world-joint
-        // smoothing can't see, because body+fingers come from the muscle-space HumanPose) ---
+        // --- Muscle-space post-process (smoothing + glitch guard on the GLB clip the character actually displays) ---
         bool smoothEnabled;
-        float smoothMinCutoff = 1f;
-        float smoothBeta = 0.01f;
+        bool glitchGuardEnabled;
+        float smoothMinCutoff = 0.35f;
+        float smoothBeta = 0.08f;
+        float maxMuscleSpeed = 6f;
         OneEuroFilterScalar[] muscleFilters;
         readonly OneEuroFilterQuaternion bodyRotFilter = new OneEuroFilterQuaternion();
+        float[] prevMuscles;
+        bool hasPrevMuscles;
+        float lastProcessedTime = float.NaN;
+        HumanPose cachedPose;
+        bool hasCachedPose;
 
-        /// <summary>Enable/disable speed-adaptive smoothing of the sampled muscles + body rotation.</summary>
-        public void SetSmoothing(bool enabled, float minCutoff, float beta)
+        /// <summary>Configure smoothing + glitch guard on sampled muscles (what the GLB character displays).</summary>
+        public void SetPostProcess(bool smoothing, float minCutoff, float beta, bool glitchGuard, float maxSpeed)
         {
-            smoothEnabled = enabled;
+            smoothEnabled = smoothing;
+            glitchGuardEnabled = glitchGuard;
             smoothMinCutoff = minCutoff;
             smoothBeta = beta;
+            maxMuscleSpeed = Mathf.Max(0.5f, maxSpeed);
             bodyRotFilter.SetParams(minCutoff, beta);
             if (muscleFilters != null)
-                foreach (var f in muscleFilters) { f.MinCutoff = minCutoff; f.Beta = beta; }
+            {
+                foreach (var f in muscleFilters)
+                {
+                    f.MinCutoff = minCutoff;
+                    f.Beta = beta;
+                }
+            }
         }
 
-        /// <summary>Clear smoothing history (call when (re)starting playback to avoid a stale ease-in).</summary>
+        /// <summary>Legacy entry point — forwards to <see cref="SetPostProcess"/>.</summary>
+        public void SetSmoothing(bool enabled, float minCutoff, float beta) =>
+            SetPostProcess(enabled, minCutoff, beta, glitchGuardEnabled, maxMuscleSpeed);
+
+        /// <summary>Clear filter history (call when (re)starting playback to avoid a stale ease-in).</summary>
         public void ResetSmoothing()
         {
             bodyRotFilter.Reset();
             if (muscleFilters != null)
                 foreach (var f in muscleFilters) f.Reset();
+            prevMuscles = null;
+            hasPrevMuscles = false;
+            lastProcessedTime = float.NaN;
+            hasCachedPose = false;
         }
 
         static readonly Dictionary<string, MoveGlbSource> cache = new Dictionary<string, MoveGlbSource>();
@@ -277,26 +299,81 @@ namespace BodyTracking.Playback
             if (!IsReady || handler == null || clip == null || root == null)
                 return false;
 
+            return SampleProcessedPose(seconds, ref pose);
+        }
+
+        /// <summary>Sample clip, apply glitch guard + smoothing, write back to the GLB skeleton.</summary>
+        bool SampleProcessedPose(float seconds, ref HumanPose pose)
+        {
+            if (hasCachedPose && Mathf.Approximately(seconds, lastProcessedTime))
+            {
+                pose = cachedPose;
+                handler.SetHumanPose(ref pose);
+                return true;
+            }
+
             float len = clip.length;
             float t = len > 0f ? Mathf.Repeat(seconds, len) : 0f;
             clip.SampleAnimation(root, t);
             handler.GetHumanPose(ref pose);
 
+            float dt = Time.deltaTime > 0f ? Time.deltaTime : 1f / 60f;
+            if (glitchGuardEnabled)
+                GlitchGuardMuscles(ref pose, dt);
             if (smoothEnabled && pose.muscles != null)
+                SmoothMuscles(ref pose, dt);
+
+            cachedPose = pose;
+            lastProcessedTime = seconds;
+            hasCachedPose = true;
+            handler.SetHumanPose(ref pose);
+            return true;
+        }
+
+        void GlitchGuardMuscles(ref HumanPose pose, float dt)
+        {
+            if (pose.muscles == null) return;
+            if (prevMuscles == null || prevMuscles.Length != pose.muscles.Length)
             {
-                float dt = Time.deltaTime > 0f ? Time.deltaTime : 1f / 60f;
-                if (muscleFilters == null || muscleFilters.Length != pose.muscles.Length)
-                {
-                    muscleFilters = new OneEuroFilterScalar[pose.muscles.Length];
-                    for (int i = 0; i < muscleFilters.Length; i++)
-                        muscleFilters[i] = new OneEuroFilterScalar(smoothMinCutoff, smoothBeta);
-                }
-                for (int i = 0; i < pose.muscles.Length; i++)
-                    pose.muscles[i] = muscleFilters[i].Filter(pose.muscles[i], dt);
-                pose.bodyRotation = bodyRotFilter.Filter(pose.bodyRotation, dt);
+                prevMuscles = (float[])pose.muscles.Clone();
+                hasPrevMuscles = true;
+                return;
             }
 
-            return true;
+            for (int i = 0; i < pose.muscles.Length; i++)
+            {
+                float p = pose.muscles[i];
+                if (float.IsNaN(p) || float.IsInfinity(p))
+                {
+                    if (hasPrevMuscles) pose.muscles[i] = prevMuscles[i];
+                    continue;
+                }
+
+                if (hasPrevMuscles && maxMuscleSpeed > 0f)
+                {
+                    float speed = Mathf.Abs(p - prevMuscles[i]) / dt;
+                    if (speed > maxMuscleSpeed)
+                    {
+                        pose.muscles[i] = prevMuscles[i];
+                        continue;
+                    }
+                }
+                prevMuscles[i] = pose.muscles[i];
+            }
+            hasPrevMuscles = true;
+        }
+
+        void SmoothMuscles(ref HumanPose pose, float dt)
+        {
+            if (muscleFilters == null || muscleFilters.Length != pose.muscles.Length)
+            {
+                muscleFilters = new OneEuroFilterScalar[pose.muscles.Length];
+                for (int i = 0; i < muscleFilters.Length; i++)
+                    muscleFilters[i] = new OneEuroFilterScalar(smoothMinCutoff, smoothBeta);
+            }
+            for (int i = 0; i < pose.muscles.Length; i++)
+                pose.muscles[i] = muscleFilters[i].Filter(pose.muscles[i], dt);
+            pose.bodyRotation = bodyRotFilter.Filter(pose.bodyRotation, dt);
         }
 
         /// <summary>
@@ -305,20 +382,26 @@ namespace BodyTracking.Playback
         /// baked fusion pose when the cached MOTION_DATA pose is stale but the Move GLB matches ARKit timing.
         /// </summary>
         public bool TryBuildJointOffsets(float seconds, IReadOnlyList<string> jointNames, out Vector3[] offsets)
+            => TryBuildJointOffsets(seconds, jointNames, out offsets, out _);
+
+        public bool TryBuildJointOffsets(float seconds, IReadOnlyList<string> jointNames, out Vector3[] offsets, out Vector3 rootWorld)
         {
             offsets = null;
+            rootWorld = Vector3.zero;
             if (!IsReady || handler == null || clip == null || root == null || avatar == null ||
                 jointNames == null || jointNames.Count == 0)
                 return false;
 
-            float len = clip.length;
-            float t = len > 0f ? Mathf.Repeat(seconds, len) : 0f;
-            clip.SampleAnimation(root, t);
+            // Use the same processed pose as the character (smoothing/glitch guard affect bone positions too).
+            HumanPose pose = new HumanPose();
+            if (!SampleProcessedPose(seconds, ref pose))
+                return false;
 
             int n = jointNames.Count;
             offsets = new Vector3[n];
             Transform rootBone = ResolveMoveBone(jointNames[0]);
             Vector3 rootPos = rootBone != null ? rootBone.position : (Hips != null ? Hips.position : root.transform.position);
+            rootWorld = rootPos;
             int mapped = 0;
             for (int i = 0; i < n; i++)
             {

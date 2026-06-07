@@ -23,10 +23,10 @@ RenderSettings:
   m_AmbientSkyColor: {r: 0.55, g: 0.58, b: 0.62, a: 1}
   m_AmbientEquatorColor: {r: 0.44, g: 0.44, b: 0.46, a: 1}
   m_AmbientGroundColor: {r: 0.3, g: 0.28, b: 0.24, a: 1}
-  m_AmbientIntensity: 1.39
+  m_AmbientIntensity: 1.69
   m_AmbientMode: 0
   m_SubtractiveShadowColor: {r: 0.42, g: 0.478, b: 0.627, a: 1}
-  m_SkyboxMaterial: {fileID: 638994859}
+  m_SkyboxMaterial: {fileID: 235188345}
   m_HaloStrength: 0.5
   m_FlareStrength: 1
   m_FlareFadeSpeed: 3
@@ -1082,7 +1082,7 @@ Light:
   serializedVersion: 11
   m_Type: 1
   m_Color: {r: 0.96, g: 0.96, b: 1, a: 1}
-  m_Intensity: 0.68
+  m_Intensity: 1.41
   m_Range: 10
   m_SpotAngle: 30
   m_InnerSpotAngle: 21.80208
@@ -1922,6 +1922,41 @@ CanvasRenderer:
   m_PrefabAsset: {fileID: 0}
   m_GameObject: {fileID: 227592389}
   m_CullTransparentMesh: 1
+--- !u!21 &235188345
+Material:
+  serializedVersion: 8
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_Name: CharacterLab_HDRI
+  m_Shader: {fileID: 103, guid: 0000000000000000f000000000000000, type: 0}
+  m_Parent: {fileID: 0}
+  m_ModifiedSerializedProperties: 0
+  m_ValidKeywords: []
+  m_InvalidKeywords: []
+  m_LightmapFlags: 4
+  m_EnableInstancingVariants: 0
+  m_DoubleSidedGI: 0
+  m_CustomRenderQueue: -1
+  stringTagMap: {}
+  disabledShaderPasses: []
+  m_LockedProperties: 
+  m_SavedProperties:
+    serializedVersion: 3
+    m_TexEnvs:
+    - _Tex:
+        m_Texture: {fileID: 8900000, guid: 78158039b959f4b5a8b33473990c824a, type: 3}
+        m_Scale: {x: 1, y: 1}
+        m_Offset: {x: 0, y: 0}
+    m_Ints: []
+    m_Floats:
+    - _Exposure: 0.15
+    - _Rotation: 0
+    m_Colors:
+    - _Tint: {r: 1, g: 0.94373065, b: 0.8349056, a: 1}
+  m_BuildTextureStacks: []
+  m_AllowLocking: 1
 --- !u!1 &242295897
 GameObject:
   m_ObjectHideFlags: 0
@@ -5712,41 +5747,6 @@ CanvasRenderer:
   m_PrefabAsset: {fileID: 0}
   m_GameObject: {fileID: 637487712}
   m_CullTransparentMesh: 1
---- !u!21 &638994859
-Material:
-  serializedVersion: 8
-  m_ObjectHideFlags: 0
-  m_CorrespondingSourceObject: {fileID: 0}
-  m_PrefabInstance: {fileID: 0}
-  m_PrefabAsset: {fileID: 0}
-  m_Name: CharacterLab_HDRI
-  m_Shader: {fileID: 103, guid: 0000000000000000f000000000000000, type: 0}
-  m_Parent: {fileID: 0}
-  m_ModifiedSerializedProperties: 0
-  m_ValidKeywords: []
-  m_InvalidKeywords: []
-  m_LightmapFlags: 4
-  m_EnableInstancingVariants: 0
-  m_DoubleSidedGI: 0
-  m_CustomRenderQueue: -1
-  stringTagMap: {}
-  disabledShaderPasses: []
-  m_LockedProperties: 
-  m_SavedProperties:
-    serializedVersion: 3
-    m_TexEnvs:
-    - _Tex:
-        m_Texture: {fileID: 8900000, guid: 78158039b959f4b5a8b33473990c824a, type: 3}
-        m_Scale: {x: 1, y: 1}
-        m_Offset: {x: 0, y: 0}
-    m_Ints: []
-    m_Floats:
-    - _Exposure: 0.15
-    - _Rotation: 0
-    m_Colors:
-    - _Tint: {r: 1, g: 0.9812631, b: 0.9386792, a: 1}
-  m_BuildTextureStacks: []
-  m_AllowLocking: 1
 --- !u!1001 &644975186
 PrefabInstance:
   m_ObjectHideFlags: 0
@@ -8576,7 +8576,7 @@ Light:
   serializedVersion: 11
   m_Type: 1
   m_Color: {r: 1, g: 0.97, b: 0.9, a: 1}
-  m_Intensity: 1.62
+  m_Intensity: 2.08
   m_Range: 10
   m_SpotAngle: 30
   m_InnerSpotAngle: 21.80208
@@ -10238,7 +10238,7 @@ MonoBehaviour:
     - mixamorig:Hips
     - Pelvis
     - root
-  invertFacing: 1
+  invertFacing: 0
   flipCharacterForward: 1
   loop: 1
   playbackSpeed: 1
@@ -10250,17 +10250,17 @@ MonoBehaviour:
     fullMotionVelocity: 0.2
     followSeconds: 0.1
     correctXZOnly: 0
-    moveDrivenFacing: 0
+    moveDrivenFacing: 1
     facingCorrectionSeconds: 2
   playbackAnchorMode: 2
-  enablePoseSmoothing: 0
+  enablePoseSmoothing: 1
   postProcessSettings:
-    enableGlitchGuard: 0
-    maxJointSpeed: 12
-    boneLengthTolerance: 0.4
-    enableSmoothing: 0
-    minCutoff: 2.7
-    beta: 0.1
+    enableGlitchGuard: 1
+    maxJointSpeed: 6
+    boneLengthTolerance: 0.25
+    enableSmoothing: 1
+    minCutoff: 0.35
+    beta: 0.08
     smoothRootTranslation: 0
     jumpVelocityThreshold: 1.5
     jumpBetaScale: 8
@@ -10276,8 +10276,8 @@ MonoBehaviour:
     skipDuringJump: 1
     debugDraw: 0
   surfaceProbe: {fileID: 1834499786}
-  heightFitMode: 0
-  skeletonFitScale: 1
+  heightFitMode: 2
+  skeletonFitScale: 0.9333801
 --- !u!114 &1266904064
 MonoBehaviour:
   m_ObjectHideFlags: 0
@@ -10740,7 +10740,7 @@ Light:
   serializedVersion: 11
   m_Type: 1
   m_Color: {r: 0.82, g: 0.89, b: 1, a: 1}
-  m_Intensity: 0.68
+  m_Intensity: 1.41
   m_Range: 10
   m_SpotAngle: 30
   m_InnerSpotAngle: 21.80208
@@ -14914,7 +14914,7 @@ Light:
   serializedVersion: 11
   m_Type: 1
   m_Color: {r: 0.9, g: 0.94, b: 1, a: 1}
-  m_Intensity: 0.68
+  m_Intensity: 1.41
   m_Range: 10
   m_SpotAngle: 30
   m_InnerSpotAngle: 21.80208
@@ -16811,7 +16811,7 @@ MonoBehaviour:
   exportToPhotoLibraryAfterCapture: 1
   rotation: 4
   cameraManager: {fileID: 331264288}
-  enableEncoderPrewarm: 1
+  enableEncoderPrewarm: 0
   prewarmDelayAfterFirstFrameSeconds: 6
   deferPrewarmUntilStill: 1
   prewarmStillnessThresholdRadPerSec: 0.75

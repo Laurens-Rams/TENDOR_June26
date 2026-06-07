@@ -1,4 +1,6 @@
+using System.Collections;
 using System.Collections.Generic;
+using System.Globalization;
 using System.Text;
 using UnityEngine;
 using BodyTracking.Animation;
@@ -47,6 +49,9 @@ namespace BodyTracking.Playback
             // Fit the foot->head BONE-CHAIN (joint to joint) to the skeleton. Lands the character's joints on the
             // orange joints, but lets the mesh crown/soles stick out past the skeleton (character looks taller).
             BoneChain,
+            // Match the character's mapped head and foot bones to the orange skeleton's Head and toe/ankle joints
+            // (measured from the pelvis). Default for GLB replay so shoes and head land on the skeleton.
+            SkeletonJoints,
         }
 
         /// <summary>Where the per-frame body + finger articulation comes from.</summary>
@@ -76,7 +81,7 @@ namespace BodyTracking.Playback
             fullMotionVelocity = 0.2f,
             followSeconds = 0.1f,
             correctXZOnly = false,
-            moveDrivenFacing = false,
+            moveDrivenFacing = true,
             facingCorrectionSeconds = 2f,
         };
 
@@ -98,7 +103,22 @@ namespace BodyTracking.Playback
                 playbackAnchorMode = value;
                 // Rebake the one-shot GLB yaw offset when switching Baked vs Live mid-playback.
                 anchorState.hasFacing = false;
+                // Re-capture the move-driven anchor so the test mode re-anchors cleanly each time it's enabled.
+                anchorState.hasMoveDrivenAnchor = false;
+                anchorState.requestRealign = false;
             }
+        }
+
+        /// <summary>Bumped each time <see cref="RealignMoveMovement"/> is called, so the compare overlay (which
+        /// keeps its own anchor state) can mirror the re-align and stay aligned with the character.</summary>
+        public int MoveRealignEpoch { get; private set; }
+
+        /// <summary>Trigger hook (UI button / future automatic triggers): re-anchor the Move-driven test mode at
+        /// the current frame. The solver captures a fresh ARKit anchor + yaw and continues from there exactly.</summary>
+        public void RealignMoveMovement()
+        {
+            anchorState.requestRealign = true;
+            MoveRealignEpoch++;
         }
 
         /// <summary>
@@ -109,8 +129,9 @@ namespace BodyTracking.Playback
         public FusedPoseSolver.AnchorSettings EffectivePlaybackAnchorSettings()
         {
             var s = anchorSettings;
-            s.mode = playbackAnchorMode == FusedPoseSolver.AnchorMode.FollowBakedRoot
-                ? FusedPoseSolver.AnchorMode.FollowBakedRoot
+            s.mode = (playbackAnchorMode == FusedPoseSolver.AnchorMode.FollowBakedRoot
+                      || playbackAnchorMode == FusedPoseSolver.AnchorMode.FollowMoveGlbRoot)
+                ? playbackAnchorMode
                 : FusedPoseSolver.AnchorMode.FollowArkit;
             return s;
         }
@@ -119,16 +140,16 @@ namespace BodyTracking.Playback
         public MoveGlbSource ActiveGlbSource => glbActive && glbSource != null && glbSource.IsReady ? glbSource : null;
 
         [Header("Post-processing")]
-        [Tooltip("Master switch for glitch guard + jitter smoothing on the pose (Step 2/3).")]
-        [SerializeField] private bool enablePoseSmoothing = false;
+        [Tooltip("Master switch for jitter smoothing on the GLB muscles + joint overlay. Glitch guard can stay on when this is off.")]
+        [SerializeField] private bool enablePoseSmoothing = true;
         [SerializeField] private PosePostProcessSettings postProcessSettings = new PosePostProcessSettings
         {
-            enableGlitchGuard = false,
-            maxJointSpeed = 12f,
-            boneLengthTolerance = 0.4f,
-            enableSmoothing = false,
-            minCutoff = 1.0f,
-            beta = 0.01f,
+            enableGlitchGuard = true,
+            maxJointSpeed = 6f,
+            boneLengthTolerance = 0.25f,
+            enableSmoothing = true,
+            minCutoff = 0.35f,
+            beta = 0.08f,
             smoothRootTranslation = false,
             jumpVelocityThreshold = 1.5f,
             jumpBetaScale = 8f,
@@ -143,7 +164,10 @@ namespace BodyTracking.Playback
             enableWallFootIK = false,
             maxIkWeight = 1f,
             penetrationForFullWeight = 0.08f,
-            wholeBodyPenetrationFraction = 0.5f,
+            enableWholeBodyPush = false,
+            minWholeBodyPenetration = 0.04f,
+            wholeBodyPenetrationFraction = 0.75f,
+            maxWholeBodyPushMeters = 0.12f,
             skipDuringJump = true,
             debugDraw = false,
         };
@@ -154,16 +178,22 @@ namespace BodyTracking.Playback
         private readonly PosePostProcessor postProcessor = new PosePostProcessor();
         private readonly PosePenetrationResolver penetrationResolver = new PosePenetrationResolver();
         private int[] footWorldIndices = System.Array.Empty<int>();
+        private int[] wallContactWorldIndices = System.Array.Empty<int>();
 
         [Header("Fit")]
         [Tooltip("How the one uniform character scale is chosen. RenderedMeshHeight (default) matches the visible " +
                  "mesh — hair/crown down to the soles — to the recorded climber height, so the character stops " +
                  "looking too tall. BoneChain matches joint-to-joint and lets the mesh overshoot the skeleton.")]
-        [SerializeField] private HeightFitMode heightFitMode = HeightFitMode.RenderedMeshHeight;
+        [SerializeField] private HeightFitMode heightFitMode = HeightFitMode.SkeletonJoints;
         [Tooltip("Optional fine-tune multiplier on the auto-computed height scale. Leave at 1 for an exact fit; " +
                  "nudge down/up if the mesh still reads slightly large/small. Live-adjustable in play mode.")]
-        [SerializeField, Range(0.5f, 1.5f)] private float skeletonFitScale = 1f;
+        [SerializeField, Range(0.5f, 1.5f)] private float skeletonFitScale = 0.9333801f;
         private float lastAppliedFitScale = float.NaN;
+
+        [Header("Dev")]
+        [Tooltip("Every 15s, log all live tuning values in Unity scene YAML form (Xcode console) for copy/paste.")]
+        [SerializeField] private bool logTuningSettingsEvery15s = true;
+        Coroutine tuningSnapshotLogRoutine;
 
         private IRouteRootProvider routeRootProvider;
         private CoordinateFrame referenceFrame;
@@ -255,12 +285,26 @@ namespace BodyTracking.Playback
         public bool EnablePoseSmoothing
         {
             get => enablePoseSmoothing;
-            set => enablePoseSmoothing = value;
+            set
+            {
+                enablePoseSmoothing = value;
+                if (value)
+                {
+                    var s = postProcessSettings;
+                    s.enableSmoothing = true;
+                    postProcessSettings = s;
+                }
+                RefreshGlbPostProcess();
+            }
         }
         public PosePostProcessSettings PostProcessSettings
         {
             get => postProcessSettings;
-            set => postProcessSettings = value;
+            set
+            {
+                postProcessSettings = value;
+                RefreshGlbPostProcess();
+            }
         }
         public bool EnablePenetrationFix
         {
@@ -291,6 +335,96 @@ namespace BodyTracking.Playback
         }
 
         public void SetRouteRootLocalOffset(Vector3 offset) => routeRootLocalOffset = offset;
+
+        void OnEnable()
+        {
+            if (logTuningSettingsEvery15s)
+                tuningSnapshotLogRoutine = StartCoroutine(TuningSnapshotLogLoop());
+        }
+
+        void OnDisable()
+        {
+            if (tuningSnapshotLogRoutine != null)
+            {
+                StopCoroutine(tuningSnapshotLogRoutine);
+                tuningSnapshotLogRoutine = null;
+            }
+        }
+
+        IEnumerator TuningSnapshotLogLoop()
+        {
+            var wait = new WaitForSecondsRealtime(15f);
+            while (true)
+            {
+                yield return wait;
+                LogTuningSnapshotForCopy();
+            }
+        }
+
+        /// <summary>Emit all tunables in Unity scene YAML form for copy/paste into NewVersion.unity.</summary>
+        public void LogTuningSnapshotForCopy()
+        {
+            var a = anchorSettings;
+            var pp = postProcessSettings;
+            var pen = penetrationSettings;
+            var bake = Object.FindFirstObjectByType<MoveAIFusionCoordinator>()?.BakeSettings
+                       ?? MoveAIFusionBaker.Settings.Default;
+
+            var sb = new StringBuilder(2048);
+            sb.AppendLine("[FusedCharacterPlayer] === Tuning snapshot — copy block below into scene YAML ===");
+            sb.AppendLine("  invertFacing: " + YBool(invertFacing));
+            sb.AppendLine("  flipCharacterForward: " + YBool(flipCharacterForward));
+            sb.AppendLine("  loop: " + YBool(loop));
+            sb.AppendLine("  playbackSpeed: " + YFloat(playbackSpeed));
+            sb.AppendLine("  routeRootLocalOffset: {x: " + YFloat(routeRootLocalOffset.x) + ", y: " + YFloat(routeRootLocalOffset.y) + ", z: " + YFloat(routeRootLocalOffset.z) + "}");
+            sb.AppendLine("  articulationSource: " + (int)articulationSource + "  # " + articulationSource);
+            sb.AppendLine("  anchorSettings:");
+            sb.AppendLine("    mode: " + (int)a.mode + "  # " + a.mode);
+            sb.AppendLine("    stillnessVelocity: " + YFloat(a.stillnessVelocity));
+            sb.AppendLine("    fullMotionVelocity: " + YFloat(a.fullMotionVelocity));
+            sb.AppendLine("    followSeconds: " + YFloat(a.followSeconds));
+            sb.AppendLine("    correctXZOnly: " + YBool(a.correctXZOnly));
+            sb.AppendLine("    moveDrivenFacing: " + YBool(a.moveDrivenFacing));
+            sb.AppendLine("    facingCorrectionSeconds: " + YFloat(a.facingCorrectionSeconds));
+            sb.AppendLine("  playbackAnchorMode: " + (int)playbackAnchorMode + "  # " + playbackAnchorMode);
+            sb.AppendLine("  enablePoseSmoothing: " + YBool(enablePoseSmoothing));
+            sb.AppendLine("  postProcessSettings:");
+            sb.AppendLine("    enableGlitchGuard: " + YBool(pp.enableGlitchGuard));
+            sb.AppendLine("    maxJointSpeed: " + YFloat(pp.maxJointSpeed));
+            sb.AppendLine("    boneLengthTolerance: " + YFloat(pp.boneLengthTolerance));
+            sb.AppendLine("    enableSmoothing: " + YBool(pp.enableSmoothing));
+            sb.AppendLine("    minCutoff: " + YFloat(pp.minCutoff));
+            sb.AppendLine("    beta: " + YFloat(pp.beta));
+            sb.AppendLine("    smoothRootTranslation: " + YBool(pp.smoothRootTranslation));
+            sb.AppendLine("    jumpVelocityThreshold: " + YFloat(pp.jumpVelocityThreshold));
+            sb.AppendLine("    jumpBetaScale: " + YFloat(pp.jumpBetaScale));
+            sb.AppendLine("  enablePenetrationFix: " + YBool(enablePenetrationFix));
+            sb.AppendLine("  penetrationSettings:");
+            sb.AppendLine("    enableFloorFix: " + YBool(pen.enableFloorFix));
+            sb.AppendLine("    floorContactBand: " + YFloat(pen.floorContactBand));
+            sb.AppendLine("    enableWallHandIK: " + YBool(pen.enableWallHandIK));
+            sb.AppendLine("    enableWallFootIK: " + YBool(pen.enableWallFootIK));
+            sb.AppendLine("    maxIkWeight: " + YFloat(pen.maxIkWeight));
+            sb.AppendLine("    penetrationForFullWeight: " + YFloat(pen.penetrationForFullWeight));
+            sb.AppendLine("    enableWholeBodyPush: " + YBool(pen.enableWholeBodyPush));
+            sb.AppendLine("    minWholeBodyPenetration: " + YFloat(pen.minWholeBodyPenetration));
+            sb.AppendLine("    wholeBodyPenetrationFraction: " + YFloat(pen.wholeBodyPenetrationFraction));
+            sb.AppendLine("    maxWholeBodyPushMeters: " + YFloat(pen.maxWholeBodyPushMeters));
+            sb.AppendLine("    skipDuringJump: " + YBool(pen.skipDuringJump));
+            sb.AppendLine("    debugDraw: " + YBool(pen.debugDraw));
+            sb.AppendLine("  heightFitMode: " + (int)heightFitMode + "  # " + heightFitMode);
+            sb.AppendLine("  skeletonFitScale: " + YFloat(skeletonFitScale));
+            sb.AppendLine("--- MoveAIFusionCoordinator (fusion bake) ---");
+            sb.AppendLine("  axisWeights: {x: " + YFloat(bake.axisWeights.x) + ", y: " + YFloat(bake.axisWeights.y) + ", z: " + YFloat(bake.axisWeights.z) + "}");
+            sb.AppendLine("  smoothingTau: " + YFloat(bake.smoothingTau));
+            sb.AppendLine("  outlierMeters: " + YFloat(bake.outlierMeters));
+            sb.AppendLine("[FusedCharacterPlayer] === End tuning snapshot ===");
+            Debug.Log(sb.ToString());
+        }
+
+        static int YBool(bool v) => v ? 1 : 0;
+
+        static string YFloat(float v) => v.ToString("G", CultureInfo.InvariantCulture);
 
         public event System.Action OnPlaybackStarted;
         public event System.Action OnPlaybackStopped;
@@ -345,6 +479,17 @@ namespace BodyTracking.Playback
         /// source to drive the character from the GLB; pass null to fall back to the procedural position solver.
         /// Builds the character's Humanoid pose handler (and a runtime avatar if the rig is generic) on demand.
         /// </summary>
+        void RefreshGlbPostProcess()
+        {
+            if (glbSource == null) return;
+            glbSource.SetPostProcess(
+                enablePoseSmoothing && postProcessSettings.enableSmoothing,
+                postProcessSettings.minCutoff,
+                postProcessSettings.beta,
+                postProcessSettings.enableGlitchGuard,
+                postProcessSettings.maxJointSpeed);
+        }
+
         public void SetMoveGlbSource(MoveGlbSource source)
         {
             glbSource = source;
@@ -352,8 +497,7 @@ namespace BodyTracking.Playback
             // Step 2b: smooth the GLB's muscle-space body/finger jitter (the world-joint smoothing can't see it).
             if (source != null)
             {
-                source.SetSmoothing(enablePoseSmoothing && postProcessSettings.enableSmoothing,
-                    postProcessSettings.minCutoff, postProcessSettings.beta);
+                RefreshGlbPostProcess();
                 source.ResetSmoothing();
             }
 
@@ -501,6 +645,7 @@ namespace BodyTracking.Playback
                 DisableRigAnimator();
                 if (articulationSource == BodyArticulationSource.MoveGlb)
                     EnsureCharacterHumanoid();
+                ApplyRecordingHeightScale();
             }
             return true;
         }
@@ -555,6 +700,8 @@ namespace BodyTracking.Playback
             loggedPlacement = false;
             anchorState = default;
             postProcessor.Reset();
+            RefreshGlbPostProcess();
+            glbSource?.ResetSmoothing();
             hasLastGoodBodyBasis = false;
             waitingForLocalization = !routeRootProvider.IsLocalized;
             SetCharacterVisible(characterRoot != null && !waitingForLocalization);
@@ -686,9 +833,8 @@ namespace BodyTracking.Playback
             Vector3[] local = FusedPoseSolver.ComputeLocalJoints(asset, recording, t, ref anchorState, out Quaternion effectiveFacingLocal, invertFacing, effAnchorSettings, ActiveGlbSource);
             if (local == null) return;
 
-            // Step 2/3: glitch guard + jump-aware jitter smoothing, in stable RouteRoot-local space so phone motion
-            // is never smoothed — only the pose.
-            if (enablePoseSmoothing)
+            // Step 2/3: joint-array cleanup for the procedural path. GLB replay handles muscles in MoveGlbSource.
+            if (!glbActive && (enablePoseSmoothing || postProcessSettings.enableGlitchGuard))
                 postProcessor.Process(local, rootJointIndex, Time.deltaTime, postProcessSettings);
             bool jumping = postProcessor.LastJumping;
 
@@ -703,7 +849,8 @@ namespace BodyTracking.Playback
             {
                 if (routeRootProvider != null && routeRootProvider.RouteRoot != null)
                     surfaceProbe.SetRouteRoot(routeRootProvider.RouteRoot);
-                penetrationResolver.ResolveBodyAndFloor(world, rootJointIndex, footWorldIndices, jumping, penetrationSettings);
+                penetrationResolver.ResolveBodyAndFloor(world, rootJointIndex, footWorldIndices, wallContactWorldIndices,
+                    jumping, penetrationSettings);
             }
 
             // GLB articulation path: body + fingers come from the Move GLB (muscle space); positioning + facing
@@ -953,7 +1100,15 @@ namespace BodyTracking.Playback
 
             float currentScale = Mathf.Max(0.01f, (characterRoot.localScale.x + characterRoot.localScale.y + characterRoot.localScale.z) / 3f);
 
-            // Preferred (default): match the character's RENDERED height — the crown of the mesh (hair included)
+            // Default: match mapped head + foot bones to the orange skeleton joints (same asset.scale the overlay uses).
+            if (heightFitMode == HeightFitMode.SkeletonJoints && TryComputeSkeletonJointScale(currentScale, fit, out float jointScale))
+            {
+                characterRoot.localScale = Vector3.one * jointScale;
+                Debug.Log($"[FusedCharacterPlayer] Character skeleton-joint fit scale={jointScale:F3} (head+feet → orange joints, fit={fit:F2})");
+                return;
+            }
+
+            // Preferred (legacy): match the character's RENDERED height — the crown of the mesh (hair included)
             // down to the soles — to the recorded climber's height. The orange/cyan skeletons only reach the Head
             // JOINT (well below the crown) and the toe JOINT (above the sole), so a joint-to-joint chain fit leaves
             // the mesh overshooting top and bottom and the character looks too tall. Fitting the mesh extent makes
@@ -1013,6 +1168,71 @@ namespace BodyTracking.Playback
             Debug.Log($"[FusedCharacterPlayer] Character height scale={targetScale:F3} " +
                       $"(target {targetHeight:F2}m / model {currentHeight:F2}m, " +
                       $"fit={fit:F2}, measure={(usingBoneHeight ? "joints" : "mesh-bounds")})");
+        }
+
+        static readonly string[] FootJointCandidates = { "Left_toe", "Right_toe", "Left_ankle", "Right_ankle" };
+
+        /// <summary>
+        /// Uniform scale so the character's mapped head and foot land on the orange skeleton's Head and foot joints
+        /// when the pelvis is pinned. Uses the same <see cref="MoveAIFusionAsset.scale"/> as
+        /// <see cref="FusedPoseSolver.ComputeLocalJoints"/>. Averages hip→head and hip→foot ratios so both extremities
+        /// match as closely as a single scale allows.
+        /// </summary>
+        bool TryComputeSkeletonJointScale(float currentUniformScale, float fitMultiplier, out float scale)
+        {
+            scale = 0f;
+            if (asset?.pose == null || asset.pose.FrameCount == 0 || boneByJoint.Count == 0)
+                return false;
+
+            var pose = asset.pose;
+            int headIdx = pose.IndexOfJoint("Head");
+            if (headIdx < 0) headIdx = pose.IndexOfJoint("Neck");
+            int footIdx = FindMappedExtremityJoint(pose, rootJointIndex, FootJointCandidates);
+            if (headIdx < 0 || footIdx < 0) return false;
+            if (!boneByJoint.TryGetValue(rootJointIndex, out var hipsBone) || hipsBone == null) return false;
+            if (!boneByJoint.TryGetValue(headIdx, out var headBone) || headBone == null) return false;
+            if (!boneByJoint.TryGetValue(footIdx, out var footBone) || footBone == null) return false;
+
+            var fk = pose.ForwardKinematics(pose.frames[0]);
+            if (fk == null || headIdx >= fk.Length || footIdx >= fk.Length || rootJointIndex >= fk.Length)
+                return false;
+
+            float poseScale = Mathf.Max(0.01f, asset.scale);
+            float moveHeadDist = Vector3.Distance(fk[headIdx], fk[rootJointIndex]);
+            float moveFootDist = Vector3.Distance(fk[footIdx], fk[rootJointIndex]);
+            if (moveHeadDist < 0.05f || moveFootDist < 0.05f) return false;
+
+            // Normalize out the current root scale so re-applying the fit slider stays stable, not cumulative.
+            float charHeadDist = Vector3.Distance(headBone.position, hipsBone.position) / currentUniformScale;
+            float charFootDist = Vector3.Distance(footBone.position, hipsBone.position) / currentUniformScale;
+            if (charHeadDist < 0.05f || charFootDist < 0.05f) return false;
+
+            float headRatio = (moveHeadDist * poseScale) / charHeadDist;
+            float footRatio = (moveFootDist * poseScale) / charFootDist;
+            scale = Mathf.Max(0.01f, 0.5f * (headRatio + footRatio) * fitMultiplier);
+            return true;
+        }
+
+        int FindMappedExtremityJoint(MoveMotion pose, int rootIdx, string[] jointNames)
+        {
+            if (pose == null || pose.FrameCount == 0 || rootIdx < 0) return -1;
+            var fk = pose.ForwardKinematics(pose.frames[0]);
+            if (fk == null || rootIdx >= fk.Length) return -1;
+
+            int best = -1;
+            float bestDist = 0f;
+            foreach (var name in jointNames)
+            {
+                int idx = pose.IndexOfJoint(name);
+                if (idx < 0 || idx >= fk.Length || !boneByJoint.ContainsKey(idx)) continue;
+                float dist = Vector3.Distance(fk[idx], fk[rootIdx]);
+                if (dist > bestDist)
+                {
+                    bestDist = dist;
+                    best = idx;
+                }
+            }
+            return best;
         }
 
         /// <summary>
@@ -1724,12 +1944,24 @@ namespace BodyTracking.Playback
             postProcessor.Reset();
 
             var feet = new List<int>();
+            var wallContacts = new List<int>();
             foreach (var name in new[] { "Left_ankle", "Right_ankle", "Left_toe", "Right_toe" })
             {
                 int idx = pose.IndexOfJoint(name);
-                if (idx >= 0) feet.Add(idx);
+                if (idx >= 0)
+                {
+                    feet.Add(idx);
+                    wallContacts.Add(idx);
+                }
+            }
+            foreach (var name in new[] { "Left_wrist", "Right_wrist", "Left_hand", "Right_hand" })
+            {
+                int idx = pose.IndexOfJoint(name);
+                if (idx >= 0 && !wallContacts.Contains(idx))
+                    wallContacts.Add(idx);
             }
             footWorldIndices = feet.ToArray();
+            wallContactWorldIndices = wallContacts.ToArray();
 
             if (surfaceProbe == null)
                 surfaceProbe = FindAnyObjectByType<ARSurfaceProbe>();

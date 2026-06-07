@@ -49,7 +49,7 @@ public class VideoRecorder : MonoBehaviour
 
     [Header("Encoder prewarm")]
     [Tooltip("Run a throwaway capture once at startup so the first real record tap is instant (~15s VideoToolbox init otherwise). Disable if the brief startup hitch is worse than a slow first record.")]
-    [SerializeField] private bool enableEncoderPrewarm = true;
+    [SerializeField] private bool enableEncoderPrewarm = false;
     [Tooltip("Seconds after the first AR camera frame before prewarm runs (lets map switches / localization settle first).")]
     [SerializeField] private float prewarmDelayAfterFirstFrameSeconds = 6f;
     [Tooltip("AVPro's first StartCapture blocks the main thread for several seconds (VideoToolbox init). Defer until the device is still so scanning/moving the phone stays responsive.")]

@@ -54,6 +54,25 @@ namespace BodyTracking.LookDev
         [Tooltip("How strongly the HDRI lights the scene (ambient).")]
         [Range(0f, 3f)] public float hdriAmbientIntensity = 1.0f;
 
+        [Header("Camera match (AR realism)")]
+        [Tooltip("Soften the character to better match the soft AR camera feed.")]
+        public bool softenForCamera = true;
+        [Tooltip("Full-screen soften pass (runs on device via compatibility-mode Execute).")]
+        public bool screenSoftening = true;
+        [Range(0f, 10f)] public float screenStrength = 5.5f;
+        [Range(0f, 0.35f)] public float screenMinBlend = 0.14f;
+        [Range(0.5f, 5f)] public float screenBlurRadius = 2.4f;
+        [Range(0f, 40f)] public float screenDepthStrength = 18f;
+        [Tooltip("Reduce normal-map strength so skin/cloth shading is less crisp.")]
+        public bool materialSoftening = true;
+        [Range(0f, 1f)] public float materialNormalScale = 0.45f;
+        [Tooltip("Enable FXAA on the AR camera (needs renderPostProcessing on).")]
+        public bool edgeSoftening = true;
+        [Tooltip("Slightly blur character textures via mipmap bias + lower aniso filtering.")]
+        public bool textureSoftening = true;
+        [Range(0f, 2f)] public float textureMipBias = 1.3f;
+        [Range(1, 4)] public int textureAnisoLevel = 1;
+
         // Light rig group/names match GymLightingSetup so the lab and main scene stay in sync.
         const string GroupName = "TendorLighting";
         const string KeyName = "Key Light (Skylights)";
@@ -111,14 +130,18 @@ namespace BodyTracking.LookDev
             if (root == null) return;
             DisableOcclusionShells(root);
             DisableShadows(root);
+            CharacterCameraMatch.ApplyToCharacter(root);
+            CharacterCameraMatch.ApplyToCamera(Camera.main);
         }
 
         public void ApplyMaterials()
         {
+            PushCameraMatchSettings();
             if (character == null) return;
 
             DisableOcclusionShells(character);
             DisableShadows(character);
+            CharacterCameraMatch.ApplyToCharacter(character);
 
             var seen = new HashSet<Material>();
             foreach (var r in character.GetComponentsInChildren<Renderer>(true))
@@ -192,6 +215,25 @@ namespace BodyTracking.LookDev
                 if (m != null && IsOcclusionShell(m.name))
                     return true;
             return false;
+        }
+
+        void PushCameraMatchSettings()
+        {
+            CharacterCameraMatch.SetSettings(new CharacterCameraMatch.Settings
+            {
+                enabled = softenForCamera,
+                screenSoftening = screenSoftening,
+                materialSoftening = materialSoftening,
+                textureSoftening = textureSoftening,
+                edgeSoftening = edgeSoftening,
+                screenStrength = screenStrength,
+                screenMinBlend = screenMinBlend,
+                screenBlurRadius = screenBlurRadius,
+                screenDepthStrength = screenDepthStrength,
+                materialNormalScale = materialNormalScale,
+                textureMipBias = textureMipBias,
+                textureAnisoLevel = textureAnisoLevel,
+            });
         }
 
         void ApplyMatte(Material mat, bool isEye)

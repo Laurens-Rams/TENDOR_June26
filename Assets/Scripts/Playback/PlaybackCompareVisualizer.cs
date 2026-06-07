@@ -35,6 +35,7 @@ namespace BodyTracking.Playback
         float localPlaybackTime;
         FusedPoseSolver.AnchorState moveAnchorState; // last-good anchor/facing through ARKit dropouts
         FusedPoseSolver.AnchorMode lastPlaybackAnchorMode = (FusedPoseSolver.AnchorMode)(-1);
+        int lastRealignEpoch; // mirrors FusedCharacterPlayer.MoveRealignEpoch so the overlay re-anchors in sync
 
         SkeletonLayer arkitLayer;
         SkeletonLayer moveLayer;
@@ -179,6 +180,12 @@ namespace BodyTracking.Playback
             // last-good anchor/facing through ARKit dropouts so the overlay no longer spins when the body is lost.
             var anchorSettings = fusedPlayer != null ? fusedPlayer.EffectivePlaybackAnchorSettings() : FusedPoseSolver.AnchorSettings.Default;
             SyncAnchorMode(anchorSettings.mode);
+            // Mirror the character's Move-driven re-align so the orange overlay re-anchors at the same moment.
+            if (fusedPlayer != null && fusedPlayer.MoveRealignEpoch != lastRealignEpoch)
+            {
+                lastRealignEpoch = fusedPlayer.MoveRealignEpoch;
+                moveAnchorState.requestRealign = true;
+            }
             var glb = fusedPlayer != null ? fusedPlayer.ActiveGlbSource : null;
             bool effInvert = fusedPlayer != null ? fusedPlayer.InvertFacing : invertFacing;
             Vector3[] local = FusedPoseSolver.ComputeLocalJoints(fusion, recording, t, ref moveAnchorState, out _, effInvert, anchorSettings, glb);
@@ -207,6 +214,8 @@ namespace BodyTracking.Playback
             if (lastPlaybackAnchorMode == mode) return;
             lastPlaybackAnchorMode = mode;
             moveAnchorState.hasFacing = false;
+            // Re-capture the Move-driven anchor on mode switch so the overlay re-anchors cleanly like the character.
+            moveAnchorState.hasMoveDrivenAnchor = false;
         }
 
         static bool TryGetSample(HipFrame frame, int jointIndex, out RecordedJointSample sample)

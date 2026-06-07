@@ -297,6 +297,24 @@ namespace BodyTracking.UI
             return root.gameObject;
         }
 
+        /// <summary>Horizontal swap chevrons (switch / cycle between items).</summary>
+        public static GameObject AddSwitchIcon(Transform parent, float size, Color color)
+        {
+            var root = CreateRect("Icon_Switch", parent);
+            Center(root, new Vector2(size, size));
+
+            float stroke = Mathf.Max(2f, size * 0.13f);
+            float arm = size * 0.24f;
+            float xOff = size * 0.16f;
+
+            AddChevronArm(root, "ChevL_T", new Vector2(-xOff, arm * 0.22f), arm, 38f, stroke, color);
+            AddChevronArm(root, "ChevL_B", new Vector2(-xOff, -arm * 0.22f), arm, -38f, stroke, color);
+            AddChevronArm(root, "ChevR_T", new Vector2(xOff, arm * 0.22f), arm, -38f, stroke, color);
+            AddChevronArm(root, "ChevR_B", new Vector2(xOff, -arm * 0.22f), arm, 38f, stroke, color);
+
+            return root.gameObject;
+        }
+
         /// <summary>Minimal stick-figure climber for the moving playhead.</summary>
         public static GameObject AddClimberIcon(Transform parent, float size, Color color)
         {
@@ -386,6 +404,26 @@ namespace BodyTracking.UI
             rect.anchoredPosition = pos;
             var img = rect.gameObject.AddComponent<Image>();
             img.sprite = RoundedSprite(3);
+            img.type = Image.Type.Sliced;
+            img.color = color;
+            img.raycastTarget = false;
+        }
+
+        private static void AddChevronArm(
+            Transform parent,
+            string name,
+            Vector2 pos,
+            float length,
+            float angleDeg,
+            float stroke,
+            Color color)
+        {
+            var rect = CreateRect(name, parent);
+            rect.sizeDelta = new Vector2(stroke, length);
+            rect.anchoredPosition = pos;
+            rect.localRotation = Quaternion.Euler(0f, 0f, angleDeg);
+            var img = rect.gameObject.AddComponent<Image>();
+            img.sprite = RoundedSprite(2);
             img.type = Image.Type.Sliced;
             img.color = color;
             img.raycastTarget = false;

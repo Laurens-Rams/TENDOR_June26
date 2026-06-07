@@ -81,6 +81,7 @@ namespace BodyTracking.AR
                     Vector3 normal = rh.normal.sqrMagnitude > 1e-6f ? rh.normal.normalized : outwardGuess;
                     Vector3 target = rh.point + normal * wallSkinOffset;
                     float pen = Vector3.Dot(target - worldPos, normal);
+                    pen = Mathf.Clamp(pen, 0f, maxProbeDistance);
                     hit = new SurfaceHit
                     {
                         valid = true,
@@ -100,6 +101,7 @@ namespace BodyTracking.AR
             Vector3 fwd = routeRoot.forward;
             float localZ = Vector3.Dot(worldPos - origin, fwd);
             float penetration = wallSkinOffset - localZ; // >0 when the joint is inside the skin surface
+            penetration = Mathf.Clamp(penetration, 0f, maxProbeDistance);
             hit = new SurfaceHit
             {
                 valid = true,
