@@ -91,6 +91,10 @@ namespace BodyTracking.Editor
                 }
             }
 
+            var fbxController = Object.FindAnyObjectByType<BodyTracking.Animation.FBXCharacterController>();
+            if (fbxController != null && fbxController.GetComponent<ARCharacterPlanarShadow>() == null)
+                Undo.AddComponent<ARCharacterPlanarShadow>(fbxController.gameObject);
+
             EditorSceneManager.MarkSceneDirty(scene);
             Selection.activeGameObject = camGo;
 

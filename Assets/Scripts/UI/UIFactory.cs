@@ -267,6 +267,118 @@ namespace BodyTracking.UI
             return img;
         }
 
+        /// <summary>Procedural checkmark (two strokes) for finish / done markers.</summary>
+        public static GameObject AddCheckmarkIcon(Transform parent, float size, Color color)
+        {
+            var root = CreateRect("Icon_Check", parent);
+            Center(root, new Vector2(size, size));
+
+            float stroke = Mathf.Max(2.5f, size * 0.14f);
+            var shortLeg = CreateRect("LegShort", root);
+            shortLeg.sizeDelta = new Vector2(stroke, size * 0.38f);
+            shortLeg.anchoredPosition = new Vector2(-size * 0.12f, -size * 0.06f);
+            shortLeg.localRotation = Quaternion.Euler(0f, 0f, 38f);
+            var shortImg = shortLeg.gameObject.AddComponent<Image>();
+            shortImg.sprite = RoundedSprite(2);
+            shortImg.type = Image.Type.Sliced;
+            shortImg.color = color;
+            shortImg.raycastTarget = false;
+
+            var longLeg = CreateRect("LegLong", root);
+            longLeg.sizeDelta = new Vector2(stroke, size * 0.62f);
+            longLeg.anchoredPosition = new Vector2(size * 0.1f, size * 0.04f);
+            longLeg.localRotation = Quaternion.Euler(0f, 0f, -52f);
+            var longImg = longLeg.gameObject.AddComponent<Image>();
+            longImg.sprite = RoundedSprite(2);
+            longImg.type = Image.Type.Sliced;
+            longImg.color = color;
+            longImg.raycastTarget = false;
+
+            return root.gameObject;
+        }
+
+        /// <summary>Minimal stick-figure climber for the moving playhead.</summary>
+        public static GameObject AddClimberIcon(Transform parent, float size, Color color)
+        {
+            var root = CreateRect("Icon_Climber", parent);
+            Center(root, new Vector2(size, size));
+
+            float stroke = Mathf.Max(2f, size * 0.11f);
+
+            // Head
+            var head = CreateRect("Head", root);
+            head.sizeDelta = new Vector2(size * 0.22f, size * 0.22f);
+            head.anchoredPosition = new Vector2(size * 0.06f, size * 0.22f);
+            var headImg = head.gameObject.AddComponent<Image>();
+            headImg.sprite = CircleSprite();
+            headImg.color = color;
+            headImg.raycastTarget = false;
+
+            // Torso
+            MakeBar(root, "Torso", new Vector2(size * 0.06f, -size * 0.02f),
+                new Vector2(stroke, size * 0.34f), color);
+
+            // Reach arm (up-right)
+            var reach = CreateRect("ReachArm", root);
+            reach.sizeDelta = new Vector2(stroke, size * 0.28f);
+            reach.anchoredPosition = new Vector2(size * 0.16f, size * 0.08f);
+            reach.localRotation = Quaternion.Euler(0f, 0f, -38f);
+            var reachImg = reach.gameObject.AddComponent<Image>();
+            reachImg.sprite = RoundedSprite(2);
+            reachImg.type = Image.Type.Sliced;
+            reachImg.color = color;
+            reachImg.raycastTarget = false;
+
+            // Pull arm (bent)
+            var pull = CreateRect("PullArm", root);
+            pull.sizeDelta = new Vector2(stroke, size * 0.24f);
+            pull.anchoredPosition = new Vector2(-size * 0.04f, size * 0.02f);
+            pull.localRotation = Quaternion.Euler(0f, 0f, 55f);
+            var pullImg = pull.gameObject.AddComponent<Image>();
+            pullImg.sprite = RoundedSprite(2);
+            pullImg.type = Image.Type.Sliced;
+            pullImg.color = color;
+            pullImg.raycastTarget = false;
+
+            // Legs
+            var legA = CreateRect("LegA", root);
+            legA.sizeDelta = new Vector2(stroke, size * 0.26f);
+            legA.anchoredPosition = new Vector2(size * 0.1f, -size * 0.22f);
+            legA.localRotation = Quaternion.Euler(0f, 0f, -28f);
+            var legAImg = legA.gameObject.AddComponent<Image>();
+            legAImg.sprite = RoundedSprite(2);
+            legAImg.type = Image.Type.Sliced;
+            legAImg.color = color;
+            legAImg.raycastTarget = false;
+
+            var legB = CreateRect("LegB", root);
+            legB.sizeDelta = new Vector2(stroke, size * 0.22f);
+            legB.anchoredPosition = new Vector2(-size * 0.02f, -size * 0.2f);
+            legB.localRotation = Quaternion.Euler(0f, 0f, 42f);
+            var legBImg = legB.gameObject.AddComponent<Image>();
+            legBImg.sprite = RoundedSprite(2);
+            legBImg.type = Image.Type.Sliced;
+            legBImg.color = color;
+            legBImg.raycastTarget = false;
+
+            return root.gameObject;
+        }
+
+        /// <summary>Create TMP with bold weight (for move numbers on the playback timeline).</summary>
+        public static TextMeshProUGUI CreateBoldText(
+            string name,
+            Transform parent,
+            string text,
+            float fontSize,
+            Color color,
+            TextAlignmentOptions alignment = TextAlignmentOptions.Center)
+        {
+            var tmp = CreateText(name, parent, text, fontSize, color, alignment);
+            tmp.fontStyle = FontStyles.Bold;
+            tmp.fontWeight = FontWeight.Bold;
+            return tmp;
+        }
+
         private static void MakeBar(Transform parent, string name, Vector2 pos, Vector2 sizeDelta, Color color)
         {
             var rect = CreateRect(name, parent);

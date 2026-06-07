@@ -83,6 +83,7 @@ namespace BodyTracking.UI
         private TextMeshProUGUI mapLoadButtonLabel;
         private TextMeshProUGUI mapStatusLabel;
         private bool mapPanelVisible;
+        private Button goToPlaybackButton;
 
         // State
         private readonly List<string> availableRecordings = new List<string>();
@@ -95,36 +96,37 @@ namespace BodyTracking.UI
         private int transportDbgFrame;
 #endif
 
+        private bool initialized;
+
         void Start()
         {
-            if (controller == null)
-                controller = UnityEngine.Object.FindFirstObjectByType<BodyTrackingController>();
+            if (Object.FindFirstObjectByType<BodyTrackingUISwitcher>() != null)
+                return;
+            var canvas = GetComponentInParent<Canvas>();
+            if (canvas != null)
+                canvas.gameObject.AddComponent<BodyTrackingUISwitcher>();
+        }
 
-            if (controller == null)
-                UnityEngine.Debug.LogError("[BodyTrackingUI] BodyTrackingController not found");
-
-            BuildUI();
-            HookUpEvents();
-
-            if (controller != null)
-            {
-                controller.OnModeChanged += OnModeChanged;
-                controller.OnRecordingComplete += OnRecordingComplete;
-                controller.OnFusionStatusChanged += OnFusionStatusChanged;
-            }
-
+        void OnEnable()
+        {
+            EnsureInitialized();
+            if (uiRoot != null && Object.FindFirstObjectByType<BodyTrackingUISwitcher>() == null)
+                uiRoot.gameObject.SetActive(true);
+            SubscribeControllerEvents();
             RefreshRecordingsList();
             UpdateUI();
         }
 
+        void OnDisable()
+        {
+            UnsubscribeControllerEvents();
+            if (uiRoot != null)
+                uiRoot.gameObject.SetActive(false);
+        }
+
         void OnDestroy()
         {
-            if (controller != null)
-            {
-                controller.OnModeChanged -= OnModeChanged;
-                controller.OnRecordingComplete -= OnRecordingComplete;
-                controller.OnFusionStatusChanged -= OnFusionStatusChanged;
-            }
+            UnsubscribeControllerEvents();
 
             if (mapSwitcher != null)
             {
@@ -133,8 +135,50 @@ namespace BodyTracking.UI
             }
         }
 
+        private void EnsureInitialized()
+        {
+            if (initialized)
+                return;
+
+            if (controller == null)
+                controller = UnityEngine.Object.FindFirstObjectByType<BodyTrackingController>();
+
+            if (controller == null)
+                UnityEngine.Debug.LogError("[BodyTrackingUI] BodyTrackingController not found");
+
+            BuildUI();
+            HookUpEvents();
+            initialized = true;
+        }
+
+        private void SubscribeControllerEvents()
+        {
+            if (controller == null)
+                return;
+
+            controller.OnModeChanged -= OnModeChanged;
+            controller.OnRecordingComplete -= OnRecordingComplete;
+            controller.OnFusionStatusChanged -= OnFusionStatusChanged;
+            controller.OnModeChanged += OnModeChanged;
+            controller.OnRecordingComplete += OnRecordingComplete;
+            controller.OnFusionStatusChanged += OnFusionStatusChanged;
+        }
+
+        private void UnsubscribeControllerEvents()
+        {
+            if (controller == null)
+                return;
+
+            controller.OnModeChanged -= OnModeChanged;
+            controller.OnRecordingComplete -= OnRecordingComplete;
+            controller.OnFusionStatusChanged -= OnFusionStatusChanged;
+        }
+
         void Update()
         {
+            // RouteRootManager may appear after our first BuildUI(); create map controls once it exists.
+            TryBuildMapSwitcherLate();
+
             // Map id can sync after Start(); keep the toggle label current even when the transport bar is hidden.
             if (Time.frameCount % 10 == 0)
                 UpdateMapToggleLabel();
@@ -179,14 +223,38 @@ namespace BodyTracking.UI
             UIFactory.Stretch(uiRoot);
             uiRoot.gameObject.AddComponent<UISafeArea>();
 
+            mapUiBuilt = false;
+
             DeactivateLegacyUI(canvas);
 
             BuildTopStatusArea(uiRoot);
             BuildBottomTransportBar(uiRoot);
             BuildVisibilityToggle(uiRoot);
             BuildMapSwitcher(uiRoot);
+            BuildScreenSwitchButton(uiRoot);
 
             ApplyMainUiVisibility();
+        }
+
+        /// <summary>Pill button that switches to the dedicated playback screen.</summary>
+        private void BuildScreenSwitchButton(RectTransform root)
+        {
+            goToPlaybackButton = UIFactory.CreatePillButton("GoToPlaybackButton", root, "Playback", ghost: true);
+            var rect = (RectTransform)goToPlaybackButton.transform;
+            rect.sizeDelta = new Vector2(108f, 34f);
+            rect.anchorMin = new Vector2(0f, 1f);
+            rect.anchorMax = new Vector2(0f, 1f);
+            rect.pivot = new Vector2(0f, 1f);
+            rect.anchoredPosition = new Vector2(UITokens.Space12, -UITokens.Space8);
+        }
+
+        /// <summary>Wire the Playback pill to a screen switcher (called by <see cref="BodyTrackingUISwitcher"/>).</summary>
+        public void WireScreenSwitcher(BodyTrackingUISwitcher switcher)
+        {
+            if (goToPlaybackButton == null || switcher == null)
+                return;
+            goToPlaybackButton.onClick.RemoveListener(switcher.ShowPlayback);
+            goToPlaybackButton.onClick.AddListener(switcher.ShowPlayback);
         }
 
         /// <summary>
@@ -501,15 +569,64 @@ namespace BodyTracking.UI
         /// Top-left control to enter a new Immersal map id at runtime (device builds). Downloads map
         /// data and the sparse visualization, then updates localization for the whole session.
         /// </summary>
-        private void BuildMapSwitcher(RectTransform root)
-        {
-            mapSwitcher = UnityEngine.Object.FindFirstObjectByType<ImmersalMapSwitcher>();
-            if (mapSwitcher == null && controller != null && controller.routeRootManager != null)
-                mapSwitcher = controller.routeRootManager.gameObject.AddComponent<ImmersalMapSwitcher>();
+        private bool mapUiBuilt;
 
+        /// <summary>
+        /// Find or create <see cref="ImmersalMapSwitcher"/>. BodyTrackingController creates
+        /// <see cref="RouteRootManager"/> in Start(), which can run after our first BuildUI() — so we
+        /// also attach to the controller host when needed and retry UI creation from Update().
+        /// </summary>
+        bool EnsureMapSwitcherComponent()
+        {
+            if (mapSwitcher != null)
+                return true;
+
+            mapSwitcher = UnityEngine.Object.FindFirstObjectByType<ImmersalMapSwitcher>();
+            if (mapSwitcher != null)
+                return true;
+
+            if (controller == null)
+                controller = UnityEngine.Object.FindFirstObjectByType<BodyTrackingController>();
+
+            RouteRootManager rrm = controller != null ? controller.routeRootManager : null;
+            if (rrm == null && controller != null)
+                rrm = controller.GetComponent<RouteRootManager>();
+            if (rrm == null)
+                rrm = UnityEngine.Object.FindFirstObjectByType<RouteRootManager>();
+
+            GameObject host = rrm != null ? rrm.gameObject : controller != null ? controller.gameObject : null;
+            if (host == null)
+                return false;
+
+            mapSwitcher = host.GetComponent<ImmersalMapSwitcher>();
             if (mapSwitcher == null)
+                mapSwitcher = host.AddComponent<ImmersalMapSwitcher>();
+            return mapSwitcher != null;
+        }
+
+        void TryBuildMapSwitcherLate()
+        {
+            if (mapUiBuilt || uiRoot == null)
+                return;
+            if (!EnsureMapSwitcherComponent())
                 return;
 
+            BuildMapSwitcher(uiRoot);
+            mapUiBuilt = mapToggleButton != null;
+            if (mapUiBuilt)
+                SyncMapInputFromSwitcher();
+        }
+
+        private void BuildMapSwitcher(RectTransform root)
+        {
+            if (!EnsureMapSwitcherComponent())
+            {
+                Debug.LogWarning("[BodyTrackingUI] Map switcher unavailable — map controls not created yet (will retry).");
+                return;
+            }
+
+            mapSwitcher.OnStatusChanged -= OnMapSwitcherStatusChanged;
+            mapSwitcher.OnMapSwitched -= OnMapSwitched;
             mapSwitcher.OnStatusChanged += OnMapSwitcherStatusChanged;
             mapSwitcher.OnMapSwitched += OnMapSwitched;
 
@@ -574,6 +691,7 @@ namespace BodyTracking.UI
             mapPanel.SetActive(false);
             UpdateMapToggleLabel();
             UpdateMapControls();
+            mapUiBuilt = true;
         }
 
         private void ToggleMapPanel()
@@ -1070,6 +1188,13 @@ namespace BodyTracking.UI
         // ============================================================================================
         // VISIBILITY TOGGLE
         // ============================================================================================
+
+        /// <summary>Hide or show the entire record/settings UI (used when switching to playback screen).</summary>
+        public void SetScreenVisible(bool visible)
+        {
+            if (uiRoot != null)
+                uiRoot.gameObject.SetActive(visible);
+        }
 
         private void ApplyMainUiVisibility()
         {

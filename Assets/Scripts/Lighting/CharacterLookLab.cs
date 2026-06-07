@@ -107,6 +107,7 @@ namespace BodyTracking.LookDev
             if (character == null) return;
 
             DisableOcclusionShells(character);
+            DisableShadows(character);
 
             var seen = new HashSet<Material>();
             foreach (var r in character.GetComponentsInChildren<Renderer>(true))
@@ -143,6 +144,29 @@ namespace BodyTracking.LookDev
                 }
             }
             return hidden;
+        }
+
+        /// <summary>
+        /// Turn off shadow casting/receiving on every renderer under the character. The gym key light casts a
+        /// directional shadow that self-shadows the face (nose → cheek, brow → eye socket) as harsh dark patches.
+        /// For a flat-lit AR avatar the fill/rim rig already provides shape; skipping shadows also avoids the
+        /// URP main-light shadow-map pass. Returns count of renderers updated.
+        /// </summary>
+        public static int DisableShadows(Transform root)
+        {
+            if (root == null) return 0;
+            int updated = 0;
+            foreach (var r in root.GetComponentsInChildren<Renderer>(true))
+            {
+                if (r.shadowCastingMode == ShadowCastingMode.Off && !r.receiveShadows) continue;
+                r.shadowCastingMode = ShadowCastingMode.Off;
+                r.receiveShadows = false;
+                updated++;
+#if UNITY_EDITOR
+                UnityEditor.EditorUtility.SetDirty(r);
+#endif
+            }
+            return updated;
         }
 
         static bool IsOcclusionShell(string name)

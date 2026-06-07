@@ -251,7 +251,8 @@ namespace BodyTracking.Playback
         {
             // Shared solver: same ARKit-anchored, facing-aligned positions the character uses, and it holds the
             // last-good anchor/facing through ARKit dropouts so the overlay no longer spins when the body is lost.
-            Vector3[] local = FusedPoseSolver.ComputeLocalJoints(fusion, recording, t, ref moveAnchorState, invertFacing);
+            var anchorSettings = fusedPlayer != null ? fusedPlayer.AnchorSettings : FusedPoseSolver.AnchorSettings.Default;
+            Vector3[] local = FusedPoseSolver.ComputeLocalJoints(fusion, recording, t, ref moveAnchorState, invertFacing, anchorSettings);
             if (local == null) return;
 
             int n = local.Length;

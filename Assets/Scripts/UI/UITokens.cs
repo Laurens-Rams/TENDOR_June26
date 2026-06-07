@@ -95,5 +95,21 @@ namespace BodyTracking.UI
         public const float ScrubTrackHeight = 5f;
         /// <summary>Diameter of the scrub handle.</summary>
         public const float ScrubHandleDiameter = 20f;
+
+        // ----------------------------------------------------------------------------------------
+        // PLAYBACK SCREEN (vertical move timeline + floating transport)
+        // Dark glass controls + teal accent; kept translucent so AR feed shows through.
+        // ----------------------------------------------------------------------------------------
+        public static readonly Color PlaybackTrack = new Color(1f, 1f, 1f, 0.42f);
+        public static readonly Color PlaybackNode = new Color(0.06f, 0.18f, 0.14f, 0.68f);
+        public static readonly Color PlaybackNodeActive = new Color(0f, 0.82f, 0.72f, 0.82f);
+        public static readonly Color PlaybackPlayhead = new Color(0f, 0.82f, 0.72f, 0.78f);
+        /// <summary>Secondary transport circles (−2, +2, speed, loop).</summary>
+        public static readonly Color PlaybackTransportBtn = new Color(0.10f, 0.12f, 0.12f, 0.48f);
+        /// <summary>Primary play/pause — teal to match the timeline, not system blue.</summary>
+        public static readonly Color PlaybackTransportPlay = new Color(0f, 0.82f, 0.72f, 0.62f);
+        public const float PlaybackNodeDiameter = 36f;
+        public const float PlaybackPlayheadDiameter = 44f;
+        public const float PlaybackTrackWidth = 3f;
     }
 }

@@ -43,6 +43,7 @@ namespace BodyTracking.Editor
 
             EnsureXrSpaceInScene();
             EnsureRouteRootProvider();
+            int fixedMaps = FixMissingMapFileReferences(showDialog: false);
 
             EditorSceneManager.MarkSceneDirty(EditorSceneManager.GetActiveScene());
             Selection.activeGameObject = sdk.gameObject;
@@ -51,8 +52,54 @@ namespace BodyTracking.Editor
             EditorUtility.DisplayDialog(
                 "Immersal Setup",
                 "ImmersalSDK and XR Space were added to the scene.\n\n" +
+                (fixedMaps > 0 ? $"Cleared {fixedMaps} broken map-file reference(s).\n\n" : "") +
                 "Next: TENDOR > Immersal > Login",
                 "OK");
+        }
+
+        /// <summary>
+        /// XR Maps that download from the Immersal cloud do not need a local mapFile TextAsset. This clears
+        /// broken/missing references (common after a partial project recovery) and enables runtime download.
+        /// </summary>
+        [MenuItem("TENDOR/Immersal/Fix Missing Map File References")]
+        public static void FixMissingMapFileReferencesMenu()
+        {
+            int n = FixMissingMapFileReferences(showDialog: true);
+            if (n == 0)
+                EditorUtility.DisplayDialog("Immersal Map Fix", "No broken map-file references found in open scene(s).", "OK");
+        }
+
+        static int FixMissingMapFileReferences(bool showDialog)
+        {
+            int fixedCount = 0;
+            foreach (var map in Object.FindObjectsByType<XRMap>(FindObjectsSortMode.None))
+            {
+                if (map == null) continue;
+                var so = new SerializedObject(map);
+                var mapFileProp = so.FindProperty("mapFile");
+                if (mapFileProp == null) continue;
+
+                bool broken = mapFileProp.objectReferenceValue == null && mapFileProp.objectReferenceInstanceIDValue != 0;
+                if (!broken)
+                    continue;
+
+                mapFileProp.objectReferenceValue = null;
+                so.ApplyModifiedPropertiesWithoutUndo();
+                EditorUtility.SetDirty(map);
+                fixedCount++;
+                Debug.Log($"[ImmersalSetupTool] Cleared missing mapFile on '{map.name}' (map id {map.mapId}). Cloud download will be used.");
+            }
+
+            if (fixedCount > 0)
+            {
+                EditorSceneManager.MarkSceneDirty(EditorSceneManager.GetActiveScene());
+                if (showDialog)
+                    EditorUtility.DisplayDialog("Immersal Map Fix",
+                        $"Cleared {fixedCount} broken map-file reference(s).\n\nMaps download from the Immersal cloud at runtime — no local .bytes file is required.\n\nSave the scene (Cmd+S).",
+                        "OK");
+            }
+
+            return fixedCount;
         }
 
         [MenuItem("TENDOR/Immersal/Login")]

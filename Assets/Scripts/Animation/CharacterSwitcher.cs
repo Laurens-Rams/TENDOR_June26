@@ -22,8 +22,19 @@ namespace BodyTracking.Animation
         [SerializeField] private Transform charactersParent;
         [Tooltip("Explicit, ordered list of character root GameObjects. Used only when Characters Parent is empty.")]
         [SerializeField] private List<GameObject> characters = new List<GameObject>();
-        [Tooltip("Which character is shown first (clamped to the list).")]
+        [Tooltip("Which character is shown first (clamped to the list). Point this at the GLB character to make " +
+                 "GLB playback the default.")]
         [SerializeField] private int startIndex = 0;
+
+        [Header("Articulation")]
+        [Tooltip("Default articulation for every character. We now use GLB (Move AI muscle retarget: body + " +
+                 "fingers) for all characters — drop your GLB characters under the Characters Parent and the " +
+                 "toggle cycles through them, each driven by the GLB.")]
+        [SerializeField] private FusedCharacterPlayer.BodyArticulationSource defaultArticulation =
+            FusedCharacterPlayer.BodyArticulationSource.MoveGlb;
+        [Tooltip("Fallback escape hatch: characters listed here use the legacy FBX procedural retarget instead of " +
+                 "the GLB path. Leave empty for GLB-only. Kept in case a GLB character won't animate correctly.")]
+        [SerializeField] private List<GameObject> proceduralCharacters = new List<GameObject>();
 
         [Header("Playback wiring")]
         [Tooltip("The Move AI fused player that drives the character. Auto-found if left empty.")]
@@ -48,28 +59,46 @@ namespace BodyTracking.Animation
 
         private void Awake()
         {
-            CollectCharacters();
-
             if (fusedPlayer == null)
                 fusedPlayer = FindFirstObjectByType<FusedCharacterPlayer>(FindObjectsInactive.Include);
 
-            if (characters.Count == 0)
+            if (!EnsureBound())
             {
-                Debug.LogWarning("[CharacterSwitcher] No characters configured. Assign a Characters Parent with child models, or fill the Characters list.");
+                Debug.LogWarning("[CharacterSwitcher] No GLB characters found. Put Avaturn/priyal/modelART under " +
+                                 "'Characters', or run TENDOR ▸ Characters ▸ Use GLB Characters Only.");
                 return;
             }
 
             // All hidden to start; the active player reveals the selected one during playback.
             foreach (var c in characters)
-                if (c != null) c.SetActive(false);
+                if (c != null && c != Current) c.SetActive(false);
+        }
 
-            ApplySelection(Mathf.Clamp(startIndex, 0, characters.Count - 1));
+        /// <summary>Ensure a GLB display character is bound. Safe to call before playback if Awake found nothing
+        /// (e.g. all characters were disabled in the scene, or a GLB was left at scene root).</summary>
+        public bool EnsureBound()
+        {
+            CollectCharacters();
+            if (characters.Count == 0)
+                DiscoverLooseGlbs();
+
+            if (characters.Count == 0)
+                return false;
+
+            if (CurrentIndex < 0 || Current == null)
+            {
+                foreach (var c in characters)
+                    if (c != null) c.SetActive(false);
+                ApplySelection(Mathf.Clamp(startIndex, 0, characters.Count - 1));
+            }
+
+            return Current != null;
         }
 
         /// <summary>Advance to the next character (wraps around). Hook UI Button OnClick here.</summary>
         public void CycleCharacter()
         {
-            if (characters.Count == 0) return;
+            if (characters.Count == 0 && !EnsureBound()) return;
             int next = (CurrentIndex + 1) % characters.Count;
             ApplySelection(next);
         }
@@ -105,9 +134,20 @@ namespace BodyTracking.Animation
 
             CurrentIndex = index;
 
-            // Re-point the fused playback driver at the new rig. Works whether idle or mid-playback.
+            // Re-point the fused playback driver at the new rig and pick its articulation mode based on the
+            // character: GLB characters use the Move AI muscle retarget; everything else uses the legacy FBX
+            // procedural path. Set the mode BEFORE rebinding so the player builds the right pose handler.
             if (fusedPlayer != null)
+            {
+                var mode = proceduralCharacters.Contains(next)
+                    ? FusedCharacterPlayer.BodyArticulationSource.Procedural
+                    : defaultArticulation;
+                fusedPlayer.SetArticulationSource(mode);
                 fusedPlayer.RebindCharacter(next.transform);
+
+                if (verboseLogging)
+                    Debug.Log($"[CharacterSwitcher] '{next.name}' → {mode} articulation.");
+            }
 
             // Keep the legacy FBX path in sync if it's being used.
             if (fbxCharacterController != null)
@@ -126,9 +166,59 @@ namespace BodyTracking.Animation
         {
             if (charactersParent == null) return;
 
+            // Collect ALL non-fallback children (active or inactive). GLB characters start disabled and are
+            // revealed during playback; excluding inactive ones left the list empty and forced an FBX fallback.
             characters.Clear();
             for (int i = 0; i < charactersParent.childCount; i++)
-                characters.Add(charactersParent.GetChild(i).gameObject);
+            {
+                var child = charactersParent.GetChild(i).gameObject;
+                if (!IsExcludedFallback(child))
+                    characters.Add(child);
+            }
+        }
+
+        /// <summary>Find GLB display characters placed outside the Characters parent (e.g. Avaturn_Target at
+        /// scene root) and reparent them so the toggle can cycle them.</summary>
+        void DiscoverLooseGlbs()
+        {
+            if (charactersParent == null) return;
+
+            foreach (var go in Resources.FindObjectsOfTypeAll<GameObject>())
+            {
+                if (go == null || !go.scene.IsValid() || go.hideFlags != HideFlags.None)
+                    continue;
+                if (IsExcludedFallback(go) || characters.Contains(go))
+                    continue;
+                if (!LooksLikeGlbDisplayCharacter(go))
+                    continue;
+
+                if (go.transform.parent != charactersParent)
+                    go.transform.SetParent(charactersParent, false);
+                characters.Add(go);
+
+                if (verboseLogging)
+                    Debug.Log($"[CharacterSwitcher] Discovered GLB character '{go.name}' and parented under '{charactersParent.name}'.");
+            }
+        }
+
+        static bool IsExcludedFallback(GameObject go)
+        {
+            if (go == null) return true;
+            string n = go.name.ToLowerInvariant().Trim();
+            if (n == "model" || n == "model 1") return true;
+            if (n.Contains("source") || n.Contains("moveai")) return true;
+            return go.GetComponentInChildren<FBXCharacterController>(true) != null;
+        }
+
+        static bool LooksLikeGlbDisplayCharacter(GameObject go)
+        {
+            // Avaturn / glTFast GLB instances: skinned mesh + skeleton, no FBX controller.
+            if (go.GetComponentInChildren<SkinnedMeshRenderer>(true) == null)
+                return false;
+            if (go.GetComponentInChildren<Animator>(true) == null &&
+                go.GetComponentsInChildren<Transform>(true).Length < 5)
+                return false;
+            return true;
         }
     }
 }

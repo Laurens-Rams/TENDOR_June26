@@ -14,8 +14,10 @@ namespace BodyTracking.Animation
     ///
     /// Drop this on any scene GameObject (e.g. the one with <see cref="FBXCharacterController"/>). It auto-finds the
     /// currently shown character — including after a <see cref="CharacterSwitcher"/> swap — rescans its blink
-    /// blendshapes, and keeps blinking. All timing/feel is exposed below for tuning.
+    /// blendshapes, and keeps blinking. All timing/feel is exposed below for tuning. Uses unscaled time so blinks
+    /// continue while playback is paused.
     /// </summary>
+    [DefaultExecutionOrder(250)]
     public class CharacterEyeBlink : MonoBehaviour
     {
         [Header("Target (optional — auto-resolved if empty)")]
@@ -74,7 +76,10 @@ namespace BodyTracking.Animation
         [SerializeField] private bool verboseLogging = false;
 
         // --- resolved binding ---------------------------------------------------------------------------------
-        private struct ShapeRef { public SkinnedMeshRenderer smr; public int index; }
+        // fullWeight = the blendshape's own max frame weight. FBX/Maya shapes are authored 0–100, but glTF morph
+        // targets imported by glTFast are authored 0–1, so driving them to 100 over-applies the shape 100× and
+        // balloons the eye. Scaling by the shape's real max keeps the blink at its intended full-closed amount.
+        private struct ShapeRef { public SkinnedMeshRenderer smr; public int index; public float fullWeight; }
         private readonly List<ShapeRef> blinkShapes = new List<ShapeRef>();
         private Transform boundRoot;
 
@@ -131,7 +136,7 @@ namespace BodyTracking.Animation
 
             if (onlyWhenActive && !root.gameObject.activeInHierarchy) return;
 
-            AdvanceBlink(Time.deltaTime);
+            AdvanceBlink(Time.unscaledDeltaTime);
         }
 
         private Transform ResolveActiveRoot()
@@ -161,7 +166,7 @@ namespace BodyTracking.Animation
                     int idx = FindBlendShape(smr.sharedMesh, name);
                     if (idx >= 0)
                     {
-                        blinkShapes.Add(new ShapeRef { smr = smr, index = idx });
+                        blinkShapes.Add(new ShapeRef { smr = smr, index = idx, fullWeight = MaxFrameWeight(smr.sharedMesh, idx) });
                         foundPerEye = true;
                     }
                 }
@@ -175,7 +180,7 @@ namespace BodyTracking.Animation
                     if (smr == null || smr.sharedMesh == null) continue;
                     int idx = FindBlendShape(smr.sharedMesh, eyesClosedBlendshapeName);
                     if (idx >= 0)
-                        blinkShapes.Add(new ShapeRef { smr = smr, index = idx });
+                        blinkShapes.Add(new ShapeRef { smr = smr, index = idx, fullWeight = MaxFrameWeight(smr.sharedMesh, idx) });
                 }
             }
 
@@ -192,6 +197,16 @@ namespace BodyTracking.Animation
                                      $"(looked for: {string.Join(", ", blinkBlendshapeNames)}" +
                                      (fallbackToEyesClosed ? $", {eyesClosedBlendshapeName}" : "") + ").");
             }
+        }
+
+        // The blendshape's authored full-strength weight (last frame). glTFast morph targets => 1.0,
+        // FBX/Maya shapes => 100. Falling back to the inspector's closedWeight only if the mesh reports 0.
+        private float MaxFrameWeight(Mesh mesh, int shapeIndex)
+        {
+            int frames = mesh.GetBlendShapeFrameCount(shapeIndex);
+            if (frames <= 0) return closedWeight;
+            float w = mesh.GetBlendShapeFrameWeight(shapeIndex, frames - 1);
+            return w > 0.0001f ? w : closedWeight;
         }
 
         private static int FindBlendShape(Mesh mesh, string name)
@@ -301,11 +316,13 @@ namespace BodyTracking.Animation
 
         private void ApplyWeight(float weight01)
         {
-            float w = Mathf.Clamp01(weight01) * closedWeight;
+            float t = Mathf.Clamp01(weight01);
             for (int i = 0; i < blinkShapes.Count; i++)
             {
                 var s = blinkShapes[i];
-                if (s.smr != null) s.smr.SetBlendShapeWeight(s.index, w);
+                // Scale to each shape's own authored max so glTF (0–1) and FBX (0–100) rigs both close fully
+                // without over-driving (which previously scaled the eye geometry 100×).
+                if (s.smr != null) s.smr.SetBlendShapeWeight(s.index, t * s.fullWeight);
             }
         }
 

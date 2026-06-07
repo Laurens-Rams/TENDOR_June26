@@ -119,6 +119,11 @@ namespace BodyTracking.Animation
             int hiddenShells = BodyTracking.LookDev.CharacterLookLab.DisableOcclusionShells(characterRoot.transform);
             if (hiddenShells > 0 && enableLogging)
                 Debug.Log($"[FBXCharacterController] Disabled {hiddenShells} eye-occlusion shell mesh(es).");
+
+            // No cast/receive shadows — avoids self-shadow dark patches on the face and skips shadow sampling.
+            int shadowOff = BodyTracking.LookDev.CharacterLookLab.DisableShadows(characterRoot.transform);
+            if (shadowOff > 0 && enableLogging)
+                Debug.Log($"[FBXCharacterController] Disabled shadows on {shadowOff} renderer(s).");
             
             // Ensure character uses normal materials (not debug cyan)
             RestoreNormalMaterials();

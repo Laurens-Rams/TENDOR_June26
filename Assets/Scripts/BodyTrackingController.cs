@@ -49,8 +49,8 @@ namespace BodyTracking
         public int bodyDetectConsecutiveFrames = 3;
         [Tooltip("Start recording anyway if no body is detected within this many seconds (0 = wait until the user taps stop to cancel).")]
         public float waitForBodyTimeoutSeconds = 25f;
-        [Tooltip("Trim this many seconds off the end of each recording (and the Move AI clip), since the climber usually steps out of frame to tap stop. 0 disables trimming.")]
-        public float trimEndSeconds = 2f;
+        [Tooltip("End each recording this many seconds before the last tracked body frame (mirrors the start trim). Also drops any untracked tail after the climber steps out of frame to tap stop. Set negative to disable.")]
+        public float trimEndBodyBufferSeconds = 1f;
         
         [Header("Settings")]
         public bool autoInitialize = true;
@@ -313,27 +313,6 @@ namespace BodyTracking
         }
 
         /// <summary>
-        /// Remove frames in the last <paramref name="seconds"/> of the recording and shorten its duration to match.
-        /// No-op when the recording is shorter than the trim amount.
-        /// </summary>
-        private void TrimRecordingTail(HipRecording recording, float seconds)
-        {
-            if (recording == null || recording.frames == null || recording.frames.Count == 0 || seconds <= 0f)
-                return;
-
-            float cutoff = recording.duration - seconds;
-            if (cutoff <= 0f)
-            {
-                Debug.LogWarning($"[BodyTrackingController] Trim {seconds:F1}s skipped — recording only {recording.duration:F2}s long.");
-                return;
-            }
-
-            int removed = recording.frames.RemoveAll(f => f.timestamp > cutoff);
-            recording.duration = cutoff;
-            Debug.Log($"[BodyTrackingController] Trimmed last {seconds:F1}s ({removed} frames removed); duration now {cutoff:F2}s.");
-        }
-
-        /// <summary>
         /// Remove frames from the start until the first valid hip, re-zero timestamps, and shorten duration.
         /// Stops "waiting for body" dead time from inflating clip length and Move AI processing window.
         /// </summary>
@@ -371,6 +350,44 @@ namespace BodyTracking
                       $"duration now {recording.duration:F2}s, video offset {recording.videoStartTimeOffset:F2}s.");
         }
 
+        /// <summary>
+        /// Remove frames after the last valid hip (minus <paramref name="bufferBeforeLastBodySeconds"/>), and shorten
+        /// duration. Drops the out-of-frame tail between the last body sighting and the stop tap, mirroring
+        /// <see cref="TrimRecordingLeadingInvalid"/>.
+        /// </summary>
+        private void TrimRecordingTrailingInvalid(HipRecording recording, float bufferBeforeLastBodySeconds)
+        {
+            if (recording?.frames == null || recording.frames.Count == 0 || bufferBeforeLastBodySeconds < 0f)
+                return;
+
+            int lastValid = -1;
+            for (int i = recording.frames.Count - 1; i >= 0; i--)
+            {
+                if (recording.frames[i].hipJoint.IsValid)
+                {
+                    lastValid = i;
+                    break;
+                }
+            }
+            if (lastValid < 0)
+                return;
+
+            float lastValidTime = recording.frames[lastValid].timestamp;
+            float cutoff = lastValidTime - bufferBeforeLastBodySeconds;
+            if (cutoff <= 0f)
+            {
+                Debug.LogWarning($"[BodyTrackingController] Trailing body trim skipped — last body at {lastValidTime:F2}s, " +
+                                 $"buffer {bufferBeforeLastBodySeconds:F1}s would leave nothing.");
+                return;
+            }
+
+            int removed = recording.frames.RemoveAll(f => f.timestamp > cutoff);
+            recording.duration = cutoff;
+            Debug.Log($"[BodyTrackingController] Trimmed trailing untracked tail at {lastValidTime:F2}s " +
+                      $"(cutoff {cutoff:F2}s, buffer {bufferBeforeLastBodySeconds:F1}s, {removed} frames removed); " +
+                      $"duration now {cutoff:F2}s.");
+        }
+
         /// <summary>Cancel a pending "waiting for body" arming state without recording.</summary>
         public void CancelArming()
         {
@@ -401,14 +418,12 @@ namespace BodyTracking
             
             lastRecording = recorder.StopRecording();
 
-            // Drop the tail where the climber steps out of frame to tap stop (keeps the video, hip data, and the
-            // Move AI clip window consistent since the video is stopped right after this).
-            if (lastRecording != null && trimEndSeconds > 0f)
-                TrimRecordingTail(lastRecording, trimEndSeconds);
-
-            // Drop leading frames with no body/hip (common in portrait while ARKit is still locking on).
+            // Drop leading/trailing frames with no body/hip so playback and Move AI match the in-frame window.
             if (lastRecording != null)
+            {
                 TrimRecordingLeadingInvalid(lastRecording);
+                TrimRecordingTrailingInvalid(lastRecording, trimEndBodyBufferSeconds);
+            }
 
             if (lastRecording != null)
             {
@@ -494,6 +509,8 @@ namespace BodyTracking
                 SetMode(OperationMode.Playing);
                 UpdateStatus($"Compare overlay: ARKit (cyan) + Move (orange) at recorded position");
                 Debug.Log("[BodyTrackingController] Started fused Move AI playback");
+                ApplyPlaybackSpeed();
+                ApplyPlaybackLoopSettings();
                 return true;
             }
 
@@ -504,6 +521,8 @@ namespace BodyTracking
                 SetMode(OperationMode.Playing);
                 UpdateStatus($"Playing back hip movement: {recording.FrameCount} frames");
                 Debug.Log("[BodyTrackingController] Started hip playback");
+                ApplyPlaybackSpeed();
+                ApplyPlaybackLoopSettings();
                 return true;
             }
             
@@ -572,6 +591,195 @@ namespace BodyTracking
                 player.SeekToTime(normalized * player.Duration);
         }
 
+        // --- Playback screen controls (speed, loop, checkpoints, frame step) ---
+
+        public const int PlaybackCheckpointCount = 5;
+        private static readonly float[] PlaybackSpeedSteps = { 0.5f, 1f, 1.5f, 2f };
+        private int playbackSpeedIndex = 1;
+        private PlaybackLoopMode playbackLoopMode = PlaybackLoopMode.Full;
+        private int activeCheckpointIndex = -1;
+
+        public PlaybackLoopMode PlaybackLoopMode => playbackLoopMode;
+        public int ActiveCheckpointIndex => activeCheckpointIndex;
+        public float PlaybackSpeed => PlaybackSpeedSteps[Mathf.Clamp(playbackSpeedIndex, 0, PlaybackSpeedSteps.Length - 1)];
+
+        /// <summary>Duration of the loaded/active recording (0 when none).</summary>
+        public float PlaybackDuration
+        {
+            get
+            {
+                if (IsPlaying && IsFusedPlaying) return FusedDuration;
+                if (IsPlaying && player != null) return player.Duration;
+                return lastRecording != null ? lastRecording.duration : 0f;
+            }
+        }
+
+        /// <summary>Current playback time in seconds.</summary>
+        public float PlaybackCurrentTime
+        {
+            get
+            {
+                if (IsPlaying && IsFusedPlaying) return FusedCurrentTime;
+                if (IsPlaying && player != null) return player.CurrentTime;
+                return 0f;
+            }
+        }
+
+        /// <summary>Normalized playback progress (0..1).</summary>
+        public float PlaybackNormalizedProgress
+        {
+            get
+            {
+                float d = PlaybackDuration;
+                return d > 0f ? Mathf.Clamp01(PlaybackCurrentTime / d) : 0f;
+            }
+        }
+
+        /// <summary>Time in seconds for checkpoint index (0..PlaybackCheckpointCount-1), marking move start.</summary>
+        public float GetCheckpointTime(int index)
+        {
+            float duration = PlaybackDuration;
+            if (duration <= 0f) return 0f;
+            index = Mathf.Clamp(index, 0, PlaybackCheckpointCount - 1);
+            return duration * index / PlaybackCheckpointCount;
+        }
+
+        /// <summary>End time for the move segment beginning at <paramref name="index"/>.</summary>
+        public float GetCheckpointSegmentEnd(int index)
+        {
+            float duration = PlaybackDuration;
+            if (duration <= 0f) return 0f;
+            index = Mathf.Clamp(index, 0, PlaybackCheckpointCount - 1);
+            return index < PlaybackCheckpointCount - 1
+                ? duration * (index + 1) / PlaybackCheckpointCount
+                : duration;
+        }
+
+        /// <summary>Cycle playback speed: 0.5 → 1.0 → 1.5 → 2.0.</summary>
+        public float CyclePlaybackSpeed()
+        {
+            playbackSpeedIndex = (playbackSpeedIndex + 1) % PlaybackSpeedSteps.Length;
+            ApplyPlaybackSpeed();
+            return PlaybackSpeed;
+        }
+
+        /// <summary>Toggle loop mode between full recording and the active move segment.</summary>
+        public PlaybackLoopMode CyclePlaybackLoopMode()
+        {
+            playbackLoopMode = playbackLoopMode == PlaybackLoopMode.Full
+                ? PlaybackLoopMode.Segment
+                : PlaybackLoopMode.Full;
+            ApplyPlaybackLoopSettings();
+            return playbackLoopMode;
+        }
+
+        /// <summary>Seek to a checkpoint, mark it active, and resume playback from that time.</summary>
+        public bool JumpToCheckpoint(int index)
+        {
+            if (lastRecording == null || !lastRecording.IsValid)
+            {
+                LoadLatestRecording();
+                if (lastRecording == null || !lastRecording.IsValid)
+                    return false;
+            }
+
+            index = Mathf.Clamp(index, 0, PlaybackCheckpointCount - 1);
+            activeCheckpointIndex = index;
+            float time = GetCheckpointTime(index);
+            return PlayFromTime(time);
+        }
+
+        /// <summary>Start (or continue) playback from an absolute time in seconds.</summary>
+        public bool PlayFromTime(float time)
+        {
+            if (!IsPlaying)
+            {
+                if (!CanPlayback)
+                {
+                    LoadLatestRecording();
+                    if (!CanPlayback)
+                        return false;
+                }
+
+                if (!StartPlayback())
+                    return false;
+            }
+
+            SeekPlaybackTime(time);
+            ApplyPlaybackLoopSettings();
+
+            if (IsPaused)
+                ResumePlayback();
+
+            return true;
+        }
+
+        /// <summary>Seek to an absolute time while playing (no-op when idle).</summary>
+        public void SeekPlaybackTime(float time)
+        {
+            if (currentMode != OperationMode.Playing) return;
+            float duration = PlaybackDuration;
+            time = duration > 0f ? Mathf.Clamp(time, 0f, duration) : Mathf.Max(0f, time);
+
+            if (IsFusedPlaying)
+                fusionCoordinator.SeekFusedPlayback(time);
+            else if (player != null)
+                player.SeekToTime(time);
+        }
+
+        /// <summary>Step forward/back by two frames on the active timeline.</summary>
+        public void StepPlaybackTwoFrames(int direction)
+        {
+            if (direction == 0) return;
+
+            if (!IsPlaying)
+            {
+                LoadLatestRecording();
+                if (!StartPlayback())
+                    return;
+                PausePlayback();
+            }
+
+            int delta = direction > 0 ? 2 : -2;
+            if (IsFusedPlaying)
+                fusionCoordinator.StepFusedFrames(delta);
+            else if (player != null)
+                player.StepFrames(delta);
+        }
+
+        private void ApplyPlaybackSpeed()
+        {
+            float speed = PlaybackSpeed;
+            if (player != null) player.PlaybackSpeed = speed;
+            if (fusionCoordinator != null) fusionCoordinator.FusedPlaybackSpeed = speed;
+        }
+
+        private void ApplyPlaybackLoopSettings()
+        {
+            bool segment = playbackLoopMode == PlaybackLoopMode.Segment && activeCheckpointIndex >= 0;
+            float duration = PlaybackDuration;
+            float segStart = 0f;
+            float segEnd = duration;
+
+            if (segment && duration > 0f)
+            {
+                segStart = GetCheckpointTime(activeCheckpointIndex);
+                segEnd = GetCheckpointSegmentEnd(activeCheckpointIndex);
+            }
+
+            if (player != null)
+            {
+                player.LoopPlayback = playbackLoopMode == PlaybackLoopMode.Full;
+                player.SetSegmentLoop(segStart, segEnd, segment);
+            }
+
+            if (fusionCoordinator != null)
+            {
+                fusionCoordinator.FusedLoopPlayback = playbackLoopMode == PlaybackLoopMode.Full;
+                fusionCoordinator.SetFusedSegmentLoop(segStart, segEnd, segment);
+            }
+        }
+
         /// <summary>
         /// Reload the most recent recording from storage so playback always uses the latest clip.
         /// </summary>
@@ -589,6 +797,8 @@ namespace BodyTracking
                 lastRecordingFileName = fileName;
                 UpdateStatus($"Loaded hip recording: {recording.ValidFrameCount}/{recording.FrameCount} valid frames");
                 Debug.Log($"[BodyTrackingController] Loaded '{fileName}' ({recording.ValidFrameCount}/{recording.FrameCount} valid, {recording.duration:F1}s)");
+                if (fusionCoordinator != null)
+                    fusionCoordinator.WarmGlb(fileName);
                 if (loadAssociatedWorldMap && autoLoadWorldMapForLoadedRecording && worldMapPersistence != null)
                 {
                     if (worldMapPersistence.IsWorldMapSupported() && worldMapPersistence.HasWorldMap(fileName))

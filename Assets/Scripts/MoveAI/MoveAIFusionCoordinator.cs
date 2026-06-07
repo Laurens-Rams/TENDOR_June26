@@ -31,6 +31,9 @@ namespace BodyTracking.MoveAI
         [SerializeField] private float outlierMeters = 0.6f;
         [Tooltip("During fused replay, show ARKit (cyan) and Move (orange) skeletons side by side alongside the character.")]
         [SerializeField] private bool showCompareSkeletons = true;
+        [Tooltip("When a Move AI GLB exists for the recording, retarget body + fingers from it (muscle space). " +
+                 "Positioning/scale still come from the fused trajectory. Disable to force the procedural retarget.")]
+        [SerializeField] private bool preferGlbArticulation = true;
 
         [Header("Status (read-only)")]
         [SerializeField] private string lastStatus = "";
@@ -112,13 +115,15 @@ namespace BodyTracking.MoveAI
             // Surface the uploaded file size + the processing window. If the mp4 is truncated (read before AVPro
             // finished writing) Move fails ingest with a generic "unable to synchronize" error — this log lets us
             // confirm the file is complete and that the clip window is sane.
+            float clipEnd = recording.duration > 0f
+                ? recording.videoStartTimeOffset + recording.duration
+                : 0f;
             Debug.Log($"[MoveAIFusionCoordinator] Uploading video: {videoBytes.Length / 1024}KB, " +
-                      $"recording duration {recording.duration:F2}s, clipWindow end {(recording.duration > 0f ? recording.duration : 0f):F2}s");
+                      $"recording duration {recording.duration:F2}s, clipWindow end {clipEnd:F2}s");
 
             SetStatus("Submitting climb to Move AI...");
-            // The recording has already been trimmed to drop the out-of-frame tail; process only that window so the
+            // The recording has already been trimmed to the in-frame body window; process only that span so the
             // Move motion matches the saved ARKit recording length.
-            float clipEnd = recording.duration > 0f ? recording.duration : 0f;
             moveApiClient.SubmitVideo(videoBytes,
                 onComplete: result => OnMoveJobComplete(recording, recordingFileName, result),
                 onProgress: p => SetStatus($"Move AI: {p.message} ({p.percent:F0}%)"),
@@ -174,6 +179,25 @@ namespace BodyTracking.MoveAI
         }
 
         static string GlbDir => Path.Combine(Application.persistentDataPath, "MoveAIGLB");
+        static string GlbPath(string recordingFileName) => Path.Combine(GlbDir, recordingFileName + ".glb");
+
+        /// <summary>True when a raw Move AI GLB has been downloaded for this recording (used for GLB retargeting).</summary>
+        public static bool HasGlb(string recordingFileName) =>
+            !string.IsNullOrEmpty(recordingFileName) && File.Exists(GlbPath(recordingFileName));
+
+        // Hidden host for the runtime-loaded Move GLB skeleton(s).
+        private Transform glbHost;
+        Transform GlbHost()
+        {
+            if (glbHost == null)
+            {
+                var go = new GameObject("MoveGlbSources");
+                go.transform.SetParent(transform, false);
+                go.SetActive(true);
+                glbHost = go.transform;
+            }
+            return glbHost;
+        }
 
         /// <summary>
         /// Writes the raw Move AI GLB to persistentDataPath/MoveAIGLB/&lt;recording&gt;.glb so the raw rigged Move
@@ -271,6 +295,81 @@ namespace BodyTracking.MoveAI
             fusedPlayer.SetRouteRootProvider(provider);
             fusedPlayer.SetSourceRecording(recording);
             if (!fusedPlayer.LoadAsset(asset)) return false;
+
+            // Precedence: if a Move AI GLB exists for this recording, retarget body + fingers from it (muscle space)
+            // while positioning/scale stay on the fused trajectory. The GLB loads asynchronously, so defer the
+            // actual StartPlayback until it's ready (or failed -> procedural). The fused JSON path is otherwise
+            // unchanged, and the dot-skeleton player remains the outer fallback in BodyTrackingController.
+            // #region agent log
+            DbgLog("B", "MoveAIFusionCoordinator.cs:TryStartFusedPlayback", "glb branch decision",
+                "{\"recording\":\"" + recordingFileName + "\",\"preferGlb\":" + (preferGlbArticulation ? "true" : "false") +
+                ",\"hasGlb\":" + (HasGlb(recordingFileName) ? "true" : "false") + ",\"glbPath\":\"" + GlbPath(recordingFileName).Replace("\\", "/") + "\"}");
+            // #endregion
+            // Only take the GLB path when the player is actually in GLB articulation mode. In FBX mode the player
+            // runs the original position-based procedural retarget, so we must NOT load/attach a Move GLB — that
+            // keeps the FBX path identical to how it worked before the GLB feature existed.
+            bool glbMode = fusedPlayer.ArticulationMode == FusedCharacterPlayer.BodyArticulationSource.MoveGlb;
+            if (glbMode && preferGlbArticulation && HasGlb(recordingFileName))
+            {
+                // Start playback immediately (procedural fallback); attach the GLB muscle retarget when ready so a
+                // slow glTFast load on device never blocks the UI or leaves the app feeling frozen.
+                StartCoroutine(AttachGlbWhenReady(GlbPath(recordingFileName), recordingFileName));
+            }
+            else
+            {
+                fusedPlayer.SetMoveGlbSource(null);
+            }
+
+            StartFusedNow(recordingFileName, asset, provider, recording);
+            return true;
+        }
+
+        /// <summary>Preload the Move GLB for a recording so Play can switch to muscle retarget instantly.</summary>
+        public void WarmGlb(string recordingFileName)
+        {
+            if (!preferGlbArticulation || fusedPlayer == null) return;
+            if (fusedPlayer.ArticulationMode != FusedCharacterPlayer.BodyArticulationSource.MoveGlb) return;
+            if (!HasGlb(recordingFileName)) return;
+            StartCoroutine(AttachGlbWhenReady(GlbPath(recordingFileName), recordingFileName));
+        }
+
+        IEnumerator AttachGlbWhenReady(string glbPath, string recordingFileName)
+        {
+            Debug.Log($"[MoveAIFusionCoordinator] GLB load started for '{recordingFileName}'…");
+            MoveGlbSource source = null;
+            float deadline = Time.realtimeSinceStartup + 45f;
+            var load = MoveGlbSource.LoadCoroutine(glbPath, GlbHost(), r => source = r);
+            while (load.MoveNext())
+            {
+                if (Time.realtimeSinceStartup > deadline)
+                {
+                    Debug.LogWarning("[MoveAIFusionCoordinator] Move GLB load timed out after 45s; staying on procedural articulation.");
+                    yield break;
+                }
+                yield return load.Current;
+            }
+
+            string loadError = source != null ? source.Error : "unknown";
+            // #region agent log
+            DbgLog("D", "MoveAIFusionCoordinator.cs:AttachGlbWhenReady", "glb load done",
+                "{\"sourceNull\":" + (source == null ? "true" : "false") +
+                ",\"ready\":" + (source != null && source.IsReady ? "true" : "false") + ",\"error\":\"" + (loadError ?? "").Replace("\"", "'") + "\"}");
+            // #endregion
+            if (source != null && source.IsReady)
+            {
+                fusedPlayer.SetMoveGlbSource(source);
+                SetStatus($"Move GLB articulation active for '{recordingFileName}'");
+            }
+            else
+            {
+                Debug.LogWarning("[MoveAIFusionCoordinator] Move GLB load failed; using procedural articulation. " + loadError);
+            }
+        }
+
+        void StartFusedNow(string recordingFileName, MoveAIFusionAsset asset,
+                           IRouteRootProvider provider, HipRecording recording)
+        {
+            fusedPlayer.RefreshGlbArticulation();
             fusedPlayer.StartPlayback();
 
             if (showCompareSkeletons && recording != null)
@@ -280,7 +379,6 @@ namespace BodyTracking.MoveAI
             }
 
             SetStatus($"Playing fused replay '{recordingFileName}'");
-            return true;
         }
 
         public bool IsFusedPlaying => fusedPlayer != null && fusedPlayer.IsPlaying;
@@ -303,6 +401,28 @@ namespace BodyTracking.MoveAI
             if (fusedPlayer != null) fusedPlayer.SeekToTime(time);
         }
 
+        public void SetFusedSegmentLoop(float start, float end, bool enabled)
+        {
+            if (fusedPlayer != null) fusedPlayer.SetSegmentLoop(start, end, enabled);
+        }
+
+        public void StepFusedFrames(int deltaFrames)
+        {
+            if (fusedPlayer != null) fusedPlayer.StepFrames(deltaFrames);
+        }
+
+        public float FusedPlaybackSpeed
+        {
+            get => fusedPlayer != null ? fusedPlayer.PlaybackSpeed : 1f;
+            set { if (fusedPlayer != null) fusedPlayer.PlaybackSpeed = value; }
+        }
+
+        public bool FusedLoopPlayback
+        {
+            get => fusedPlayer != null && fusedPlayer.LoopPlayback;
+            set { if (fusedPlayer != null) fusedPlayer.LoopPlayback = value; }
+        }
+
         void EnsureCompareVisualizer()
         {
             if (compareVisualizer == null)
@@ -318,6 +438,16 @@ namespace BodyTracking.MoveAI
             if (fusedPlayer != null)
                 fusedPlayer.StopPlayback();
         }
+
+        // #region agent log
+        static void DbgLog(string h, string loc, string msg, string data)
+        {
+            string line = "{\"sessionId\":\"8c511b\",\"hypothesisId\":\"" + h + "\",\"location\":\"" + loc + "\",\"message\":\"" + msg + "\",\"data\":" + data + ",\"timestamp\":" + System.DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() + "}";
+            UnityEngine.Debug.Log("[DBG8c511b] " + line);
+            try { System.IO.File.AppendAllText("/Users/laurensart/Desktop/TENDOR-climbing copy/TENDOR-climbing/.cursor/debug-8c511b.log", line + "\n"); }
+            catch { }
+        }
+        // #endregion
 
         void SetStatus(string status)
         {

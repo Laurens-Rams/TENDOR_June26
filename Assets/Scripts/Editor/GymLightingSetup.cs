@@ -59,16 +59,14 @@ namespace BodyTracking.Editor
                 Undo.RegisterCreatedObjectUndo(group, "Create Lighting Group");
             }
 
-            // KEY: the dominant "skylight" coming through the roof. Slightly warm, casts the
-            // only (hard) shadow the pipeline allows, softened by a reduced shadow strength.
+            // KEY: the dominant "skylight" coming through the roof. Slightly warm, no shadows —
+            // directional shadows self-shadow the avatar's face (nose/cheek) as harsh dark patches in AR, and
+            // the fill/rim rig already provides shape. Skipping the shadow map is also cheaper on device.
             var key = EnsureLight(group, KeyName, reuseExistingSun: true);
             key.type = LightType.Directional;
             key.color = new Color(1.00f, 0.97f, 0.90f);
             key.intensity = 1.0f;
-            key.shadows = LightShadows.Soft; // pipeline downgrades to hard, still cheapest "on"
-            key.shadowStrength = 0.55f;       // keep shadows gentle, like diffuse gym light
-            key.shadowNormalBias = 0.5f;
-            key.shadowBias = 0.05f;
+            key.shadows = LightShadows.None;
             key.bounceIntensity = 1f;
             key.transform.localEulerAngles = new Vector3(50f, -35f, 0f);
 

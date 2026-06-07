@@ -1,6 +1,4 @@
 using UnityEngine;
-using UnityEngine.Animations;
-using UnityEngine.Playables;
 
 namespace BodyTracking.Glb
 {
@@ -41,7 +39,8 @@ namespace BodyTracking.Glb
         HumanPoseHandler sourceHandler;
         HumanPoseHandler targetHandler;
         HumanPose pose = new HumanPose();
-        PlayableGraph graph;
+        GameObject sourceRoot;
+        float sourceTime;
         Transform sourceHips, targetHips;
         bool ready;
 
@@ -49,7 +48,6 @@ namespace BodyTracking.Glb
 
         void OnDisable()
         {
-            if (graph.IsValid()) graph.Destroy();
             sourceHandler?.Dispose();
             targetHandler?.Dispose();
             sourceHandler = null;
@@ -99,15 +97,9 @@ namespace BodyTracking.Glb
                 return false;
             }
 
-            // Drive the source rig with the clip via a Playable graph (works for generic clips, no controller needed).
-            if (graph.IsValid()) graph.Destroy();
-            if (srcAnimator == null) srcAnimator = srcRoot.AddComponent<Animator>();
-            graph = PlayableGraph.Create("GlbRetarget_" + sourceInstance.name);
-            graph.SetTimeUpdateMode(DirectorUpdateMode.GameTime);
-            var output = AnimationPlayableOutput.Create(graph, "Animation", srcAnimator);
-            var clipPlayable = AnimationClipPlayable.Create(graph, sourceClip);
-            output.SetSourcePlayable(clipPlayable);
-            graph.Play();
+            // glTFast clips are legacy transform curves — SampleAnimation works; Playables reject them.
+            sourceRoot = srcRoot;
+            sourceTime = 0f;
 
             sourceHandler = new HumanPoseHandler(sourceAvatar, srcRoot.transform);
             targetHandler = new HumanPoseHandler(targetAnimator.avatar, targetAnimator.transform);
@@ -123,9 +115,15 @@ namespace BodyTracking.Glb
 
         void LateUpdate()
         {
-            if (!ready) return;
+            if (!ready || sourceClip == null || sourceRoot == null) return;
 
-            // The source rig is posed by the Playable graph this frame; read it in muscle space and write to target.
+            float len = sourceClip.length;
+            if (len > 0f)
+            {
+                sourceTime = Mathf.Repeat(sourceTime + Time.deltaTime, len);
+                sourceClip.SampleAnimation(sourceRoot, sourceTime);
+            }
+
             sourceHandler.GetHumanPose(ref pose);
             targetHandler.SetHumanPose(ref pose);
 

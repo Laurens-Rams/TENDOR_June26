@@ -62,12 +62,35 @@ namespace BodyTracking.Playback
         public event System.Action OnPlaybackLooped;
         public event System.Action<float> OnPlaybackProgress; // 0-1
         
+        // Segment loop (used by the playback screen when looping a single move).
+        private bool segmentLoopEnabled;
+        private float segmentLoopStart;
+        private float segmentLoopEnd;
+
         // Public properties
         public bool IsPlaying => isPlaying;
         public bool IsPaused => isPaused;
         public float PlaybackProgress => recording != null ? Mathf.Clamp01(currentPlaybackTime / recording.duration) : 0f;
         public float CurrentTime => currentPlaybackTime;
         public float Duration => recording?.duration ?? 0f;
+        public float PlaybackSpeed
+        {
+            get => playbackSpeed;
+            set
+            {
+                if (Mathf.Approximately(playbackSpeed, value)) return;
+                float t = currentPlaybackTime;
+                playbackSpeed = Mathf.Max(0.01f, value);
+                if (isPlaying && !isPaused)
+                    playbackStartTime = Time.time - t / playbackSpeed;
+            }
+        }
+        public bool LoopPlayback
+        {
+            get => loopPlayback;
+            set => loopPlayback = value;
+        }
+        public float FrameRate => recording != null && recording.frameRate > 0f ? recording.frameRate : 30f;
 
         /// <summary>
         /// Bind/replace the RouteRoot provider used to map recorded points back to world space.
@@ -340,7 +363,29 @@ namespace BodyTracking.Playback
             if (isPlaying)
             {
                 playbackStartTime = Time.time - currentPlaybackTime / playbackSpeed;
+                if (isPaused)
+                {
+                    var frame = recording.GetFrameAtTime(currentPlaybackTime);
+                    if (frame.IsValid && !waitingForLocalization)
+                        UpdatePlaybackFrame(frame);
+                }
             }
+        }
+
+        /// <summary>Configure looping between two times (inclusive start, exclusive end).</summary>
+        public void SetSegmentLoop(float start, float end, bool enabled)
+        {
+            segmentLoopEnabled = enabled && end > start;
+            segmentLoopStart = Mathf.Max(0f, start);
+            segmentLoopEnd = end;
+        }
+
+        /// <summary>Step the timeline by whole frames (positive = forward).</summary>
+        public void StepFrames(int deltaFrames)
+        {
+            if (recording == null || deltaFrames == 0) return;
+            float step = deltaFrames * (1f / FrameRate);
+            SeekToTime(currentPlaybackTime + step);
         }
 
         void Update()
@@ -386,8 +431,19 @@ namespace BodyTracking.Playback
             float elapsedTime = (Time.time - playbackStartTime) * playbackSpeed;
             currentPlaybackTime = elapsedTime;
             
-            // Handle looping
-            if (currentPlaybackTime >= recording.duration)
+            // Handle looping (segment loop takes priority over full loop).
+            if (segmentLoopEnabled && segmentLoopEnd > segmentLoopStart)
+            {
+                if (currentPlaybackTime >= segmentLoopEnd)
+                {
+                    currentPlaybackTime = segmentLoopStart;
+                    playbackStartTime = Time.time - currentPlaybackTime / playbackSpeed;
+                    OnPlaybackLooped?.Invoke();
+                    if (useFbxCharacterPlayback && characterController != null && characterController.IsInitialized)
+                        characterController.StartAnimationPlayback();
+                }
+            }
+            else if (currentPlaybackTime >= recording.duration)
             {
                 if (loopPlayback)
                 {
