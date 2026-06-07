@@ -26,7 +26,8 @@ namespace BodyTracking.MoveAI
         [SerializeField] private MoveJointMap jointMap = MoveJointMap.CreateDefaultMixamo();
 
         [Header("Fusion settings")]
-        [SerializeField] private Vector3 axisWeights = new Vector3(0.6f, 0.2f, 1.0f);
+        [Tooltip("Per-axis ARKit correction weights applied at bake time (X/Z moderate, Y full for climbs). Zero in scene = use default (0.6, 1, 1).")]
+        [SerializeField] private Vector3 axisWeights = MoveAIFusionBaker.Settings.DefaultAxisWeights;
         [SerializeField] private float smoothingTau = 0.4f;
         [SerializeField] private float outlierMeters = 0.6f;
         [Tooltip("During fused replay, show ARKit (cyan) and Move (orange) skeletons side by side alongside the character.")]
@@ -45,11 +46,59 @@ namespace BodyTracking.MoveAI
         public event Action<string> OnStatusChanged;
         public event Action<string> OnFusionReady; // recordingFileName
 
+        /// <summary>Live-tunable fusion bake settings (applied by <see cref="RebakeLatest"/>, no API call).</summary>
+        public MoveAIFusionBaker.Settings BakeSettings
+        {
+            get => new MoveAIFusionBaker.Settings
+            {
+                axisWeights = axisWeights,
+                smoothingTau = smoothingTau,
+                outlierMeters = outlierMeters,
+            };
+            set
+            {
+                axisWeights = value.axisWeights;
+                smoothingTau = value.smoothingTau;
+                outlierMeters = value.outlierMeters;
+            }
+        }
+
         static string FusionDir => Path.Combine(Application.persistentDataPath, FusionFolder);
         static string FusionPath(string recordingFileName) => Path.Combine(FusionDir, recordingFileName + ".fusion.json");
 
         public static bool HasFusionAsset(string recordingFileName) =>
             !string.IsNullOrEmpty(recordingFileName) && File.Exists(FusionPath(recordingFileName));
+
+        void Awake()
+        {
+            // Legacy scenes serialized axisWeights as zero (pure Move root); migrate so rebake applies ARKit Y correction.
+            if (IsZeroWeights(axisWeights))
+                axisWeights = MoveAIFusionBaker.Settings.DefaultAxisWeights;
+        }
+
+        static bool IsZeroWeights(Vector3 w) => w.sqrMagnitude < 1e-8f;
+
+        /// <summary>
+        /// Effective bake settings: non-zero serialized weights, else weights stored on the asset, else defaults.
+        /// </summary>
+        MoveAIFusionBaker.Settings ResolveBakeSettings(MoveAIFusionAsset existing = null)
+        {
+            var weights = axisWeights;
+            if (IsZeroWeights(weights))
+            {
+                if (existing != null && !IsZeroWeights(existing.correctionWeights))
+                    weights = existing.correctionWeights;
+                else
+                    weights = MoveAIFusionBaker.Settings.DefaultAxisWeights;
+            }
+
+            return new MoveAIFusionBaker.Settings
+            {
+                axisWeights = weights,
+                smoothingTau = smoothingTau,
+                outlierMeters = outlierMeters,
+            };
+        }
 
         /// <summary>
         /// Kick off the Move AI fusion job for a freshly saved recording. <paramref name="videoFilePath"/> is the
@@ -69,12 +118,11 @@ namespace BodyTracking.MoveAI
                 return;
             }
 
-            // The fusion stack (this coordinator + MoveApiClient) lives on the MoveAIFusion object, which can be
-            // left inactive in the scene. Activate it so the upload/poll coroutine can run.
-            if (!moveApiClient.gameObject.activeSelf)
-                moveApiClient.gameObject.SetActive(true);
-            if (!gameObject.activeSelf)
-                gameObject.SetActive(true);
+            if (!EnsureFusionHostActive())
+            {
+                SetStatus("Fusion skipped: MoveAIFusion inactive");
+                return;
+            }
             if (string.IsNullOrEmpty(videoFilePath) || !File.Exists(VideoRecorder.NormalizeLocalPath(videoFilePath)))
             {
                 SetStatus("Fusion skipped: no paired video file");
@@ -154,13 +202,7 @@ namespace BodyTracking.MoveAI
             }
 
             SetStatus("Baking fusion...");
-            var settings = new MoveAIFusionBaker.Settings
-            {
-                axisWeights = axisWeights,
-                smoothingTau = smoothingTau,
-                outlierMeters = outlierMeters,
-            };
-            var asset = MoveAIFusionBaker.Bake(recording, motion, jointMap, settings);
+            var asset = MoveAIFusionBaker.Bake(recording, motion, jointMap, ResolveBakeSettings());
             if (asset == null)
             {
                 SetStatus("Fusion bake failed");
@@ -324,13 +366,75 @@ namespace BodyTracking.MoveAI
             return true;
         }
 
+        /// <summary>
+        /// Re-fuse the latest recording using the CACHED Move pose from the existing fused asset and the current
+        /// <see cref="BakeSettings"/> — no Move API call. Saves back over the same .fusion.json and restarts fused
+        /// playback so the change is visible immediately. Returns false (with a status) if there's nothing to rebake.
+        /// </summary>
+        public bool RebakeLatest(string recordingFileName, IRouteRootProvider provider, HipRecording recording)
+        {
+            if (fusedPlayer == null || string.IsNullOrEmpty(recordingFileName) || recording == null)
+            {
+                SetStatus("Rebake skipped: no recording loaded");
+                return false;
+            }
+            if (!HasFusionAsset(recordingFileName))
+            {
+                SetStatus("No fused asset yet — submit to Move first");
+                return false;
+            }
+
+            var existing = MoveAIFusionAsset.Load(FusionPath(recordingFileName));
+            if (existing == null || existing.pose == null || existing.pose.FrameCount == 0)
+            {
+                SetStatus("Rebake failed: cached pose unreadable");
+                return false;
+            }
+
+            SetStatus("Rebaking (no API)…");
+            var rebaked = MoveAIFusionBaker.RebakeFromAsset(recording, existing, ResolveBakeSettings(existing));
+            if (rebaked == null)
+            {
+                SetStatus("Rebake failed");
+                return false;
+            }
+
+            if (!rebaked.Save(FusionPath(recordingFileName)))
+            {
+                SetStatus("Rebake save failed");
+                return false;
+            }
+
+            // Restart fused playback from the freshly saved asset (reuses provider/GLB/compare wiring).
+            bool restarted = TryStartFusedPlayback(recordingFileName, provider, recording);
+            SetStatus(restarted ? $"Rebaked '{recordingFileName}'" : "Rebaked; press Play to view");
+            return true;
+        }
+
         /// <summary>Preload the Move GLB for a recording so Play can switch to muscle retarget instantly.</summary>
         public void WarmGlb(string recordingFileName)
         {
             if (!preferGlbArticulation || fusedPlayer == null) return;
             if (fusedPlayer.ArticulationMode != FusedCharacterPlayer.BodyArticulationSource.MoveGlb) return;
             if (!HasGlb(recordingFileName)) return;
+            if (!EnsureFusionHostActive())
+                return;
             StartCoroutine(AttachGlbWhenReady(GlbPath(recordingFileName), recordingFileName));
+        }
+
+        /// <summary>Coroutines require an active host (MoveAIFusion is often left inactive in the scene).</summary>
+        bool EnsureFusionHostActive()
+        {
+            if (moveApiClient != null && !moveApiClient.gameObject.activeSelf)
+                moveApiClient.gameObject.SetActive(true);
+            if (!gameObject.activeSelf)
+                gameObject.SetActive(true);
+            if (!isActiveAndEnabled)
+            {
+                Debug.LogWarning("[MoveAIFusionCoordinator] MoveAIFusion is inactive in hierarchy — enable it (or its parents) for GLB preload / fusion.");
+                return false;
+            }
+            return true;
         }
 
         IEnumerator AttachGlbWhenReady(string glbPath, string recordingFileName)

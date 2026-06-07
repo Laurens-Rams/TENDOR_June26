@@ -4,6 +4,9 @@ using BodyTracking.Data;
 using BodyTracking.MoveAI;
 using BodyTracking.Spatial;
 using BodyTracking.Utils;
+#if UNITY_EDITOR || DEVELOPMENT_BUILD
+using BodyTracking.DebugTools;
+#endif
 
 namespace BodyTracking.Playback
 {
@@ -34,6 +37,7 @@ namespace BodyTracking.Playback
         bool active;
         float localPlaybackTime;
         FusedPoseSolver.AnchorState moveAnchorState; // last-good anchor/facing through ARKit dropouts
+        FusedPoseSolver.AnchorMode lastPlaybackAnchorMode = (FusedPoseSolver.AnchorMode)(-1);
 
         SkeletonLayer arkitLayer;
         SkeletonLayer moveLayer;
@@ -104,6 +108,7 @@ namespace BodyTracking.Playback
 
 #if UNITY_EDITOR || DEVELOPMENT_BUILD
         int dbgFrame;
+        int dbgTimingFrame;
 
         // #region agent log
         void OnEnable()
@@ -182,6 +187,13 @@ namespace BodyTracking.Playback
 
 #if UNITY_EDITOR || DEVELOPMENT_BUILD
             // #region agent log
+            if ((dbgTimingFrame++ % 30) == 0)
+                LogTimingAlignment(t);
+            // #endregion
+#endif
+
+#if UNITY_EDITOR || DEVELOPMENT_BUILD
+            // #region agent log
             if ((dbgFrame++ % 60) == 0)
             {
                 var camTr = Camera.main != null ? Camera.main.transform : null;
@@ -251,8 +263,10 @@ namespace BodyTracking.Playback
         {
             // Shared solver: same ARKit-anchored, facing-aligned positions the character uses, and it holds the
             // last-good anchor/facing through ARKit dropouts so the overlay no longer spins when the body is lost.
-            var anchorSettings = fusedPlayer != null ? fusedPlayer.AnchorSettings : FusedPoseSolver.AnchorSettings.Default;
-            Vector3[] local = FusedPoseSolver.ComputeLocalJoints(fusion, recording, t, ref moveAnchorState, invertFacing, anchorSettings);
+            var anchorSettings = fusedPlayer != null ? fusedPlayer.EffectivePlaybackAnchorSettings() : FusedPoseSolver.AnchorSettings.Default;
+            SyncAnchorMode(anchorSettings.mode);
+            var glb = fusedPlayer != null ? fusedPlayer.ActiveGlbSource : null;
+            Vector3[] local = FusedPoseSolver.ComputeLocalJoints(fusion, recording, t, ref moveAnchorState, invertFacing, anchorSettings, glb);
             if (local == null) return;
 
             int n = local.Length;
@@ -272,6 +286,100 @@ namespace BodyTracking.Playback
                 }
             }
         }
+
+#if UNITY_EDITOR || DEVELOPMENT_BUILD
+        // #region agent log
+        /// <summary>Measure whether orange foot height best matches ARKit at t, t-offset, etc.</summary>
+        void LogTimingAlignment(float t)
+        {
+            if (recording == null || fusion?.pose == null) return;
+
+            float offset = recording.videoStartTimeOffset;
+            float fps = fusion.frameRate > 0f ? fusion.frameRate : 30f;
+            int bakedIdx = Mathf.Clamp(Mathf.RoundToInt(t * fps), 0, fusion.FrameCount - 1);
+
+            var anchorSettings = fusedPlayer != null ? fusedPlayer.EffectivePlaybackAnchorSettings() : FusedPoseSolver.AnchorSettings.Default;
+            var glb = fusedPlayer != null ? fusedPlayer.ActiveGlbSource : null;
+            Vector3[] orangeLocal = FusedPoseSolver.ComputeLocalJoints(fusion, recording, t, ref moveAnchorState, invertFacing, anchorSettings, glb);
+            float orangeFootY = TryMoveFootY(orangeLocal);
+            float arkitFootY = FootYAtTime(t);
+            float arkitFootYMinusOffset = offset > 0.01f ? FootYAtTime(Mathf.Max(0f, t - offset)) : arkitFootY;
+
+            float bestLag = 0f;
+            float bestErr = float.MaxValue;
+            int steps = Mathf.Max(1, Mathf.RoundToInt(offset * 10f));
+            for (int s = 0; s <= steps; s++)
+            {
+                float lag = steps > 0 ? (offset * s / steps) : 0f;
+                float err = Mathf.Abs(orangeFootY - FootYAtTime(Mathf.Max(0f, t - lag)));
+                if (err < bestErr) { bestErr = err; bestLag = lag; }
+            }
+
+            float errAtZero = Mathf.Abs(orangeFootY - arkitFootY);
+            float errAtOffset = Mathf.Abs(orangeFootY - arkitFootYMinusOffset);
+
+            float bakedRootY = fusion.rootPathLocal != null && bakedIdx < fusion.rootPathLocal.Count
+                ? fusion.rootPathLocal[bakedIdx].y : 0f;
+
+            TimingDebugLog.Log("H1", "PlaybackCompareVisualizer.LogTimingAlignment",
+                "t=" + t.ToString("F2") + " offset=" + offset.ToString("F2") +
+                " corrected=" + fusion.offsetCorrected + " bestLag=" + bestLag.ToString("F2") +
+                " err0=" + errAtZero.ToString("F3") + " errOff=" + errAtOffset.ToString("F3"),
+                "{\"t\":" + t.ToString("F2") +
+                ",\"videoOffset\":" + offset.ToString("F2") +
+                ",\"offsetCorrected\":" + (fusion.offsetCorrected ? "true" : "false") +
+                ",\"anchorMode\":\"" + anchorSettings.mode + "\"" +
+                ",\"usedGlbPose\":" + (glb != null ? "true" : "false") +
+                ",\"bakedIdx\":" + bakedIdx +
+                ",\"bakedRootY\":" + bakedRootY.ToString("F3") +
+                ",\"orangeFootY\":" + orangeFootY.ToString("F3") +
+                ",\"arkitFootY\":" + arkitFootY.ToString("F3") +
+                ",\"arkitFootY_tMinusOffset\":" + arkitFootYMinusOffset.ToString("F3") +
+                ",\"errAtZero\":" + errAtZero.ToString("F3") +
+                ",\"errAtOffset\":" + errAtOffset.ToString("F3") +
+                ",\"bestLagSec\":" + bestLag.ToString("F2") + "}");
+        }
+
+        void SyncAnchorMode(FusedPoseSolver.AnchorMode mode)
+        {
+            if (lastPlaybackAnchorMode == mode) return;
+            lastPlaybackAnchorMode = mode;
+            moveAnchorState.hasFacing = false;
+        }
+
+        float FootYAtTime(float sampleT)
+        {
+            var frame = recording.GetFrameAtTime(sampleT);
+            float footY = float.MaxValue;
+            bool any = false;
+            foreach (int idx in new[] { 5, 6, 10, 11, 4, 9, 13 })
+            {
+                if (TryGetSample(frame, idx, out var s))
+                {
+                    footY = Mathf.Min(footY, s.positionReference.y);
+                    any = true;
+                }
+            }
+            if (!any && frame.hipJoint.IsValid)
+            {
+                footY = frame.hipJoint.position.y;
+                any = true;
+            }
+            return any ? footY : 0f;
+        }
+
+        float TryMoveFootY(Vector3[] local)
+        {
+            if (local == null || fusion?.pose == null) return 0f;
+            int footIdx = fusion.pose.IndexOfJoint("Left_toe");
+            if (footIdx < 0) footIdx = fusion.pose.IndexOfJoint("Left_ankle");
+            if (footIdx < 0) footIdx = fusion.pose.IndexOfJoint("Right_toe");
+            if (footIdx < 0) footIdx = fusion.pose.IndexOfJoint("Right_ankle");
+            if (footIdx < 0 || footIdx >= local.Length) return local.Length > 0 ? local[0].y : 0f;
+            return local[footIdx].y;
+        }
+        // #endregion
+#endif
 
         static bool TryGetSample(HipFrame frame, int jointIndex, out RecordedJointSample sample)
         {

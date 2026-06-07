@@ -34,6 +34,7 @@ namespace BodyTracking.UI
         private GameObject playIcon;
         private GameObject pauseIcon;
         private Button backToRecordButton;
+        private Button tuneButton;
         private Button finishButton;
         private Image finishCircle;
         private GameObject finishCheckmark;
@@ -453,9 +454,18 @@ namespace BodyTracking.UI
             rect.anchorMax = new Vector2(0f, 1f);
             rect.pivot = new Vector2(0f, 1f);
             rect.anchoredPosition = new Vector2(UITokens.Space12, -UITokens.Space8);
+
+            tuneButton = UIFactory.CreatePillButton("OpenTuning", root, "Tune", ghost: true);
+            var trect = (RectTransform)tuneButton.transform;
+            trect.sizeDelta = new Vector2(84f, 34f);
+            trect.anchorMin = new Vector2(0f, 1f);
+            trect.anchorMax = new Vector2(0f, 1f);
+            trect.pivot = new Vector2(0f, 1f);
+            trect.anchoredPosition = new Vector2(UITokens.Space12 + 96f + UITokens.Space8, -UITokens.Space8);
         }
 
         public Button BackToRecordButton => backToRecordButton;
+        public Button TuneButton => tuneButton;
 
         // ============================================================================================
         // SHARED CANVAS / EVENT SYSTEM

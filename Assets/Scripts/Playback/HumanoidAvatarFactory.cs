@@ -33,6 +33,13 @@ namespace BodyTracking.Glb
         /// </summary>
         public static Avatar Build(GameObject root, out string report)
         {
+            return Build(root, out report, out _);
+        }
+
+        /// <summary>Like <see cref="Build(UnityEngine.GameObject,out string)"/> but also returns the resolved bone map.</summary>
+        public static Avatar Build(GameObject root, out string report, out Dictionary<HumanBodyBones, Transform> resolvedBones)
+        {
+            resolvedBones = null;
             var sb = new StringBuilder();
             if (root == null) { report = "No root."; return null; }
 
@@ -103,6 +110,7 @@ namespace BodyTracking.Glb
             }
 
             avatar.name = root.name + "_HumanoidAvatar";
+            resolvedBones = resolved;
             sb.AppendLine($"Humanoid avatar built: {human.Count} bones mapped ({resolved.Count} human bones, fingers included where present).");
             report = sb.ToString();
             return avatar;

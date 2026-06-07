@@ -102,6 +102,17 @@ namespace BodyTracking.LookDev
             ApplyEnvironment();
         }
 
+        /// <summary>
+        /// Runtime/editor prep shared by AR playback: hide eye-occlusion shells and disable cast/receive shadows.
+        /// Material look comes from the shared .mat assets tuned in Character Look Lab.
+        /// </summary>
+        public static void PrepareForDisplay(Transform root)
+        {
+            if (root == null) return;
+            DisableOcclusionShells(root);
+            DisableShadows(root);
+        }
+
         public void ApplyMaterials()
         {
             if (character == null) return;

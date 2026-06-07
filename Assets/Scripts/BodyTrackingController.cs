@@ -125,6 +125,22 @@ namespace BodyTracking
             !string.IsNullOrEmpty(lastRecordingFileName) &&
             MoveAIFusionCoordinator.HasFusionAsset(lastRecordingFileName);
 
+        /// <summary>True when there's a loaded recording with a cached fused asset that can be rebaked (no API).</summary>
+        public bool CanRebake =>
+            fusionCoordinator != null &&
+            lastRecording != null && lastRecording.IsValid &&
+            LastRecordingHasFusionAsset;
+
+        /// <summary>
+        /// Re-fuse the latest recording from the cached Move pose with the coordinator's current bake settings —
+        /// no Move API call — and restart fused playback. No-op (returns false) when <see cref="CanRebake"/> is false.
+        /// </summary>
+        public bool RebakeLatest()
+        {
+            if (!CanRebake) return false;
+            return fusionCoordinator.RebakeLatest(lastRecordingFileName, routeRootManager, lastRecording);
+        }
+
         /// <summary>True when a fused Move AI replay is driving playback (instead of the dot-skeleton player).</summary>
         public bool IsFusedPlaying => fusionCoordinator != null && fusionCoordinator.IsFusedPlaying;
         public float FusedCurrentTime => fusionCoordinator != null ? fusionCoordinator.FusedCurrentTime : 0f;
@@ -942,6 +958,30 @@ namespace BodyTracking
             }
             immersal.RequestRealign();
             UpdateStatus("Re-aligning to Immersal…");
+        }
+
+        /// <summary>
+        /// Clears the frozen Immersal anchor so localization can re-establish, then snaps to the latest fix.
+        /// Use after walking to a new wall or when the room anchor has drifted.
+        /// </summary>
+        public void RetargetAndRealignImmersal()
+        {
+            if (IsRecording || IsPlaying)
+            {
+                UpdateStatus("Stop recording/playback before retargeting");
+                return;
+            }
+
+            var immersal = routeRootManager != null ? routeRootManager.ImmersalProvider : null;
+            if (immersal == null)
+            {
+                UpdateStatus("Retarget unavailable (no Immersal provider)");
+                return;
+            }
+
+            immersal.ClearFrozenAnchor();
+            immersal.RequestRealign();
+            UpdateStatus("Retargeting Immersal & re-aligning…");
         }
 
         private void SetupComponents()

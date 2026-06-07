@@ -631,10 +631,13 @@ namespace BodyTracking.UI
             mapSwitcher.OnMapSwitched += OnMapSwitched;
 
             float topY = -(UITokens.Space8 + UITokens.PillHeight * 2f + UITokens.Space4 + 4f);
+            const float mapPillWidth = 120f;
+            const float mapPillHeight = 34f;
+            const float mapPillGap = UITokens.Space8;
 
             mapToggleButton = UIFactory.CreatePillButton("MapToggle", root, "Map —", ghost: true);
             var toggleRect = (RectTransform)mapToggleButton.transform;
-            toggleRect.sizeDelta = new Vector2(120f, 34f);
+            toggleRect.sizeDelta = new Vector2(mapPillWidth, mapPillHeight);
             toggleRect.anchorMin = new Vector2(0f, 1f);
             toggleRect.anchorMax = new Vector2(0f, 1f);
             toggleRect.pivot = new Vector2(0f, 1f);
@@ -642,13 +645,23 @@ namespace BodyTracking.UI
             mapToggleLabel = mapToggleButton.GetComponentInChildren<TextMeshProUGUI>();
             mapToggleButton.onClick.AddListener(ToggleMapPanel);
 
+            realignButton = UIFactory.CreatePillButton("ImmersalRetargetRealign", root, "Retarget & align", ghost: true);
+            var realignRect = (RectTransform)realignButton.transform;
+            realignRect.sizeDelta = new Vector2(132f, mapPillHeight);
+            realignRect.anchorMin = new Vector2(0f, 1f);
+            realignRect.anchorMax = new Vector2(0f, 1f);
+            realignRect.pivot = new Vector2(0f, 1f);
+            realignRect.anchoredPosition = new Vector2(UITokens.Space12, topY - 42f - mapPillHeight - mapPillGap);
+            realignButton.onClick.RemoveListener(OnRetargetRealignClicked);
+            realignButton.onClick.AddListener(OnRetargetRealignClicked);
+
             mapPanel = UIFactory.CreatePanel("MapPanel", root, UITokens.Surface, UITokens.RadiusLarge).gameObject;
             var panelRect = mapPanel.GetComponent<RectTransform>();
             panelRect.anchorMin = new Vector2(0f, 1f);
             panelRect.anchorMax = new Vector2(0f, 1f);
             panelRect.pivot = new Vector2(0f, 1f);
             panelRect.sizeDelta = new Vector2(280f, 168f);
-            panelRect.anchoredPosition = new Vector2(UITokens.Space12, topY - 80f);
+            panelRect.anchoredPosition = new Vector2(UITokens.Space12, topY - 42f - (mapPillHeight + mapPillGap) * 2f - UITokens.Space8);
             var panelImage = mapPanel.GetComponent<Image>();
             panelImage.raycastTarget = true;
             // Keep the map panel above transport controls so Load is always tappable.
@@ -860,13 +873,12 @@ namespace BodyTracking.UI
             if (playButton != null) playButton.onClick.AddListener(OnPlayToggleClicked);
             if (stopPlayButton != null) stopPlayButton.onClick.AddListener(OnStopClicked);
             if (loadButton != null) loadButton.onClick.AddListener(OnLoadClicked);
-            if (realignButton != null) realignButton.onClick.AddListener(OnRealignClicked);
         }
 
-        private void OnRealignClicked()
+        private void OnRetargetRealignClicked()
         {
             if (controller != null)
-                controller.RealignToImmersal();
+                controller.RetargetAndRealignImmersal();
         }
 
         // ============================================================================================
@@ -933,12 +945,16 @@ namespace BodyTracking.UI
             if (nextRecordingButton != null) nextRecordingButton.interactable = selectorEnabled && availableRecordings.Count > 1;
             if (loadButton != null) loadButton.interactable = selectorEnabled;
 
-            // Re-align only makes sense when Immersal is the active, localized source and we're idle.
+            // Retarget/re-align when Immersal is available (including after a map switch, before re-lock).
             if (realignButton != null)
             {
-                bool immersalActive = controller.SpatialSourceLabel == "Immersal" && controller.IsLocalized;
+                var immersal = controller.routeRootManager != null
+                    ? controller.routeRootManager.ImmersalProvider
+                    : null;
+                bool immersalActive = immersal != null && immersal.IsAvailable;
                 realignButton.gameObject.SetActive(immersalActive);
-                realignButton.interactable = immersalActive && !isRecording && !isPlaying;
+                realignButton.interactable = immersalActive && !isRecording && !isPlaying
+                    && (mapSwitcher == null || !mapSwitcher.IsSwitching);
             }
 
             if (scrubSlider != null)

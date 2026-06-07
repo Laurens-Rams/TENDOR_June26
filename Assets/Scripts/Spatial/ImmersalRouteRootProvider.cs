@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using UnityEngine;
 using UnityEngine.XR.ARFoundation;
 using BodyTracking.Data;
+using BodyTracking.Utils;
 
 // The Immersal SDK Core package is NOT on a public registry; it must be downloaded from the Immersal
 // developer portal and imported via the Package Manager. To keep this project compiling with AND without
@@ -133,6 +134,8 @@ namespace BodyTracking.Spatial
         public string MapId => mapId;
         public string RouteId => routeId;
         public SpatialSourceType Source => SpatialSourceType.Immersal;
+        public int MinSuccessfulLocalizations => minSuccessfulLocalizations;
+        public int MinTrackingQuality => minTrackingQuality;
 
         public event Action<bool> OnLocalizationChanged;
 
@@ -148,6 +151,10 @@ namespace BodyTracking.Spatial
         void Awake()
         {
             EnsureRouteRoot();
+#if IMMERSAL_SDK_PRESENT
+            if (GetComponent<ImmersalScanVisualizationDriver>() == null)
+                gameObject.AddComponent<ImmersalScanVisualizationDriver>();
+#endif
         }
 
         void Update()
@@ -270,7 +277,8 @@ namespace BodyTracking.Spatial
 
             // Sample the Immersal target pose every time a NEW successful map localization lands. Failed
             // attempts ("Too few matches") do not increment successCount, so they are ignored here.
-            if (lastSuccessCount >= 0 && successCount > lastSuccessCount)
+            bool newSuccessfulLocalization = lastSuccessCount >= 0 && successCount > lastSuccessCount;
+            if (newSuccessfulLocalization)
             {
                 recentFixes.Add(GetImmersalTargetPose());
                 while (recentFixes.Count > Mathf.Max(1, freezeSampleWindow))
@@ -289,6 +297,13 @@ namespace BodyTracking.Spatial
             bool enoughSuccess = successCount >= Mathf.Max(1, minSuccessfulLocalizations);
             bool fixesAgree = TryGetAgreedFix(out Pose agreedPose);
             confidentlyLocalized = qualityHeld && enoughSuccess && fixesAgree;
+
+            if (newSuccessfulLocalization && !anchorFrozen)
+            {
+                bool lockingThisFrame = confidentlyLocalized && freezeAnchorOnConfidentLocalization;
+                if (!lockingThisFrame)
+                    HapticFeedback.PlayScanPoint();
+            }
 
             // First confident fix locks the room anchor (ARKit holds it from here on) at the AVERAGE of the
             // agreeing fixes rather than a single noisy sample.
@@ -361,6 +376,8 @@ namespace BodyTracking.Spatial
 
             if (useArAnchor)
                 RequestRoomAnchorAsync(target);
+
+            HapticFeedback.PlayAnchorLocked();
 
             Debug.Log($"[ImmersalRouteRootProvider] Room anchor locked at pos={target.position} rot={target.rotation.eulerAngles} " +
                       $"(ARAnchor={useArAnchor}, successes={GetLocalizationSuccessCount()}, agreedFrom={recentFixes.Count} fixes).");

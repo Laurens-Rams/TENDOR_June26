@@ -1,5 +1,6 @@
 using System.Collections.Generic;
 using UnityEngine;
+using BodyTracking.LookDev;
 using BodyTracking.Playback;
 
 namespace BodyTracking.Animation
@@ -155,6 +156,8 @@ namespace BodyTracking.Animation
                 if (!next.activeSelf) next.SetActive(true);
                 fbxCharacterController.SetCharacter(next);
             }
+
+            CharacterLookLab.PrepareForDisplay(next.transform);
 
             if (verboseLogging)
                 Debug.Log($"[CharacterSwitcher] Selected character {index + 1}/{characters.Count}: '{next.name}'.");

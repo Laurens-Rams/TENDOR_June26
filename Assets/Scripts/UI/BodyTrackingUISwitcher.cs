@@ -7,7 +7,8 @@ namespace BodyTracking.UI
     public enum AppScreen
     {
         Record,
-        Playback
+        Playback,
+        Tuning
     }
 
     /// <summary>
@@ -19,6 +20,7 @@ namespace BodyTracking.UI
         [Header("Screens")]
         public BodyTrackingUI recordScreen;
         public PlaybackScreenUI playbackScreen;
+        public TuningScreenUI tuningScreen;
 
         [Header("State")]
         [SerializeField] private AppScreen activeScreen = AppScreen.Record;
@@ -47,10 +49,19 @@ namespace BodyTracking.UI
             ApplyScreen(AppScreen.Playback, stopPlaybackOnLeave: false);
         }
 
+        public void ShowTuning()
+        {
+            // Reached from Playback; keep playback running so edits are visible on the character.
+            ApplyScreen(AppScreen.Tuning, stopPlaybackOnLeave: false);
+        }
+
         public void ToggleScreen()
         {
-            ApplyScreen(activeScreen == AppScreen.Record ? AppScreen.Playback : AppScreen.Record,
-                stopPlaybackOnLeave: activeScreen == AppScreen.Playback);
+            // Cycle Record -> Playback -> Tuning -> Record.
+            AppScreen next = activeScreen == AppScreen.Record ? AppScreen.Playback
+                : activeScreen == AppScreen.Playback ? AppScreen.Tuning
+                : AppScreen.Record;
+            ApplyScreen(next, stopPlaybackOnLeave: activeScreen != AppScreen.Record);
         }
 
         private void EnsureScreens()
@@ -71,6 +82,13 @@ namespace BodyTracking.UI
                 if (recordScreen != null && recordScreen.controller != null)
                     playbackScreen.controller = recordScreen.controller;
             }
+
+            if (tuningScreen == null)
+                tuningScreen = GetComponent<TuningScreenUI>();
+            if (tuningScreen == null)
+                tuningScreen = Object.FindFirstObjectByType<TuningScreenUI>();
+            if (tuningScreen == null)
+                tuningScreen = gameObject.AddComponent<TuningScreenUI>();
         }
 
         private void WireToggleButtons()
@@ -83,13 +101,25 @@ namespace BodyTracking.UI
                 playbackScreen.BackToRecordButton.onClick.RemoveListener(ShowRecord);
                 playbackScreen.BackToRecordButton.onClick.AddListener(ShowRecord);
             }
+
+            if (playbackScreen != null && playbackScreen.TuneButton != null)
+            {
+                playbackScreen.TuneButton.onClick.RemoveListener(ShowTuning);
+                playbackScreen.TuneButton.onClick.AddListener(ShowTuning);
+            }
+
+            if (tuningScreen != null && tuningScreen.BackButton != null)
+            {
+                tuningScreen.BackButton.onClick.RemoveListener(ShowPlayback);
+                tuningScreen.BackButton.onClick.AddListener(ShowPlayback);
+            }
         }
 
         private void ApplyScreen(AppScreen screen, bool stopPlaybackOnLeave)
         {
             EnsureScreens();
 
-            if (stopPlaybackOnLeave && activeScreen == AppScreen.Playback && screen == AppScreen.Record)
+            if (stopPlaybackOnLeave && activeScreen != AppScreen.Record && screen == AppScreen.Record)
             {
                 var controller = recordScreen != null ? recordScreen.controller : null;
                 if (controller == null && playbackScreen != null)
@@ -105,6 +135,9 @@ namespace BodyTracking.UI
 
             if (playbackScreen != null)
                 playbackScreen.SetVisible(screen == AppScreen.Playback);
+
+            if (tuningScreen != null)
+                tuningScreen.SetVisible(screen == AppScreen.Tuning);
 
             if (screen == AppScreen.Playback && playbackScreen != null)
             {

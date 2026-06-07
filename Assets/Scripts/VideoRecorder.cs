@@ -47,6 +47,20 @@ public class VideoRecorder : MonoBehaviour
     [Header("AR")]
     [SerializeField] private ARCameraManager cameraManager;
 
+    [Header("Encoder prewarm")]
+    [Tooltip("Run a throwaway capture once at startup so the first real record tap is instant (~15s VideoToolbox init otherwise). Disable if the brief startup hitch is worse than a slow first record.")]
+    [SerializeField] private bool enableEncoderPrewarm = true;
+    [Tooltip("Seconds after the first AR camera frame before prewarm runs (lets map switches / localization settle first).")]
+    [SerializeField] private float prewarmDelayAfterFirstFrameSeconds = 6f;
+    [Tooltip("AVPro's first StartCapture blocks the main thread for several seconds (VideoToolbox init). Defer until the device is still so scanning/moving the phone stays responsive.")]
+    [SerializeField] private bool deferPrewarmUntilStill = true;
+    [Tooltip("Gyro rotation rate (rad/s) below which the device counts as still.")]
+    [SerializeField] private float prewarmStillnessThresholdRadPerSec = 0.75f;
+    [Tooltip("Seconds of continuous stillness required before the blocking encoder warm runs.")]
+    [SerializeField] private float prewarmStillDurationSeconds = 0.5f;
+    [Tooltip("If the phone never settles, run prewarm anyway after this many seconds (may hitch while moving).")]
+    [SerializeField] private float prewarmStillnessTimeoutSeconds = 30f;
+
     [Header("Optional UI (not required for capture)")]
     [SerializeField] private TextMeshProUGUI tmpFrames;
     [SerializeField] private RawImage image;
@@ -73,6 +87,7 @@ public class VideoRecorder : MonoBehaviour
     int prewarmedCaptureWidth;
     int prewarmedCaptureHeight;
     Coroutine prewarmCoroutine;
+    Coroutine deferredPrewarmCoroutine;
     string warmupFilePath;
 
     // Set by OnFileWriteComplete when AVPro has fully flushed the real (non-prewarm) mp4 to disk. We wait for this
@@ -82,6 +97,9 @@ public class VideoRecorder : MonoBehaviour
 
     /// <summary>True after a throwaway capture has warmed the native encoder at the current AR resolution.</summary>
     public bool IsEncoderPrewarmed => prewarmed;
+
+    /// <summary>True while the throwaway encoder warm is running (including waiting for stillness).</summary>
+    public bool IsPrewarming => isWarmingUp;
 
     // Landscape conversion buffer (raw AR image) used as the source for rotation into the portrait `tex`.
     NativeArray<byte> srcBuffer;
@@ -166,6 +184,9 @@ public class VideoRecorder : MonoBehaviour
 #endif
         yield return null;
 
+        if (SystemInfo.supportsGyroscope)
+            Input.gyro.enabled = true;
+
         // AR intrinsics are not ready during BodyTrackingController.Initialize(); defer prewarm until the camera
         // is actually producing frames at its real resolution (1920x1440 etc.), otherwise the throwaway capture
         // runs at 1280x720 defaults and the first real record still pays the full CreateRecorderVideo cost.
@@ -247,6 +268,9 @@ public class VideoRecorder : MonoBehaviour
     /// </summary>
     public void Prewarm()
     {
+        if (!enableEncoderPrewarm)
+            return;
+
         if (IsRecording || isWarmingUp)
             return;
 
@@ -275,7 +299,7 @@ public class VideoRecorder : MonoBehaviour
 
     void OnCameraFrameForPrewarm(ARCameraFrameEventArgs args)
     {
-        if (prewarmed || isWarmingUp)
+        if (!enableEncoderPrewarm || prewarmed || isWarmingUp || deferredPrewarmCoroutine != null)
             return;
 
         // Prewarm competes with Immersal for the AR camera; wait until tracking is stable.
@@ -287,7 +311,40 @@ public class VideoRecorder : MonoBehaviour
             return;
 
         cm.frameReceived -= OnCameraFrameForPrewarm;
+        deferredPrewarmCoroutine = StartCoroutine(DeferredPrewarmRoutine());
+    }
+
+    IEnumerator DeferredPrewarmRoutine()
+    {
+        if (prewarmDelayAfterFirstFrameSeconds > 0f)
+            yield return new WaitForSecondsRealtime(prewarmDelayAfterFirstFrameSeconds);
+
+        deferredPrewarmCoroutine = null;
         Prewarm();
+    }
+
+    void AbortPrewarmCapture()
+    {
+        if (prewarmCoroutine != null)
+        {
+            StopCoroutine(prewarmCoroutine);
+            prewarmCoroutine = null;
+        }
+        if (deferredPrewarmCoroutine != null)
+        {
+            StopCoroutine(deferredPrewarmCoroutine);
+            deferredPrewarmCoroutine = null;
+        }
+        isWarmingUp = false;
+
+        if (capture != null && capture.IsCapturing())
+        {
+            try { capture.StopCapture(); }
+            catch (Exception e)
+            {
+                Debug.LogWarning($"[VideoRecorder] AbortPrewarm StopCapture failed: {e.Message}");
+            }
+        }
     }
 
     /// <summary>
@@ -342,6 +399,12 @@ public class VideoRecorder : MonoBehaviour
         yield return null;
         yield return null;
 
+        if (deferPrewarmUntilStill)
+        {
+            Debug.Log("[VideoRecorder] Prewarm: waiting for device to settle before encoder init...");
+            yield return WaitForDeviceStillness(prewarmStillDurationSeconds, prewarmStillnessTimeoutSeconds);
+        }
+
         try
         {
             capture.StartCapture();
@@ -393,6 +456,36 @@ public class VideoRecorder : MonoBehaviour
 
         isWarmingUp = false;
         prewarmCoroutine = null;
+    }
+
+    bool IsDeviceCurrentlyStill()
+    {
+        if (!SystemInfo.supportsGyroscope || !Input.gyro.enabled)
+            return true;
+
+        return Input.gyro.rotationRate.magnitude <= prewarmStillnessThresholdRadPerSec;
+    }
+
+    IEnumerator WaitForDeviceStillness(float stillDuration, float timeout)
+    {
+        float stillElapsed = 0f;
+        float totalElapsed = 0f;
+
+        while (totalElapsed < timeout)
+        {
+            if (IsDeviceCurrentlyStill())
+                stillElapsed += Time.unscaledDeltaTime;
+            else
+                stillElapsed = 0f;
+
+            if (stillElapsed >= stillDuration)
+                yield break;
+
+            totalElapsed += Time.unscaledDeltaTime;
+            yield return null;
+        }
+
+        Debug.LogWarning("[VideoRecorder] Prewarm: stillness timeout — running encoder init (expect a brief hitch).");
     }
 
     void TryDeleteWarmupFile()
@@ -466,6 +559,10 @@ public class VideoRecorder : MonoBehaviour
 
         if (!EnsureHostActive())
             return false;
+
+        // User tapped record — cancel a pending background prewarm and tear down any throwaway capture.
+        if (isWarmingUp || deferredPrewarmCoroutine != null)
+            AbortPrewarmCapture();
 
         if (ARSession.state != ARSessionState.SessionTracking)
         {
@@ -917,6 +1014,12 @@ public class VideoRecorder : MonoBehaviour
             try { capture.StopCapture(); } catch { /* tearing down */ }
             isWarmingUp = false;
             TryDeleteWarmupFile();
+        }
+
+        if (deferredPrewarmCoroutine != null)
+        {
+            StopCoroutine(deferredPrewarmCoroutine);
+            deferredPrewarmCoroutine = null;
         }
 
         if (IsRecording)

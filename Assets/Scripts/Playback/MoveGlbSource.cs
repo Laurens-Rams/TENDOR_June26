@@ -31,6 +31,7 @@ namespace BodyTracking.Playback
         AnimationClip clip;
         Avatar avatar;
         HumanPoseHandler handler;
+        Dictionary<HumanBodyBones, Transform> humanBones;
 
         // --- Optional muscle-space jitter smoothing (Step 2b: removes GLB body/finger jitter that the world-joint
         // smoothing can't see, because body+fingers come from the muscle-space HumanPose) ---
@@ -218,7 +219,7 @@ namespace BodyTracking.Playback
             Debug.Log($"[MoveGlbSource] Clip '{clip.name}' ({clip.length:F2}s) — building humanoid avatar (next frame)…");
             yield return null;
 
-            avatar = HumanoidAvatarFactory.Build(root, out string report);
+            avatar = HumanoidAvatarFactory.Build(root, out string report, out humanBones);
             if (avatar == null)
             {
                 Error = "Humanoid build failed: " + report;
@@ -261,6 +262,69 @@ namespace BodyTracking.Playback
 
             return true;
         }
+
+        /// <summary>
+        /// Sample the GLB clip at <paramref name="seconds"/> and build root-relative joint offsets in the
+        /// GLB skeleton's space (same layout as <see cref="MoveMotion.ForwardKinematics"/>). Used instead of the
+        /// baked fusion pose when the cached MOTION_DATA pose is stale but the Move GLB matches ARKit timing.
+        /// </summary>
+        public bool TryBuildJointOffsets(float seconds, IReadOnlyList<string> jointNames, out Vector3[] offsets)
+        {
+            offsets = null;
+            if (!IsReady || handler == null || clip == null || root == null || avatar == null ||
+                jointNames == null || jointNames.Count == 0)
+                return false;
+
+            float len = clip.length;
+            float t = len > 0f ? Mathf.Repeat(seconds, len) : 0f;
+            clip.SampleAnimation(root, t);
+
+            int n = jointNames.Count;
+            offsets = new Vector3[n];
+            Transform rootBone = ResolveMoveBone(jointNames[0]);
+            Vector3 rootPos = rootBone != null ? rootBone.position : (Hips != null ? Hips.position : root.transform.position);
+            int mapped = 0;
+            for (int i = 0; i < n; i++)
+            {
+                Transform bone = ResolveMoveBone(jointNames[i]);
+                if (bone != null)
+                {
+                    offsets[i] = bone.position - rootPos;
+                    mapped++;
+                }
+                else
+                {
+                    offsets[i] = Vector3.zero;
+                }
+            }
+
+            return mapped >= Mathf.Max(3, n / 3);
+        }
+
+        Transform ResolveMoveBone(string moveName)
+        {
+            if (string.IsNullOrEmpty(moveName) || humanBones == null) return null;
+            if (!MoveToHumanBone.TryGetValue(moveName, out var hb)) return null;
+            return humanBones.TryGetValue(hb, out var tr) ? tr : null;
+        }
+
+        static readonly Dictionary<string, HumanBodyBones> MoveToHumanBone =
+            new Dictionary<string, HumanBodyBones>(System.StringComparer.OrdinalIgnoreCase)
+        {
+            { "Root", HumanBodyBones.Hips },
+            { "Left_hip", HumanBodyBones.LeftUpperLeg }, { "Left_knee", HumanBodyBones.LeftLowerLeg },
+            { "Left_ankle", HumanBodyBones.LeftFoot }, { "Left_toe", HumanBodyBones.LeftToes },
+            { "Right_hip", HumanBodyBones.RightUpperLeg }, { "Right_knee", HumanBodyBones.RightLowerLeg },
+            { "Right_ankle", HumanBodyBones.RightFoot }, { "Right_toe", HumanBodyBones.RightToes },
+            { "Spine1", HumanBodyBones.Spine }, { "Spine2", HumanBodyBones.Chest }, { "Spine3", HumanBodyBones.UpperChest },
+            { "Neck", HumanBodyBones.Neck }, { "Head", HumanBodyBones.Head },
+            { "Left_clavicle", HumanBodyBones.LeftShoulder }, { "Left_shoulder", HumanBodyBones.LeftUpperArm },
+            { "Left_shoulder_rotation", HumanBodyBones.LeftUpperArm },
+            { "Left_elbow", HumanBodyBones.LeftLowerArm }, { "Left_wrist", HumanBodyBones.LeftHand },
+            { "Right_clavicle", HumanBodyBones.RightShoulder }, { "Right_shoulder", HumanBodyBones.RightUpperArm },
+            { "Right_shoulder_rotation", HumanBodyBones.RightUpperArm },
+            { "Right_elbow", HumanBodyBones.RightLowerArm }, { "Right_wrist", HumanBodyBones.RightHand },
+        };
 
         public void Dispose()
         {

@@ -1,5 +1,5 @@
 using System.IO;
-using System.Linq;
+using BodyTracking.Animation;
 using BodyTracking.Editor;       // GymLightingSetup
 using BodyTracking.LookDev;      // CharacterLookLab
 using UnityEditor;
@@ -20,6 +20,7 @@ namespace BodyTracking.EditorTools
         const string LabScenePath = "Assets/Scenes/CharacterLab.unity";
         const string MainScenePath = "Assets/Scenes/NewVersion.unity";
         const string CharactersFolder = "Assets/DeepMotion/Characters";
+        const string ModelArtPath = "Assets/DeepMotion/Characters/modelART.glb";
 
         [MenuItem("TENDOR/Characters/Open Character Look Lab", priority = 2)]
         public static void OpenLab()
@@ -70,24 +71,9 @@ namespace BodyTracking.EditorTools
                 ground.transform.localScale = Vector3.one * 1.2f;
             }
 
-            // Character instance.
-            GameObject character = GameObject.Find("LabCharacter");
-            if (character == null)
-            {
-                var prefab = FindCharacterFbx();
-                if (prefab != null)
-                {
-                    character = (GameObject)PrefabUtility.InstantiatePrefab(prefab);
-                    character.name = "LabCharacter";
-                    character.transform.position = Vector3.zero;
-                    character.transform.rotation = Quaternion.identity;
-                }
-                else
-                {
-                    Debug.LogWarning($"[CharacterLab] No character FBX found under '{CharactersFolder}'. " +
-                                     "Drop one in, then assign it on the CharacterLookLab 'Character' field.");
-                }
-            }
+            // Character instance — always the GLB display avatar so material tuning hits the same shared
+            // .mat assets the main scene / AR playback uses (modelART.glb, not the legacy FBX).
+            GameObject character = EnsureLabCharacter();
 
             // Tuning component on a manager object.
             var labGo = GameObject.Find("LookLab") ?? new GameObject("LookLab");
@@ -96,15 +82,52 @@ namespace BodyTracking.EditorTools
             lab.ApplyAll();
         }
 
-        static GameObject FindCharacterFbx()
+        /// <summary>Ensure a modelART.glb instance named "LabCharacter" exists; replace legacy FBX lab rigs.</summary>
+        static GameObject EnsureLabCharacter()
         {
-            if (!AssetDatabase.IsValidFolder(CharactersFolder)) return null;
-            var path = AssetDatabase.FindAssets("t:Model", new[] { CharactersFolder })
-                .Select(AssetDatabase.GUIDToAssetPath)
-                .Where(p => p.EndsWith(".fbx", System.StringComparison.OrdinalIgnoreCase))
-                .OrderBy(p => p, System.StringComparer.Ordinal)
-                .FirstOrDefault();
-            return path != null ? AssetDatabase.LoadAssetAtPath<GameObject>(path) : null;
+            var prefab = LoadModelArtPrefab();
+            if (prefab == null)
+            {
+                Debug.LogWarning($"[CharacterLab] modelART.glb not found at '{ModelArtPath}'. " +
+                                 "Import it, then assign a character on the CharacterLookLab 'Character' field.");
+                return GameObject.Find("LabCharacter") ?? GameObject.Find("modelART");
+            }
+
+            var existing = GameObject.Find("LabCharacter") ?? GameObject.Find("modelART");
+            if (existing != null && PrefabUtility.GetCorrespondingObjectFromSource(existing) == prefab)
+            {
+                if (existing.name != "LabCharacter") existing.name = "LabCharacter";
+                return existing;
+            }
+
+            if (existing != null)
+                Object.DestroyImmediate(existing);
+
+            var character = (GameObject)PrefabUtility.InstantiatePrefab(prefab);
+            character.name = "LabCharacter";
+            character.transform.SetPositionAndRotation(Vector3.zero, Quaternion.identity);
+            return character;
+        }
+
+        static GameObject LoadModelArtPrefab()
+        {
+            return AssetDatabase.LoadAssetAtPath<GameObject>(ModelArtPath);
+        }
+
+        /// <summary>Find the active GLB display character in the main scene for material prep during apply.</summary>
+        static Transform FindMainSceneCharacter()
+        {
+            var switcher = Object.FindAnyObjectByType<CharacterSwitcher>(FindObjectsInactive.Include);
+            if (switcher != null && switcher.EnsureBound() && switcher.Current != null)
+                return switcher.Current.transform;
+
+            var modelArt = GameObject.Find("modelART");
+            if (modelArt != null) return modelArt.transform;
+
+            var avaturn = GameObject.Find("Avaturn_Target");
+            if (avaturn != null) return avaturn.transform;
+
+            return Object.FindAnyObjectByType<FBXCharacterController>()?.CharacterRoot?.transform;
         }
 
         static void EnsureScenesFolder()
@@ -141,7 +164,7 @@ namespace BodyTracking.EditorTools
             var applier = holder.AddComponent<CharacterLookLab>();
             snap.Into(applier);
             applier.hdri = hdri;
-            applier.character = Object.FindAnyObjectByType<BodyTracking.Animation.FBXCharacterController>()?.transform;
+            applier.character = FindMainSceneCharacter();
             applier.ApplyAll();
             Object.DestroyImmediate(holder);
 

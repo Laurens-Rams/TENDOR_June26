@@ -1,5 +1,7 @@
 using UnityEngine;
 using BodyTracking.Data;
+using BodyTracking.Playback;
+using BodyTracking.DebugTools;
 
 namespace BodyTracking.MoveAI
 {
@@ -44,7 +46,11 @@ namespace BodyTracking.MoveAI
             /// <summary>Ride Move AI's own (steadier) root trajectory for position, and only re-sync to ARKit
             /// occasionally (timer / drift threshold), eased in, and only while the climber is actually moving.
             /// Stops the legs drifting while still.</summary>
-            MoveAIDriftCorrected
+            MoveAIDriftCorrected,
+            /// <summary>Use the BAKED root path (<see cref="MoveAIFusionAsset.rootPathLocal"/>) for position. That
+            /// path is Move AI's trajectory already fused with ARKit at bake time (aligned + smoothed + drift
+            /// corrected), indexed by frame, so it is absolute and cannot accumulate drift over loops/seeks.</summary>
+            FollowBakedRoot
         }
 
         /// <summary>Tunables for <see cref="AnchorMode.MoveAIDriftCorrected"/>. Owned/serialized by the caller
@@ -53,25 +59,30 @@ namespace BodyTracking.MoveAI
         public struct AnchorSettings
         {
             public AnchorMode mode;
-            [Tooltip("Pelvis speed (m/s) BELOW which motion is treated as drift and frozen out (legs stop creeping while still). Real walking/climbing is faster than this and passes through. Lower if a slow shuffle gets frozen; raise if drift still leaks.")]
+            [Tooltip("STILL threshold (m/s): once moving, the body re-freezes when pelvis speed drops below this. Set just above the ARKit drift/jitter speed so a standing climber latches and stops creeping.")]
             public float stillnessVelocity;
-            [Tooltip("Pelvis speed (m/s) at/above which motion is followed 1:1. Between stillnessVelocity and this the follow eases in. Keep a few× stillnessVelocity. 0 = auto (3× stillnessVelocity).")]
+            [Tooltip("MOVE threshold (m/s): from a frozen state, real locomotion is detected (and ARKit followed 1:1) once pelvis speed rises above this. Set below a normal walk/climb speed but above noise. Must be > stillnessVelocity (hysteresis band).")]
             public float fullMotionVelocity;
-            [Tooltip("Re-sync when the held anchor diverges from the ARKit pelvis by more than this (m), while moving. 0 = disabled (recommended: keep the gated position).")]
-            public float maxDriftMeters;
-            [Tooltip("Seconds to ease a re-sync in, so the correction never pops.")]
-            public float resyncBlendSeconds;
-            [Tooltip("Gate only horizontal (X/Z) motion; always follow vertical 1:1. Off = gate all 3 axes (recommended, so a still climber doesn't drift vertically on the wall).")]
+            [Tooltip("Seconds to ease the anchor onto the live ARKit pelvis once moving (catch-up after a freeze). Small = snappy, larger = smoother.")]
+            public float followSeconds;
+            [Tooltip("Freeze only horizontal (X/Z); always follow vertical 1:1. Off = freeze all 3 axes (recommended, so a still climber doesn't drift vertically on the wall).")]
             public bool correctXZOnly;
+
+            [Header("Facing")]
+            [Tooltip("ON (recommended): the character's turning comes from the steady Move body; ARKit only slowly corrects the absolute yaw offset, so leg-stride/tracking noise no longer wobbles the facing. OFF: legacy per-frame ARKit hip-axis facing.")]
+            public bool moveDrivenFacing;
+            [Tooltip("Seconds over which the Move->ARKit yaw offset is eased (move-driven facing only). Larger = steadier but slower to correct an initial mis-facing. ~2s is a good start.")]
+            public float facingCorrectionSeconds;
 
             public static AnchorSettings Default => new AnchorSettings
             {
                 mode = AnchorMode.MoveAIDriftCorrected,
-                stillnessVelocity = 0.12f,
-                fullMotionVelocity = 0.45f,
-                maxDriftMeters = 0f,
-                resyncBlendSeconds = 0.4f,
+                stillnessVelocity = 0.06f,
+                fullMotionVelocity = 0.2f,
+                followSeconds = 0.1f,
                 correctXZOnly = false,
+                moveDrivenFacing = true,
+                facingCorrectionSeconds = 2f,
             };
         }
 
@@ -89,11 +100,12 @@ namespace BodyTracking.MoveAI
             public int rejectStreak; // consecutive teleport-guard rejections (for recovery from real jumps/loops)
 
             // --- MoveAIDriftCorrected state ---
-            public Vector3 moveAnchor;     // running world-local pelvis position (gated ARKit motion integrated in)
+            public Vector3 moveAnchor;     // held world-local pelvis position (follows ARKit while moving, frozen while still)
             public bool hasMoveAnchor;     // moveAnchor has been seeded
-            public Vector3 lastArkitPc;    // previous frame's ARKit pelvis center, for delta integration
+            public Vector3 lastArkitPc;    // previous frame's ARKit pelvis center, for speed estimation
             public bool hasLastArkitPc;
-            public float blendRemaining;   // >0 while easing an optional drift re-sync toward ARKit
+            public float speedEma;         // low-pass filtered pelvis speed (m/s), for a noise-robust still/moving gate
+            public bool moving;            // hysteresis latch: true once real locomotion is detected
         }
 
         // After this many consecutive "too big" pelvis jumps, treat it as a real move (e.g. loop restart) and
@@ -108,13 +120,22 @@ namespace BodyTracking.MoveAI
         /// holds the last good ARKit-derived anchor/facing so a lost body freezes the pose in place rather than
         /// spinning from degenerate hip-axis noise.
         /// </summary>
-        public static Vector3[] ComputeLocalJoints(MoveAIFusionAsset asset, HipRecording recording, float t, ref AnchorState state, bool invertFacing = false, AnchorSettings settings = default)
+        public static Vector3[] ComputeLocalJoints(MoveAIFusionAsset asset, HipRecording recording, float t, ref AnchorState state, bool invertFacing = false, AnchorSettings settings = default, MoveGlbSource glbSource = null)
         {
             if (asset?.pose == null) return null;
-            var poseFrame = asset.pose.FrameAtTime(t);
-            if (poseFrame == null) return null;
-            var fk = asset.pose.ForwardKinematics(poseFrame);
+
+            Vector3[] fk = null;
+            bool usedGlbPose = glbSource != null && glbSource.TryBuildJointOffsets(t, asset.pose.jointNames, out fk);
+            if (!usedGlbPose)
+            {
+                var poseFrame = asset.pose.FrameAtTime(t);
+                if (poseFrame == null) return null;
+                fk = asset.pose.ForwardKinematics(poseFrame);
+            }
             if (fk == null || fk.Length == 0) return null;
+
+            // Live GLB drives joint offsets; anchor mode still selects world placement (baked Move path vs live ARKit).
+            var anchorSettings = settings;
 
             int k = Mathf.Clamp(Mathf.RoundToInt(t * asset.frameRate), 0, asset.FrameCount - 1);
             float poseScale = Mathf.Max(0.01f, asset.scale);
@@ -153,9 +174,12 @@ namespace BodyTracking.MoveAI
 #if UNITY_EDITOR || DEVELOPMENT_BUILD
                 // #region agent log
                 if ((dbgTick++ % 30) == 0 || jumpRejected)
+                {
                     UnityEngine.Debug.Log($"[DBG5f9dd8][H1/H2] t={t:F2} gotAnchorRaw={(jumpRejected ? "rej" : gotAnchor.ToString())} " +
                         $"gotFacing={gotFacing} pc={pc:F3} stateAnchor={(state.hasAnchor ? state.anchor.ToString("F3") : "none")} " +
-                        $"dist={(state.hasAnchor ? (pc - state.anchor).magnitude.ToString("F3") : "-")} jumpRejected={jumpRejected}");
+                        $"dist={(state.hasAnchor ? (pc - state.anchor).magnitude.ToString("F3") : "-")} jumpRejected={jumpRejected} " +
+                        $"usedGlbPose={usedGlbPose} anchorMode={anchorSettings.mode}");
+                }
                 // #endregion
 #endif
 
@@ -163,10 +187,38 @@ namespace BodyTracking.MoveAI
                 // hip whenever the pelvis is tracked, even when facing can't be computed (legs together during a
                 // climb makes the hip axis too short to derive facing). Coupling them froze the whole body.
                 // Facing is resolved first because MoveAIDriftCorrected rotates the Move root delta by it.
-                if (gotFacing)
+                // Baked-path + live GLB: the GLB clip carries body turn; only a stable yaw offset is needed. Snap
+                // the offset once from the first valid hip-axis pair instead of easing toward live ARKit every frame
+                // (which made Baked vs Live look identical and twisted the GLB body).
+                bool bakedGlbFacing = anchorSettings.mode == AnchorMode.FollowBakedRoot && usedGlbPose;
+                if (bakedGlbFacing && gotFacing)
                 {
-                    // Smooth toward the new yaw (first valid sample snaps) so noisy frames can't flip the body.
-                    state.facing = state.hasFacing ? Quaternion.Slerp(state.facing, f, FacingSmoothing) : f;
+                    if (!state.hasFacing)
+                    {
+                        state.facing = f;
+                        state.hasFacing = true;
+                    }
+                    facing = state.facing;
+                }
+                else if (gotFacing)
+                {
+                    if (!state.hasFacing)
+                    {
+                        state.facing = f; // first valid sample snaps
+                    }
+                    else if (settings.moveDrivenFacing)
+                    {
+                        // The body's per-frame turning is already carried by the Move pose (fk). The alignment is just
+                        // the (near-constant) Move->AR yaw OFFSET, so ease it VERY slowly: leg-stride / ARKit hip-axis
+                        // noise is averaged out instead of being injected into the facing every frame.
+                        float dtF = Mathf.Max(0f, Time.deltaTime);
+                        float rate = 1f - Mathf.Exp(-dtF / Mathf.Max(0.05f, settings.facingCorrectionSeconds));
+                        state.facing = Quaternion.Slerp(state.facing, f, rate);
+                    }
+                    else
+                    {
+                        state.facing = Quaternion.Slerp(state.facing, f, FacingSmoothing); // legacy responsive follow
+                    }
                     facing = state.facing;
                     state.hasFacing = true;
                 }
@@ -179,9 +231,18 @@ namespace BodyTracking.MoveAI
                     facing = Quaternion.identity;
                 }
 
-                if (settings.mode == AnchorMode.MoveAIDriftCorrected)
+                if (anchorSettings.mode == AnchorMode.FollowBakedRoot && asset.rootPathLocal != null && k < asset.rootPathLocal.Count)
                 {
-                    anchor = ComputeDriftCorrectedAnchor(asset, k, gotAnchor, pc, arkit, ref state, settings);
+                    // Absolute, frame-indexed baked trajectory (Move fused with ARKit at bake time). It can't
+                    // accumulate drift; the teleport guard below only matters for the live-ARKit branches, so we
+                    // simply track it as the last-good anchor for any downstream consumers.
+                    anchor = asset.rootPathLocal[k];
+                    state.anchor = anchor;
+                    state.hasAnchor = true;
+                }
+                else if (anchorSettings.mode == AnchorMode.MoveAIDriftCorrected)
+                {
+                    anchor = ComputeDriftCorrectedAnchor(asset, k, gotAnchor, pc, arkit, ref state, anchorSettings);
                 }
                 else // FollowArkit (original behavior)
                 {
@@ -202,6 +263,29 @@ namespace BodyTracking.MoveAI
                 }
 
                 state.initialized = state.hasAnchor || state.hasFacing || state.hasMoveAnchor;
+
+#if UNITY_EDITOR || DEVELOPMENT_BUILD
+                // #region agent log
+                if (usedGlbPose && ((dbgTick - 1) % 30) == 0)
+                {
+                    int ankle = asset.pose.IndexOfJoint("Left_ankle");
+                    float glbAnkleY = ankle >= 0 && ankle < fk.Length ? fk[ankle].y : 0f;
+                    float bakedRootY = asset.rootPathLocal != null && k < asset.rootPathLocal.Count
+                        ? asset.rootPathLocal[k].y : 0f;
+                    float arkitPcY = gotAnchor ? pc.y : 0f;
+                    TimingDebugLog.Log("H5", "FusedPoseSolver.ComputeLocalJoints",
+                        "t=" + t.ToString("F2") + " glb-driven fk ankleY=" + glbAnkleY.ToString("F3"),
+                        "{\"t\":" + t.ToString("F2") + ",\"usedGlbPose\":true,\"anchorMode\":\"" + anchorSettings.mode +
+                        "\",\"glbAnkleLocalY\":" + glbAnkleY.ToString("F3") + ",\"requestedMode\":\"" + settings.mode +
+                        "\",\"bakedGlbFacing\":" + (bakedGlbFacing ? "true" : "false") + "}");
+                    TimingDebugLog.Log("H6", "FusedPoseSolver.ComputeLocalJoints",
+                        "t=" + t.ToString("F2") + " mode=" + anchorSettings.mode + " anchorY=" + anchor.y.ToString("F3"),
+                        "{\"t\":" + t.ToString("F2") + ",\"anchorMode\":\"" + anchorSettings.mode +
+                        "\",\"anchorY\":" + anchor.y.ToString("F3") + ",\"bakedRootY\":" + bakedRootY.ToString("F3") +
+                        ",\"arkitPcY\":" + arkitPcY.ToString("F3") + ",\"usedGlbPose\":true}");
+                }
+                // #endregion
+#endif
             }
             else
             {
@@ -217,20 +301,20 @@ namespace BodyTracking.MoveAI
         }
 
         /// <summary>
-        /// Position the pelvis by integrating the ARKit pelvis motion — which carries the real walking/climbing
-        /// translation — but GATED by speed: per-frame pelvis deltas are scaled by a smooth gate so slow drift
-        /// (below <see cref="AnchorSettings.stillnessVelocity"/>) is dropped (the legs stop creeping while still)
-        /// while genuine locomotion (at/above <see cref="AnchorSettings.fullMotionVelocity"/>) is followed 1:1.
-        /// Climbing up the wall works the same way: vertical pelvis motion is real and passes the gate.
+        /// Place the pelvis by following the ARKit pelvis ABSOLUTELY while the climber is genuinely moving (so
+        /// walking/climbing translates exactly like FollowArkit), and FREEZING it while still (so slow ARKit drift
+        /// and jitter never reach the legs). A hysteresis latch on a low-pass-filtered pelvis speed switches between
+        /// the two: it starts following only above <see cref="AnchorSettings.fullMotionVelocity"/> and re-freezes
+        /// below <see cref="AnchorSettings.stillnessVelocity"/>. Following is absolute (Lerp toward the live pelvis),
+        /// never integrated, so noise can't accumulate into a random-walk.
         /// </summary>
         static Vector3 ComputeDriftCorrectedAnchor(MoveAIFusionAsset asset, int k, bool gotAnchor, Vector3 pc,
             HipFrame arkit, ref AnchorState state, AnchorSettings settings)
         {
-            float dt = Mathf.Max(0f, Time.deltaTime);
+            float dt = Mathf.Max(1e-4f, Time.deltaTime);
 
             if (!state.hasMoveAnchor)
             {
-                // Seed from the best available world-anchored position.
                 state.moveAnchor = gotAnchor ? pc
                     : state.hasAnchor ? state.anchor
                     : arkit.hipJoint.IsValid ? arkit.hipJoint.position
@@ -238,12 +322,12 @@ namespace BodyTracking.MoveAI
                 state.hasMoveAnchor = true;
                 state.lastArkitPc = state.moveAnchor;
                 state.hasLastArkitPc = gotAnchor;
-                state.blendRemaining = 0f;
+                state.speedEma = 0f;
+                state.moving = false;
                 return state.moveAnchor;
             }
 
-            // No fresh pelvis this frame (tracking dropout): hold position and re-seed the delta baseline so the
-            // next valid frame doesn't integrate a stale, oversized jump.
+            // No fresh pelvis this frame (tracking dropout): hold and re-seed the speed baseline.
             if (!gotAnchor)
             {
                 state.hasLastArkitPc = false;
@@ -260,35 +344,40 @@ namespace BodyTracking.MoveAI
             Vector3 deltaPc = pc - state.lastArkitPc;
             state.lastArkitPc = pc;
 
-            // A huge single-frame pelvis jump is a loop wrap (clip end -> start) or glitch, not real motion: snap.
+            // A huge single-frame pelvis jump is a loop wrap (clip end -> start) or glitch: snap and reset.
             if (deltaPc.magnitude > MaxAnchorJump)
             {
                 state.moveAnchor = pc;
-                state.blendRemaining = 0f;
+                state.speedEma = 0f;
+                state.moving = false;
                 return state.moveAnchor;
             }
 
-            float speed = dt > 1e-4f ? deltaPc.magnitude / dt : 0f;
+            // Low-pass the instantaneous speed so a single noisy frame can't trip the gate.
+            float rawSpeed = deltaPc.magnitude / dt;
+            float aSpeed = dt / (0.18f + dt);
+            state.speedEma += aSpeed * (rawSpeed - state.speedEma);
 
-            // Smooth speed gate: 0 below stillness (drift frozen out), 1 at/above full-motion (locomotion 1:1).
-            float lo = Mathf.Max(0.001f, settings.stillnessVelocity);
-            float hi = settings.fullMotionVelocity > lo ? settings.fullMotionVelocity : lo * 3f;
-            float gate = Mathf.SmoothStep(0f, 1f, Mathf.InverseLerp(lo, hi, speed));
+            // Hysteresis: need a real move (> fullMotionVelocity) to START following; re-freeze once slow again
+            // (< stillnessVelocity). The gap between the two keeps moderate noise from flickering the state.
+            float onThresh = Mathf.Max(settings.stillnessVelocity + 1e-3f, settings.fullMotionVelocity);
+            float offThresh = Mathf.Max(1e-3f, settings.stillnessVelocity);
+            if (!state.moving && state.speedEma > onThresh) state.moving = true;
+            else if (state.moving && state.speedEma < offThresh) state.moving = false;
 
-            // Integrate the gated delta. Optionally always follow vertical so only horizontal drift is filtered.
-            Vector3 applied = deltaPc * gate;
-            if (settings.correctXZOnly) applied.y = deltaPc.y;
-            state.moveAnchor += applied;
-
-            // Optional safety: if the gated anchor drifts too far from the live pelvis while genuinely moving,
-            // ease back toward ARKit so long sessions can't accumulate a large offset. Off by default.
-            if (settings.maxDriftMeters > 0f && gate > 0.5f &&
-                Vector3.Distance(state.moveAnchor, pc) > settings.maxDriftMeters)
+            if (state.moving)
             {
-                float u = 1f - Mathf.Exp(-dt / Mathf.Max(0.0001f, settings.resyncBlendSeconds));
+                // Ease ONTO the live pelvis (absolute) — translates with the real walk/climb, no accumulation.
+                float w = 1f - Mathf.Exp(-dt / Mathf.Max(0.0001f, settings.followSeconds));
                 Vector3 tgt = settings.correctXZOnly ? new Vector3(pc.x, state.moveAnchor.y, pc.z) : pc;
-                state.moveAnchor = Vector3.Lerp(state.moveAnchor, tgt, u);
+                state.moveAnchor = Vector3.Lerp(state.moveAnchor, tgt, w);
             }
+            else if (settings.correctXZOnly)
+            {
+                // Frozen horizontally, but still follow real vertical motion (e.g. a slow vertical reach).
+                state.moveAnchor.y = pc.y;
+            }
+            // else: fully frozen — drift and jitter are rejected.
 
             return state.moveAnchor;
         }

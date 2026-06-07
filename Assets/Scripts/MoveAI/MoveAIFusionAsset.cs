@@ -17,6 +17,10 @@ namespace BodyTracking.MoveAI
         public float frameRate = 30f;
         public float scale = 1f;                                  // uniform head-to-feet scale
         public Vector3 correctionWeights = new Vector3(0.6f, 0.2f, 1f); // x,y,z weights actually applied
+        // True once the baked pose/root sit on the correct (ARKit-aligned) clock. Older assets baked before the
+        // videoStartTimeOffset sign fix were shifted ~offset seconds early; the no-API rebake re-times them once
+        // and sets this so a second rebake can't shift them again. Fresh bakes are correct and set it directly.
+        public bool offsetCorrected;
 
         // Spatial metadata mirrored from the source HipRecording (chooses the playback RouteRoot provider).
         public string mapId;
@@ -37,6 +41,7 @@ namespace BodyTracking.MoveAI
                 { "frameRate", frameRate },
                 { "scale", scale },
                 { "correctionWeights", Vec(correctionWeights) },
+                { "offsetCorrected", offsetCorrected },
                 { "mapId", mapId },
                 { "routeId", routeId },
                 { "spatialSource", spatialSource },
@@ -58,6 +63,7 @@ namespace BodyTracking.MoveAI
                 frameRate = MiniJson.ToFloat(Val(obj, "frameRate"), 30f),
                 scale = MiniJson.ToFloat(Val(obj, "scale"), 1f),
                 correctionWeights = ReadVec(Val(obj, "correctionWeights")),
+                offsetCorrected = Val(obj, "offsetCorrected") is bool oc && oc,
                 mapId = MiniJson.ToStr(Val(obj, "mapId")),
                 routeId = MiniJson.ToStr(Val(obj, "routeId")),
                 spatialSource = MiniJson.ToStr(Val(obj, "spatialSource")),

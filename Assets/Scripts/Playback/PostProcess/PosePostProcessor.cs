@@ -21,6 +21,8 @@ namespace BodyTracking.Playback.PostProcess
         public float minCutoff;
         [Tooltip("1euro beta: higher = less lag while fast.")]
         public float beta;
+        [Tooltip("Also smooth the ROOT (whole-body translation across the room). OFF (default) so walking/climbing keeps its full travel — only the pose (joints relative to the root) is smoothed. Turn ON only if the whole body jitters in place.")]
+        public bool smoothRootTranslation;
 
         [Header("Jump preservation")]
         [Tooltip("Pelvis upward speed (m/s) above which we treat motion as a jump and reduce smoothing so it isn't damped.")]
@@ -36,6 +38,7 @@ namespace BodyTracking.Playback.PostProcess
             enableSmoothing = true,
             minCutoff = 1.0f,
             beta = 0.01f,
+            smoothRootTranslation = false,
             jumpVelocityThreshold = 1.5f,
             jumpBetaScale = 8f,
         };
@@ -119,10 +122,37 @@ namespace BodyTracking.Playback.PostProcess
             if (s.enableSmoothing)
             {
                 float beta = jumping ? s.beta * Mathf.Max(1f, s.jumpBetaScale) : s.beta;
+                bool hasRoot = rootIndex >= 0 && rootIndex < _n;
+
+                // The root's RouteRoot-local position IS the body's translation across the room. Smoothing it would
+                // damp the walk/climb (lag + lost travel). So smooth every OTHER joint RELATIVE to the root (pose
+                // only) and let the root translation pass through 1:1 unless explicitly asked to smooth it.
+                Vector3 root = hasRoot ? joints[rootIndex] : Vector3.zero;
+                Vector3 smoothedRoot = root;
+                if (hasRoot)
+                {
+                    if (s.smoothRootTranslation)
+                    {
+                        _filters[rootIndex].SetParams(s.minCutoff, beta);
+                        smoothedRoot = _filters[rootIndex].Filter(root, dt);
+                    }
+                    joints[rootIndex] = smoothedRoot;
+                }
+
                 for (int i = 0; i < _n; i++)
                 {
+                    if (hasRoot && i == rootIndex) continue;
                     _filters[i].SetParams(s.minCutoff, beta);
-                    joints[i] = _filters[i].Filter(joints[i], dt);
+                    if (hasRoot)
+                    {
+                        Vector3 rel = joints[i] - root;            // pose offset (no world translation)
+                        rel = _filters[i].Filter(rel, dt);          // smooth only the pose
+                        joints[i] = smoothedRoot + rel;
+                    }
+                    else
+                    {
+                        joints[i] = _filters[i].Filter(joints[i], dt);
+                    }
                 }
             }
 

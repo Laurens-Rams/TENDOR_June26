@@ -14,8 +14,7 @@ namespace BodyTracking.AR
     /// under the character's feet and, optionally, onto a nearby vertical plane in the light direction.
     ///
     /// This complements disabling real-time shadows on the avatar (which caused face self-shadowing): the
-    /// character stays evenly lit while a cheap blob grounds it on the real floor/wall. For a real body
-    /// silhouette on the floor, use <see cref="ARCharacterPlanarShadow"/> instead (disable this component).
+    /// character stays evenly lit while a cheap blob grounds it on the real floor/wall.
     ///
     /// Drop on any scene object (e.g. alongside <see cref="ARCharacterOcclusion"/>). Auto-finds
     /// <see cref="ARPlaneManager"/>, the active character, and the gym key-light direction. Intended for
