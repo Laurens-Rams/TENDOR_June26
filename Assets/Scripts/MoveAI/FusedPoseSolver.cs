@@ -1,7 +1,6 @@
 using UnityEngine;
 using BodyTracking.Data;
 using BodyTracking.Playback;
-using BodyTracking.DebugTools;
 
 namespace BodyTracking.MoveAI
 {
@@ -17,11 +16,13 @@ namespace BodyTracking.MoveAI
     /// </summary>
     public static class FusedPoseSolver
     {
-        // ARKit 3D body skeleton joint indices (see ARHumanBodyManager 3D joint table).
+        // ARKit 3D body skeleton joint indices (Unity XRHumanBodyJoint / ARSkeletonDefinition order).
         public const int ArkitRoot = 0;
         public const int ArkitHips = 1;
         public const int ArkitLeftUpLeg = 2;
-        public const int ArkitRightUpLeg = 7;
+        public const int ArkitRightUpLeg = 6; // index 7 is rightLeg (knee), not the hip socket
+        // First spine joints above the pelvis (spine7, spine6, …); any one can define torso forward.
+        static readonly int[] ArkitSpineCandidates = { 10, 11, 12, 13 };
 
         // Minimum horizontal hip-socket separation (m) for the ARKit pelvis axis to be trusted for facing.
         // When the tracked body is lost the legs collapse and this axis degenerates into spinning noise.
@@ -31,11 +32,6 @@ namespace BodyTracking.MoveAI
         // Facing smoothing: fraction of the way the held yaw moves toward a new valid measurement each frame.
         // Low value = very stable (heavily damped) facing that can't flicker/flip from per-frame hip-axis noise.
         const float FacingSmoothing = 0.12f;
-#if UNITY_EDITOR || DEVELOPMENT_BUILD
-        // #region agent log
-        static int dbgTick;
-        // #endregion
-#endif
 
         /// <summary>How the character's world position (pelvis anchor) is derived each frame.</summary>
         public enum AnchorMode
@@ -118,10 +114,13 @@ namespace BodyTracking.MoveAI
         /// null when the asset has no usable pose. <paramref name="recording"/> may be null (then the fused
         /// root path is used as the anchor and no facing alignment is applied). The <paramref name="state"/>
         /// holds the last good ARKit-derived anchor/facing so a lost body freezes the pose in place rather than
-        /// spinning from degenerate hip-axis noise.
+        /// spinning from degenerate hip-axis noise. <paramref name="effectiveFacingLocal"/> is the final yaw
+        /// applied to joint offsets (including <paramref name="invertFacing"/>); pass it to root placement so
+        /// the character and orange overlay stay identical.
         /// </summary>
-        public static Vector3[] ComputeLocalJoints(MoveAIFusionAsset asset, HipRecording recording, float t, ref AnchorState state, bool invertFacing = false, AnchorSettings settings = default, MoveGlbSource glbSource = null)
+        public static Vector3[] ComputeLocalJoints(MoveAIFusionAsset asset, HipRecording recording, float t, ref AnchorState state, out Quaternion effectiveFacingLocal, bool invertFacing = false, AnchorSettings settings = default, MoveGlbSource glbSource = null)
         {
+            effectiveFacingLocal = Quaternion.identity;
             if (asset?.pose == null) return null;
 
             Vector3[] fk = null;
@@ -147,22 +146,17 @@ namespace BodyTracking.MoveAI
                 HipFrame arkit = recording.GetFrameAtTime(t);
                 bool gotAnchor = TryGetPelvisCenter(arkit, out var pc);
                 bool gotFacing = TryComputeFacingAlignment(asset, fk, arkit, out var f);
-                // Optional 180° yaw: the hip-lateral alignment can land the body facing away from the climber on
-                // some captures; this flips it to face the same way without touching the per-joint pose.
-                if (gotFacing && invertFacing) f = Quaternion.AngleAxis(180f, Vector3.up) * f;
 
                 // Reject a sudden teleport of the pelvis (garbage frame during a dropout) — but only briefly.
                 // A SUSTAINED large jump is a real move (most commonly the loop restart, where the pelvis
                 // legitimately snaps from the clip's end position back to its start). Holding the stale anchor
                 // forever in that case froze the body; so after a few consecutive rejections we accept the jump.
-                bool jumpRejected = false;
                 if (gotAnchor && state.hasAnchor && (pc - state.anchor).sqrMagnitude > MaxAnchorJump * MaxAnchorJump)
                 {
                     state.rejectStreak++;
                     if (state.rejectStreak <= MaxConsecutiveAnchorRejections)
                     {
                         gotAnchor = false; // transient glitch: hold last good position
-                        jumpRejected = true;
                     }
                     // else: sustained jump — fall through and accept pc (snaps to the new location).
                 }
@@ -171,36 +165,13 @@ namespace BodyTracking.MoveAI
                     state.rejectStreak = 0;
                 }
 
-#if UNITY_EDITOR || DEVELOPMENT_BUILD
-                // #region agent log
-                if ((dbgTick++ % 30) == 0 || jumpRejected)
-                {
-                    UnityEngine.Debug.Log($"[DBG5f9dd8][H1/H2] t={t:F2} gotAnchorRaw={(jumpRejected ? "rej" : gotAnchor.ToString())} " +
-                        $"gotFacing={gotFacing} pc={pc:F3} stateAnchor={(state.hasAnchor ? state.anchor.ToString("F3") : "none")} " +
-                        $"dist={(state.hasAnchor ? (pc - state.anchor).magnitude.ToString("F3") : "-")} jumpRejected={jumpRejected} " +
-                        $"usedGlbPose={usedGlbPose} anchorMode={anchorSettings.mode}");
-                }
-                // #endregion
-#endif
-
                 // Anchor (hip POSITION) and facing are tracked INDEPENDENTLY. The body must keep moving with the
                 // hip whenever the pelvis is tracked, even when facing can't be computed (legs together during a
                 // climb makes the hip axis too short to derive facing). Coupling them froze the whole body.
                 // Facing is resolved first because MoveAIDriftCorrected rotates the Move root delta by it.
-                // Baked-path + live GLB: the GLB clip carries body turn; only a stable yaw offset is needed. Snap
-                // the offset once from the first valid hip-axis pair instead of easing toward live ARKit every frame
-                // (which made Baked vs Live look identical and twisted the GLB body).
-                bool bakedGlbFacing = anchorSettings.mode == AnchorMode.FollowBakedRoot && usedGlbPose;
-                if (bakedGlbFacing && gotFacing)
-                {
-                    if (!state.hasFacing)
-                    {
-                        state.facing = f;
-                        state.hasFacing = true;
-                    }
-                    facing = state.facing;
-                }
-                else if (gotFacing)
+                // Baked-path + live GLB: the GLB clip carries body turn; ease the Move->AR yaw offset each frame
+                // so the orange overlay tracks the cyan ARKit skeleton as the climber turns.
+                if (gotFacing)
                 {
                     if (!state.hasFacing)
                     {
@@ -217,7 +188,7 @@ namespace BodyTracking.MoveAI
                     }
                     else
                     {
-                        state.facing = Quaternion.Slerp(state.facing, f, FacingSmoothing); // legacy responsive follow
+                        state.facing = Quaternion.Slerp(state.facing, f, FacingSmoothing);
                     }
                     facing = state.facing;
                     state.hasFacing = true;
@@ -263,35 +234,18 @@ namespace BodyTracking.MoveAI
                 }
 
                 state.initialized = state.hasAnchor || state.hasFacing || state.hasMoveAnchor;
-
-#if UNITY_EDITOR || DEVELOPMENT_BUILD
-                // #region agent log
-                if (usedGlbPose && ((dbgTick - 1) % 30) == 0)
-                {
-                    int ankle = asset.pose.IndexOfJoint("Left_ankle");
-                    float glbAnkleY = ankle >= 0 && ankle < fk.Length ? fk[ankle].y : 0f;
-                    float bakedRootY = asset.rootPathLocal != null && k < asset.rootPathLocal.Count
-                        ? asset.rootPathLocal[k].y : 0f;
-                    float arkitPcY = gotAnchor ? pc.y : 0f;
-                    TimingDebugLog.Log("H5", "FusedPoseSolver.ComputeLocalJoints",
-                        "t=" + t.ToString("F2") + " glb-driven fk ankleY=" + glbAnkleY.ToString("F3"),
-                        "{\"t\":" + t.ToString("F2") + ",\"usedGlbPose\":true,\"anchorMode\":\"" + anchorSettings.mode +
-                        "\",\"glbAnkleLocalY\":" + glbAnkleY.ToString("F3") + ",\"requestedMode\":\"" + settings.mode +
-                        "\",\"bakedGlbFacing\":" + (bakedGlbFacing ? "true" : "false") + "}");
-                    TimingDebugLog.Log("H6", "FusedPoseSolver.ComputeLocalJoints",
-                        "t=" + t.ToString("F2") + " mode=" + anchorSettings.mode + " anchorY=" + anchor.y.ToString("F3"),
-                        "{\"t\":" + t.ToString("F2") + ",\"anchorMode\":\"" + anchorSettings.mode +
-                        "\",\"anchorY\":" + anchor.y.ToString("F3") + ",\"bakedRootY\":" + bakedRootY.ToString("F3") +
-                        ",\"arkitPcY\":" + arkitPcY.ToString("F3") + ",\"usedGlbPose\":true}");
-                }
-                // #endregion
-#endif
             }
             else
             {
                 anchor = asset.rootPathLocal[k];
                 facing = Quaternion.identity;
             }
+
+            // Apply the optional 180° yaw last, every frame, so toggling invertFacing takes effect immediately
+            // (including baked GLB snap-once facing) and stays consistent with root placement.
+            if (invertFacing)
+                facing = Quaternion.AngleAxis(180f, Vector3.up) * facing;
+            effectiveFacingLocal = facing;
 
             Vector3 root = fk[0];
             var outp = new Vector3[fk.Length];
@@ -404,15 +358,23 @@ namespace BodyTracking.MoveAI
         }
 
         /// <summary>
-        /// Yaw that rotates the Move pelvis lateral axis (Right_hip - Left_hip) onto the ARKit one. Anatomy
-        /// based, so it stays valid for mostly-vertical climbing where translation-based yaw would be noise.
-        /// Returns false (and identity) when either axis is missing or the ARKit hip axis is too short to trust
-        /// (body lost / legs collapsed), so callers can hold their last good facing instead of spinning.
+        /// Yaw that lines up the Move body with the recorded ARKit skeleton. Prefers matching horizontal torso
+        /// forward (pelvis → spine) so the orange overlay faces the same way as the cyan ARKit rig; falls back to
+        /// aligning the hip lateral axes when spine joints are missing.
         /// </summary>
         public static bool TryComputeFacingAlignment(MoveAIFusionAsset asset, Vector3[] fk, HipFrame arkit, out Quaternion facing)
         {
             facing = Quaternion.identity;
 
+            if (TryComputeMoveHorizontalForward(asset, fk, out var moveFwd) &&
+                TryComputeArkitHorizontalForward(arkit, out var arkitFwd))
+            {
+                float yaw = Vector3.SignedAngle(moveFwd, arkitFwd, Vector3.up);
+                facing = Quaternion.AngleAxis(yaw, Vector3.up);
+                return true;
+            }
+
+            // Fallback: hip-line lateral axis only (legacy).
             int lHip = asset.pose.IndexOfJoint("Left_hip");
             int rHip = asset.pose.IndexOfJoint("Right_hip");
             if (lHip < 0 || rHip < 0 || lHip >= fk.Length || rHip >= fk.Length)
@@ -429,12 +391,56 @@ namespace BodyTracking.MoveAI
             arkitAxis.y = 0f;
             if (arkitAxis.magnitude < MinHipAxis) return false;
 
-            // Pure YAW only (about world up). FromToRotation can inject pitch/roll when the axes are noisy or
-            // near-anti-parallel, which tilts the whole basis and makes individual bones look flipped. A signed
-            // yaw keeps the body upright and stable.
-            float yaw = Vector3.SignedAngle(moveAxis.normalized, arkitAxis.normalized, Vector3.up);
-            facing = Quaternion.AngleAxis(yaw, Vector3.up);
+            float yawFallback = Vector3.SignedAngle(moveAxis.normalized, arkitAxis.normalized, Vector3.up);
+            facing = Quaternion.AngleAxis(yawFallback, Vector3.up);
             return true;
+        }
+
+        /// <summary>Horizontal torso forward from Move/GLB offsets (root/hips → spine).</summary>
+        static bool TryComputeMoveHorizontalForward(MoveAIFusionAsset asset, Vector3[] fk, out Vector3 forward)
+        {
+            forward = Vector3.zero;
+            int root = asset.pose.IndexOfJoint("Root");
+            if (root < 0) root = 0;
+            if (root < 0 || root >= fk.Length) return false;
+
+            Vector3 pelvis = fk[root];
+            int lHip = asset.pose.IndexOfJoint("Left_hip");
+            int rHip = asset.pose.IndexOfJoint("Right_hip");
+            if (lHip >= 0 && rHip >= 0 && lHip < fk.Length && rHip < fk.Length)
+                pelvis = (fk[lHip] + fk[rHip]) * 0.5f;
+
+            int spine = asset.pose.IndexOfJoint("Spine1");
+            if (spine < 0) spine = asset.pose.IndexOfJoint("Spine2");
+            if (spine < 0 || spine >= fk.Length) return false;
+
+            forward = fk[spine] - pelvis;
+            forward.y = 0f;
+            return forward.sqrMagnitude >= 1e-6f;
+        }
+
+        /// <summary>Horizontal torso forward from the recorded ARKit skeleton (pelvis → spine).</summary>
+        static bool TryComputeArkitHorizontalForward(HipFrame arkit, out Vector3 forward)
+        {
+            forward = Vector3.zero;
+            if (!TryGetPelvisCenter(arkit, out var pelvis)) return false;
+
+            foreach (int spineIdx in ArkitSpineCandidates)
+            {
+                if (!TryGetSample(arkit, spineIdx, out var spine)) continue;
+                forward = spine.positionReference - pelvis;
+                forward.y = 0f;
+                if (forward.sqrMagnitude >= 1e-6f) return true;
+            }
+
+            // No spine: derive forward from the hip line (right × up).
+            if (!TryGetSample(arkit, ArkitLeftUpLeg, out var l) || !TryGetSample(arkit, ArkitRightUpLeg, out var r))
+                return false;
+            Vector3 right = r.positionReference - l.positionReference;
+            if (right.sqrMagnitude < MinHipAxis * MinHipAxis) return false;
+            forward = Vector3.Cross(right.normalized, Vector3.up);
+            forward.y = 0f;
+            return forward.sqrMagnitude >= 1e-6f;
         }
 
         static bool TryGetSample(HipFrame frame, int jointIndex, out RecordedJointSample sample)

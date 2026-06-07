@@ -342,11 +342,6 @@ namespace BodyTracking.MoveAI
             // while positioning/scale stay on the fused trajectory. The GLB loads asynchronously, so defer the
             // actual StartPlayback until it's ready (or failed -> procedural). The fused JSON path is otherwise
             // unchanged, and the dot-skeleton player remains the outer fallback in BodyTrackingController.
-            // #region agent log
-            DbgLog("B", "MoveAIFusionCoordinator.cs:TryStartFusedPlayback", "glb branch decision",
-                "{\"recording\":\"" + recordingFileName + "\",\"preferGlb\":" + (preferGlbArticulation ? "true" : "false") +
-                ",\"hasGlb\":" + (HasGlb(recordingFileName) ? "true" : "false") + ",\"glbPath\":\"" + GlbPath(recordingFileName).Replace("\\", "/") + "\"}");
-            // #endregion
             // Only take the GLB path when the player is actually in GLB articulation mode. In FBX mode the player
             // runs the original position-based procedural retarget, so we must NOT load/attach a Move GLB — that
             // keeps the FBX path identical to how it worked before the GLB feature existed.
@@ -454,11 +449,6 @@ namespace BodyTracking.MoveAI
             }
 
             string loadError = source != null ? source.Error : "unknown";
-            // #region agent log
-            DbgLog("D", "MoveAIFusionCoordinator.cs:AttachGlbWhenReady", "glb load done",
-                "{\"sourceNull\":" + (source == null ? "true" : "false") +
-                ",\"ready\":" + (source != null && source.IsReady ? "true" : "false") + ",\"error\":\"" + (loadError ?? "").Replace("\"", "'") + "\"}");
-            // #endregion
             if (source != null && source.IsReady)
             {
                 fusedPlayer.SetMoveGlbSource(source);
@@ -542,16 +532,6 @@ namespace BodyTracking.MoveAI
             if (fusedPlayer != null)
                 fusedPlayer.StopPlayback();
         }
-
-        // #region agent log
-        static void DbgLog(string h, string loc, string msg, string data)
-        {
-            string line = "{\"sessionId\":\"8c511b\",\"hypothesisId\":\"" + h + "\",\"location\":\"" + loc + "\",\"message\":\"" + msg + "\",\"data\":" + data + ",\"timestamp\":" + System.DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() + "}";
-            UnityEngine.Debug.Log("[DBG8c511b] " + line);
-            try { System.IO.File.AppendAllText("/Users/laurensart/Desktop/TENDOR-climbing copy/TENDOR-climbing/.cursor/debug-8c511b.log", line + "\n"); }
-            catch { }
-        }
-        // #endregion
 
         void SetStatus(string status)
         {

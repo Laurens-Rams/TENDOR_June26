@@ -8,9 +8,6 @@ using BodyTracking.Spatial;
 using BodyTracking.MoveAI;
 using BodyTracking.AR;
 using BodyTracking.Playback.PostProcess;
-#if UNITY_EDITOR || DEVELOPMENT_BUILD
-using BodyTracking.DebugTools;
-#endif
 
 namespace BodyTracking.Playback
 {
@@ -31,7 +28,7 @@ namespace BodyTracking.Playback
 
         [Header("Playback")]
         [Tooltip("Flip the Move pose 180° in yaw (affects pose anchoring). Keep matched to the compare overlay.")]
-        [SerializeField] private bool invertFacing = true;
+        [SerializeField] private bool invertFacing = false;
         [Tooltip("Spin the character root 180° about its up axis. Use when the model's authored forward is -Z so " +
                  "its torso faces the same way as the recorded climber (limbs are aimed separately and stay correct).")]
         [SerializeField] private bool flipCharacterForward = true;
@@ -180,17 +177,8 @@ namespace BodyTracking.Playback
         private bool segmentLoopEnabled;
         private float segmentLoopStart;
         private float segmentLoopEnd;
-#if UNITY_EDITOR || DEVELOPMENT_BUILD
-        private int dbgFrame;
-        private int dbgTimingFrame;
-#endif
         private bool readyToApply; // set in Update, consumed in LateUpdate so we win over the rig Animator
         private bool loggedPlacement; // one-shot placement diagnostic per playback
-#if UNITY_EDITOR || DEVELOPMENT_BUILD
-        // #region agent log
-        private bool loggedMapping; // one-shot joint->bone mapping dump
-        // #endregion
-#endif
         private Animator characterAnimator; // disabled while we drive bones procedurally
         private FusedPoseSolver.AnchorState anchorState; // last-good ARKit anchor/facing through dropouts
 
@@ -200,19 +188,6 @@ namespace BodyTracking.Playback
         private HumanPose glbPose = new HumanPose();
         private bool glbActive;                     // MoveGlb mode + source ready + target handler built
         private Transform poseRoot;                  // transform SetHumanPose drives (the avatar/animator root)
-
-        // #region agent log
-        private bool dbgLoggedPath;
-        static void DbgLog(string h, string loc, string msg, string data)
-        {
-            string line = "{\"sessionId\":\"8c511b\",\"hypothesisId\":\"" + h + "\",\"location\":\"" + loc + "\",\"message\":\"" + msg + "\",\"data\":" + data + ",\"timestamp\":" + System.DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() + "}";
-            // Console (visible in Editor + Xcode device console) so on-device runs are debuggable too.
-            UnityEngine.Debug.Log("[DBG8c511b] " + line);
-            // File (Editor only; the absolute Mac path silently no-ops on device).
-            try { System.IO.File.AppendAllText("/Users/laurensart/Desktop/TENDOR-climbing copy/TENDOR-climbing/.cursor/debug-8c511b.log", line + "\n"); }
-            catch { }
-        }
-        // #endregion
 
         // Resolved bone transforms keyed by Move joint index.
         private readonly Dictionary<int, Transform> boneByJoint = new Dictionary<int, Transform>();
@@ -297,7 +272,13 @@ namespace BodyTracking.Playback
             get => penetrationSettings;
             set => penetrationSettings = value;
         }
-        public void SetInvertFacing(bool value) => invertFacing = value;
+        public void SetInvertFacing(bool value)
+        {
+            if (invertFacing == value) return;
+            invertFacing = value;
+            hasLastFacingForward = false;
+            hasLastGoodBodyBasis = false;
+        }
         /// <summary>Fine-tune multiplier on the auto-fit character scale; re-applies the fit immediately.</summary>
         public float SkeletonFitScale
         {
@@ -390,12 +371,6 @@ namespace BodyTracking.Playback
             {
                 glbActive = false;
             }
-            // #region agent log
-            DbgLog("C", "FusedCharacterPlayer.cs:SetMoveGlbSource", "glb source set",
-                "{\"sourceNull\":" + (source == null ? "true" : "false") + ",\"sourceReady\":" + (source != null && source.IsReady ? "true" : "false") +
-                ",\"articulationSource\":\"" + articulationSource + "\",\"glbActive\":" + (glbActive ? "true" : "false") +
-                ",\"root\":\"" + (characterRoot != null ? characterRoot.name : "null") + "\",\"handlerNull\":" + (targetPoseHandler == null ? "true" : "false") + "}");
-            // #endregion
         }
 
         /// <summary>Re-apply a preloaded GLB source after LoadAsset/RebindCharacter (e.g. WarmGlb finished before Play).</summary>
@@ -451,10 +426,6 @@ namespace BodyTracking.Playback
         /// </summary>
         public void RebindCharacter(Transform newRoot)
         {
-            // #region agent log
-            DbgLog("E", "FusedCharacterPlayer.cs:RebindCharacter", "rebind requested",
-                "{\"newRoot\":\"" + (newRoot != null ? newRoot.name : "null") + "\",\"prevRoot\":\"" + (characterRoot != null ? characterRoot.name : "null") + "\",\"playing\":" + (isPlaying ? "true" : "false") + "}");
-            // #endregion
             // Hide the old rig if we're swapping it out during playback so two characters never show at once.
             if (characterRoot != null && characterRoot != newRoot)
                 SetCharacterVisible(false);
@@ -477,9 +448,6 @@ namespace BodyTracking.Playback
             targetPoseHandler = null;
             poseRoot = null;
             glbActive = false;
-#if UNITY_EDITOR || DEVELOPMENT_BUILD
-            loggedMapping = false;
-#endif
 
             if (newRoot == null)
                 return;
@@ -520,23 +488,9 @@ namespace BodyTracking.Playback
             }
             asset = fusionAsset;
             playbackTime = 0f;
-#if UNITY_EDITOR || DEVELOPMENT_BUILD
-            // #region agent log
-            TimingDebugLog.Log("H1", "FusedCharacterPlayer.LoadAsset", "fusion asset loaded",
-                "{\"offsetCorrected\":" + (fusionAsset.offsetCorrected ? "true" : "false") +
-                ",\"videoOffset\":" + (recording != null ? recording.videoStartTimeOffset.ToString("F2") : "0") +
-                ",\"frameCount\":" + fusionAsset.FrameCount +
-                ",\"duration\":" + fusionAsset.Duration.ToString("F2") +
-                ",\"playbackAnchorMode\":\"" + playbackAnchorMode + "\"}");
-            // #endregion
-#endif
             recordingHeightMeters = EstimateRecordingHeight(recording);
             UpdatePoseScaleFromRecording();
             ResolveCharacterRoot();
-            // #region agent log
-            DbgLog("A", "FusedCharacterPlayer.cs:LoadAsset", "resolved character root",
-                "{\"root\":\"" + (characterRoot != null ? characterRoot.name : "null") + "\",\"articulationSource\":\"" + articulationSource + "\",\"hasFbxController\":" + (fbxCharacterController != null ? "true" : "false") + "}");
-            // #endregion
             if (characterRoot == null)
                 Debug.LogWarning("[FusedCharacterPlayer] No character rig — timeline + compare skeletons only.");
             else
@@ -599,21 +553,10 @@ namespace BodyTracking.Playback
             playbackTime = 0f;
             readyToApply = false;
             loggedPlacement = false;
-            // #region agent log
-            dbgLoggedPath = false;
-            // #endregion
             anchorState = default;
             postProcessor.Reset();
             hasLastGoodBodyBasis = false;
             waitingForLocalization = !routeRootProvider.IsLocalized;
-#if UNITY_EDITOR || DEVELOPMENT_BUILD
-            // #region agent log
-            TimingDebugLog.LogSessionStart("FusedCharacterPlayer.StartPlayback",
-                "{\"offsetCorrected\":" + (asset != null && asset.offsetCorrected ? "true" : "false") +
-                ",\"videoOffset\":" + (recording != null ? recording.videoStartTimeOffset.ToString("F2") : "0") +
-                ",\"duration\":" + (asset != null ? asset.Duration.ToString("F2") : "0") + "}");
-            // #endregion
-#endif
             SetCharacterVisible(characterRoot != null && !waitingForLocalization);
             OnPlaybackStarted?.Invoke();
         }
@@ -680,17 +623,6 @@ namespace BodyTracking.Playback
                 ApplyRecordingHeightScale();
 
             bool localized = routeRootProvider == null || routeRootProvider.IsLocalized;
-#if UNITY_EDITOR || DEVELOPMENT_BUILD
-            // #region agent log
-            if ((dbgFrame++ % 60) == 0)
-                BodyTracking.DebugTools.DebugSessionLog.Log("A", "FusedCharacterPlayer.cs:Update",
-                    "fused Update tick",
-                    "{\"localized\":" + (localized ? "true" : "false") +
-                    ",\"waiting\":" + (waitingForLocalization ? "true" : "false") +
-                    ",\"playbackTime\":" + playbackTime.ToString("F2") +
-                    ",\"characterNull\":" + (characterRoot == null ? "true" : "false") + "}");
-            // #endregion
-#endif
             if (!localized)
             {
                 if (!waitingForLocalization)
@@ -751,7 +683,7 @@ namespace BodyTracking.Playback
             // to keep elbows, knees, hands, and feet from twisting/flipping around the segment direction.
             var effAnchorSettings = EffectivePlaybackAnchorSettings();
             useMoveDrivenFacing = effAnchorSettings.moveDrivenFacing;
-            Vector3[] local = FusedPoseSolver.ComputeLocalJoints(asset, recording, t, ref anchorState, invertFacing, effAnchorSettings, ActiveGlbSource);
+            Vector3[] local = FusedPoseSolver.ComputeLocalJoints(asset, recording, t, ref anchorState, out Quaternion effectiveFacingLocal, invertFacing, effAnchorSettings, ActiveGlbSource);
             if (local == null) return;
 
             // Step 2/3: glitch guard + jump-aware jitter smoothing, in stable RouteRoot-local space so phone motion
@@ -774,19 +706,9 @@ namespace BodyTracking.Playback
                 penetrationResolver.ResolveBodyAndFloor(world, rootJointIndex, footWorldIndices, jumping, penetrationSettings);
             }
 
-            // #region agent log
-            if (!dbgLoggedPath)
-            {
-                dbgLoggedPath = true;
-                DbgLog("ALL", "FusedCharacterPlayer.cs:ApplyFrame", "first frame applied",
-                    "{\"glbActive\":" + (glbActive ? "true" : "false") + ",\"path\":\"" + (glbActive ? "MoveGlb" : "Procedural") +
-                    "\",\"root\":\"" + (characterRoot != null ? characterRoot.name : "null") + "\",\"bonesMapped\":" + boneByJoint.Count + "}");
-            }
-            // #endregion
-
             // GLB articulation path: body + fingers come from the Move GLB (muscle space); positioning + facing
             // still come from the fused world joints above. Returns early so the procedural bone solver is skipped.
-            if (glbActive && ApplyGlbFrame(t, world))
+            if (glbActive && ApplyGlbFrame(t, world, effectiveFacingLocal))
                 return;
 
             // Reset every bound bone to its bind pose so this frame's swing is computed fresh (no roll drift).
@@ -795,7 +717,7 @@ namespace BodyTracking.Playback
                     kv.Value.localRotation = bind;
 
             // Place + face the whole character from the Move pelvis basis.
-            OrientAndPlaceRoot(world);
+            OrientAndPlaceRoot(world, effectiveFacingLocal);
             BodyBasis bodyBasis = ComputeBodyBasis(world);
 
             if (!loggedPlacement)
@@ -807,37 +729,6 @@ namespace BodyTracking.Playback
                           $"| hip world={hipW:F3} | moveBodyForward={bodyBasis.forward:F3} | localized={(routeRootProvider == null || routeRootProvider.IsLocalized)}. " +
                           "moveBodyForward should be the climber's anatomical front; the per-bone twist reference matches it to the rig bind forward.");
             }
-
-#if UNITY_EDITOR || DEVELOPMENT_BUILD
-            // #region agent log
-            if (!loggedMapping)
-            {
-                loggedMapping = true;
-                // Focus on the extremities (hands/feet) where the flip is visible, incl. whether the child bone the
-                // swing aims at is actually mapped (H5: unmapped child => leaf bone never oriented).
-                string[] probe = { "Left_elbow", "Left_wrist", "Right_elbow", "Right_wrist",
-                                   "Left_knee", "Left_ankle", "Left_toe", "Right_knee", "Right_ankle", "Right_toe" };
-                var sb = new System.Text.StringBuilder("[DBG5f9dd8][H4/H5/H6] joint->bone map: ");
-                foreach (var name in probe)
-                {
-                    int idx = asset.pose.IndexOfJoint(name);
-                    string bn = (idx >= 0 && boneByJoint.TryGetValue(idx, out var b) && b != null) ? b.name : "<none>";
-                    int childIdx = (idx >= 0 && primaryChild.TryGetValue(idx, out var c)) ? c : -1;
-                    string cn = childIdx >= 0 && childIdx < asset.pose.jointNames.Count ? asset.pose.jointNames[childIdx] : "<none>";
-                    bool childMapped = childIdx >= 0 && boneByJoint.TryGetValue(childIdx, out var cb) && cb != null;
-                    sb.Append($"{name}[{idx}]->{bn}(child={cn},childMapped={childMapped}) ");
-                }
-                UnityEngine.Debug.Log(sb.ToString());
-            }
-            // Log left/right hip world X each ~30 frames to detect mirroring (left should differ in sign from right).
-            if ((dbgFrame % 30) == 0)
-            {
-                int li = asset.pose.IndexOfJoint("Left_hip"), ri = asset.pose.IndexOfJoint("Right_hip");
-                if (li >= 0 && ri >= 0 && li < world.Length && ri < world.Length)
-                    UnityEngine.Debug.Log($"[DBG5f9dd8][H3] hipWorld L={world[li]:F3} R={world[ri]:F3} (L-R)={(world[li]-world[ri]):F3}");
-            }
-            // #endregion
-#endif
 
             // Aim each mapped bone toward its primary mapped child (parents already iterate first because
             // Move topology is parent-ordered), while preserving the target limb bend plane.
@@ -862,7 +753,7 @@ namespace BodyTracking.Playback
         /// then pin the hips onto the fused world hip every frame. Returns false to let the caller fall back to the
         /// procedural solver if the GLB pose can't be sampled this frame.
         /// </summary>
-        bool ApplyGlbFrame(float t, Vector3[] world)
+        bool ApplyGlbFrame(float t, Vector3[] world, Quaternion effectiveFacingLocal)
         {
             if (targetPoseHandler == null || glbSource == null || poseRoot == null)
                 return false;
@@ -878,26 +769,7 @@ namespace BodyTracking.Playback
             targetPoseHandler.SetHumanPose(ref glbPose);
 
             // Same root placement + per-frame facing as the procedural path (characterRoot, not poseRoot alone).
-            OrientAndPlaceRoot(world);
-
-#if UNITY_EDITOR || DEVELOPMENT_BUILD
-            // #region agent log
-            if ((dbgTimingFrame++ % 30) == 0)
-            {
-                float glbFootY = TryDebugLeftFootWorldY();
-                int footIdx = asset.pose.IndexOfJoint("Left_toe");
-                if (footIdx < 0) footIdx = asset.pose.IndexOfJoint("Left_ankle");
-                float fusedFootY = footIdx >= 0 && footIdx < world.Length ? world[footIdx].y : world[rootJointIndex].y;
-                TimingDebugLog.Log("H4", "FusedCharacterPlayer.ApplyGlbFrame",
-                    "t=" + t.ToString("F2") + " glbFootY=" + glbFootY.ToString("F3") + " fusedFootY=" + fusedFootY.ToString("F3"),
-                    "{\"t\":" + t.ToString("F2") +
-                    ",\"glbSampleT\":" + t.ToString("F2") +
-                    ",\"glbFootY\":" + glbFootY.ToString("F3") +
-                    ",\"fusedFootY\":" + fusedFootY.ToString("F3") +
-                    ",\"glbDuration\":" + (glbSource != null ? glbSource.Duration.ToString("F2") : "0") + "}");
-            }
-            // #endregion
-#endif
+            OrientAndPlaceRoot(world, effectiveFacingLocal);
 
             if (enablePenetrationFix && surfaceProbe != null)
                 penetrationResolver.ResolveLimbs(characterAnimator, postProcessor.LastJumping, penetrationSettings);
@@ -914,32 +786,23 @@ namespace BodyTracking.Playback
         }
 
         /// <summary>Position the character so its hips sit on the Move pelvis, facing the Move body basis.</summary>
-        void OrientAndPlaceRoot(Vector3[] world)
+        void OrientAndPlaceRoot(Vector3[] world, Quaternion effectiveFacingLocal)
         {
             Vector3 hipsW = world[rootJointIndex];
             BodyBasis basis = ComputeBodyBasis(world);
 
-            // Target facing = a STABLE horizontal yaw. Prefer the smoothed ARKit facing (anchorState) and fall back
-            // to the Move body's horizontal forward. The up axis is locked to world up and the forward is
-            // re-orthogonalised against it, so LookRotation can never go degenerate (forward ∥ up) — that
-            // degeneracy is what made the root spin when the climber leaned and the spine tilted toward horizontal.
-            // Body lean/tilt is still shown by the spine + limb bones, not the root.
             Vector3 forward;
             if (useMoveDrivenFacing)
             {
-                // Move-driven: the body's turning comes from the steady Move pose itself (basis.forward already
-                // includes the slow Move->AR yaw offset). This keeps the facing free of ARKit leg-stride noise.
                 forward = basis.forward;
                 forward.y = 0f;
                 if (forward.sqrMagnitude < 1e-6f && hasLastFacingForward)
-                    forward = lastFacingForward; // hold through a degenerate lean (spine near horizontal)
+                    forward = lastFacingForward;
             }
             else
             {
-                // Legacy: prefer the per-frame ARKit-aligned yaw.
-                forward = basis.forward;
-                if (anchorState.hasFacing)
-                    forward = referenceFrame.rotation * (anchorState.facing * Vector3.forward);
+                // Exact same yaw the solver applied to the orange skeleton (includes Invert facing 180°).
+                forward = referenceFrame.rotation * (effectiveFacingLocal * Vector3.forward);
                 forward.y = 0f;
                 if (forward.sqrMagnitude < 1e-6f)
                 {
@@ -956,17 +819,11 @@ namespace BodyTracking.Playback
             Quaternion targetAnatomical = Quaternion.LookRotation(forward, Vector3.up);
             if (hasRigBindAnatomical)
             {
-                // Rotate the root so its OWN anatomical basis lands on the Move basis. Because the rig basis was
-                // captured from the same bones (cross of hip + spine axes), this faces the character the same way
-                // as the orange regardless of the model's authored forward — no manual flip, can't end up reversed.
                 characterRoot.rotation = targetAnatomical * Quaternion.Inverse(rigBindLocalAnatomical);
             }
             else
             {
-                // Fallback only if the rig hips/spine couldn't be resolved: legacy behaviour + manual flip.
                 characterRoot.rotation = targetAnatomical;
-                if (flipCharacterForward)
-                    characterRoot.rotation *= Quaternion.Euler(0f, 180f, 0f);
             }
 
             // After rotating, shift so the actual hips bone lands on the Move pelvis.
@@ -1899,19 +1756,5 @@ namespace BodyTracking.Playback
             if (characterRoot != null && characterRoot.gameObject.activeSelf != visible)
                 characterRoot.gameObject.SetActive(visible);
         }
-
-#if UNITY_EDITOR || DEVELOPMENT_BUILD
-        float TryDebugLeftFootWorldY()
-        {
-            if (characterAnimator == null && characterRoot != null)
-                characterAnimator = characterRoot.GetComponentInChildren<Animator>(true);
-            if (characterAnimator != null && characterAnimator.isHuman)
-            {
-                var foot = characterAnimator.GetBoneTransform(HumanBodyBones.LeftFoot);
-                if (foot != null) return foot.position.y;
-            }
-            return characterRoot != null ? characterRoot.position.y : 0f;
-        }
-#endif
     }
 }

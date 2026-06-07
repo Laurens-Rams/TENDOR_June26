@@ -1,9 +1,6 @@
 using System.Collections.Generic;
 using UnityEngine;
 using BodyTracking.Data;
-#if UNITY_EDITOR || DEVELOPMENT_BUILD
-using BodyTracking.DebugTools;
-#endif
 
 namespace BodyTracking.MoveAI
 {
@@ -158,15 +155,6 @@ namespace BodyTracking.MoveAI
                 ? existing.pose
                 : RetimePose(existing.pose, recording.videoStartTimeOffset, fps);
             int n = pose.FrameCount;
-#if UNITY_EDITOR || DEVELOPMENT_BUILD
-            // #region agent log
-            TimingDebugLog.Log("H2", "MoveAIFusionBaker.RebakeFromAsset", "rebake pose source",
-                "{\"wasOffsetCorrected\":" + (existing.offsetCorrected ? "true" : "false") +
-                ",\"retimeApplied\":" + (existing.offsetCorrected ? "false" : "true") +
-                ",\"videoOffset\":" + recording.videoStartTimeOffset.ToString("F2") +
-                ",\"frameCount\":" + n + "}");
-            // #endregion
-#endif
 
             var arkitHip = new Vector3[n];
             var arkitValid = new bool[n];
@@ -229,18 +217,6 @@ namespace BodyTracking.MoveAI
 
             Debug.Log($"[MoveAIFusionBaker] Rebaked {n} frames (no API); scale={scale:F3}; validHip={CountTrue(arkitValid)}/{n}; " +
                       $"weights={settings.axisWeights} tau={settings.smoothingTau} outlier={settings.outlierMeters}");
-#if UNITY_EDITOR || DEVELOPMENT_BUILD
-            // #region agent log
-            int climbIdx = Mathf.Clamp(Mathf.RoundToInt(3.5f * fps), 0, n - 1);
-            TimingDebugLog.Log("H7", "MoveAIFusionBaker.RebakeFromAsset", "rebake root sample",
-                "{\"weights\":{\"x\":" + settings.axisWeights.x.ToString("F2") +
-                ",\"y\":" + settings.axisWeights.y.ToString("F2") +
-                ",\"z\":" + settings.axisWeights.z.ToString("F2") +
-                "},\"rootY_t3.5\":" + rootPath[climbIdx].y.ToString("F3") +
-                ",\"arkitY_t3.5\":" + arkitHip[climbIdx].y.ToString("F3") +
-                ",\"moveLocalY_t3.5\":" + moveLocal[climbIdx].y.ToString("F3") + "}");
-            // #endregion
-#endif
             return asset;
         }
 

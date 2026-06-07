@@ -92,9 +92,6 @@ namespace BodyTracking.UI
         private bool suppressScrubCallback;
         private const float TransportRefreshInterval = 0.1f;
         private float nextTransportRefreshTime;
-#if UNITY_EDITOR || DEVELOPMENT_BUILD
-        private int transportDbgFrame;
-#endif
 
         private bool initialized;
 
@@ -1071,15 +1068,6 @@ namespace BodyTracking.UI
                 current = controller.FusedCurrentTime;
                 total = controller.FusedDuration;
                 progress = total > 0f ? Mathf.Clamp01(current / total) : 0f;
-#if UNITY_EDITOR || DEVELOPMENT_BUILD
-                // #region agent log
-                if ((transportDbgFrame++ % 60) == 0)
-                    BodyTracking.DebugTools.DebugSessionLog.Log("D", "BodyTrackingUI.cs:UpdateTransportTime",
-                        "transport reads FusedPlayer",
-                        "{\"fusedCurrentTime\":" + current.ToString("F2") +
-                        ",\"fusedDuration\":" + total.ToString("F2") + "}");
-                // #endregion
-#endif
             }
             else if (controller.IsPlaying && controller.player != null)
             {

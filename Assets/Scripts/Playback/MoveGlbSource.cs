@@ -182,7 +182,43 @@ namespace BodyTracking.Playback
             if (parent != null)
                 root.transform.SetParent(parent, false);
 
-            if (!gltf.InstantiateMainScene(root.transform))
+            // Sync InstantiateMainScene() blocks on Task.Result and can deadlock Unity's main thread.
+            Task<bool> instantiateTask = null;
+            bool instantiateStartFailed = false;
+            try
+            {
+                instantiateTask = gltf.InstantiateMainSceneAsync(root.transform);
+            }
+            catch (Exception e)
+            {
+                Error = "InstantiateMainSceneAsync threw: " + e.Message;
+                instantiateStartFailed = true;
+            }
+            if (instantiateStartFailed)
+            {
+                Cleanup();
+                yield break;
+            }
+
+            float instantiateDeadline = Time.realtimeSinceStartup + 30f;
+            while (!instantiateTask.IsCompleted)
+            {
+                if (Time.realtimeSinceStartup > instantiateDeadline)
+                {
+                    Error = "InstantiateMainScene timed out after 30s";
+                    Cleanup();
+                    yield break;
+                }
+                yield return null;
+            }
+
+            if (instantiateTask.IsFaulted)
+            {
+                Error = instantiateTask.Exception?.GetBaseException().Message ?? "InstantiateMainScene faulted";
+                Cleanup();
+                yield break;
+            }
+            if (!instantiateTask.Result)
             {
                 Error = "InstantiateMainScene failed";
                 Cleanup();
