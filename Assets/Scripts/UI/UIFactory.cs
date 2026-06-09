@@ -127,6 +127,28 @@ namespace BodyTracking.UI
             return btn;
         }
 
+        /// <summary>Anchor a square toolbar icon to the top-left; <paramref name="index"/> 0 = leftmost.</summary>
+        public static void PlaceTopLeftToolbarButton(RectTransform rect, int index, float diameter, float inset)
+        {
+            float x = inset + index * (diameter + UITokens.Space8) + diameter * 0.5f;
+            float y = -(inset + diameter * 0.5f);
+            rect.anchorMin = new Vector2(0f, 1f);
+            rect.anchorMax = new Vector2(0f, 1f);
+            rect.pivot = new Vector2(0.5f, 0.5f);
+            rect.sizeDelta = new Vector2(diameter, diameter);
+            rect.anchoredPosition = new Vector2(x, y);
+        }
+
+        /// <summary>
+        /// Horizontal width consumed by <paramref name="count"/> top-left toolbar buttons (incl. inset).
+        /// Use to inset other top chrome (status pills) so they don't overlap the icons.
+        /// </summary>
+        public static float TopLeftToolbarWidth(int count, float diameter, float inset)
+        {
+            if (count <= 0) return inset;
+            return inset + count * diameter + (count - 1) * UITokens.Space8 + UITokens.Space8;
+        }
+
         /// <summary>
         /// A pill-shaped text button. <paramref name="ghost"/> renders an outline-only (transparent)
         /// secondary style; otherwise it is a filled accent primary button.
@@ -382,6 +404,55 @@ namespace BodyTracking.UI
             return root.gameObject;
         }
 
+        /// <summary>Three horizontal bars (list / picker affordance).</summary>
+        public static GameObject AddListIcon(Transform parent, float size, Color color)
+        {
+            var root = CreateRect("Icon_List", parent);
+            Center(root, new Vector2(size, size));
+
+            float barH = Mathf.Max(2f, size * 0.11f);
+            float barW = size * 0.62f;
+            float gap = size * 0.16f;
+            MakeBar(root, "BarTop", new Vector2(0f, gap), new Vector2(barW, barH), color);
+            MakeBar(root, "BarMid", Vector2.zero, new Vector2(barW, barH), color);
+            MakeBar(root, "BarBot", new Vector2(0f, -gap), new Vector2(barW, barH), color);
+            return root.gameObject;
+        }
+
+        /// <summary>Simple gear (hub + teeth) for settings / tuning.</summary>
+        public static GameObject AddSettingsIcon(Transform parent, float size, Color color)
+        {
+            var root = CreateRect("Icon_Settings", parent);
+            Center(root, new Vector2(size, size));
+
+            float stroke = Mathf.Max(2f, size * 0.11f);
+            float toothLen = size * 0.16f;
+            float hubR = size * 0.17f;
+
+            for (int i = 0; i < 8; i++)
+            {
+                float angle = i * 45f;
+                var tooth = CreateRect($"Tooth_{i}", root);
+                tooth.sizeDelta = new Vector2(stroke, toothLen);
+                tooth.anchoredPosition = new Vector2(0f, hubR + toothLen * 0.42f);
+                tooth.localRotation = Quaternion.Euler(0f, 0f, -angle);
+                var img = tooth.gameObject.AddComponent<Image>();
+                img.sprite = RoundedSprite(2);
+                img.type = Image.Type.Sliced;
+                img.color = color;
+                img.raycastTarget = false;
+            }
+
+            var hub = CreateRect("Hub", root);
+            hub.sizeDelta = new Vector2(hubR * 2f, hubR * 2f);
+            var hubImg = hub.gameObject.AddComponent<Image>();
+            hubImg.sprite = CircleSprite();
+            hubImg.color = color;
+            hubImg.raycastTarget = false;
+
+            return root.gameObject;
+        }
+
         /// <summary>Create TMP with bold weight (for move numbers on the playback timeline).</summary>
         public static TextMeshProUGUI CreateBoldText(
             string name,
@@ -447,19 +518,25 @@ namespace BodyTracking.UI
         /// label so the caller can update color/text as state changes.
         /// </summary>
         public static (RectTransform root, Image dot, TextMeshProUGUI label) CreateStatusPill(
-            string name, Transform parent, string initialLabel, bool autoSize = true)
+            string name, Transform parent, string initialLabel, bool autoSize = true,
+            float height = 0f, float fontSize = 0f, float dotSize = 0f)
         {
+            float pillHeight = height > 0f ? height : UITokens.PillHeight;
+            float labelSize = fontSize > 0f ? fontSize : UITokens.FontCaption - 2f;
+            float dotDiameter = dotSize > 0f ? dotSize : 8f;
+
             var root = CreateRect(name, parent);
-            root.sizeDelta = new Vector2(180f, UITokens.PillHeight);
+            root.sizeDelta = new Vector2(180f, pillHeight);
 
             var bg = root.gameObject.AddComponent<Image>();
-            bg.sprite = RoundedSprite(Mathf.RoundToInt(UITokens.PillHeight * 0.5f));
+            bg.sprite = RoundedSprite(Mathf.RoundToInt(pillHeight * 0.5f));
             bg.type = Image.Type.Sliced;
             bg.color = UITokens.SurfaceElevated;
             bg.raycastTarget = false;
 
             var layout = root.gameObject.AddComponent<HorizontalLayoutGroup>();
-            layout.padding = new RectOffset((int)UITokens.Space8, (int)UITokens.Space8, 0, 0);
+            float padH = pillHeight < UITokens.PillHeight ? UITokens.Space4 : UITokens.Space8;
+            layout.padding = new RectOffset((int)padH, (int)padH, 0, 0);
             layout.spacing = UITokens.Space4;
             layout.childAlignment = TextAnchor.MiddleLeft;
             layout.childForceExpandWidth = false;
@@ -476,21 +553,21 @@ namespace BodyTracking.UI
                 fitter.verticalFit = ContentSizeFitter.FitMode.Unconstrained;
             }
             var le = root.gameObject.AddComponent<LayoutElement>();
-            le.minHeight = UITokens.PillHeight;
-            le.preferredHeight = UITokens.PillHeight;
+            le.minHeight = pillHeight;
+            le.preferredHeight = pillHeight;
 
             var dotRect = CreateRect("Dot", root);
-            dotRect.sizeDelta = new Vector2(8f, 8f);
+            dotRect.sizeDelta = new Vector2(dotDiameter, dotDiameter);
             var dot = dotRect.gameObject.AddComponent<Image>();
             dot.sprite = CircleSprite();
             dot.color = UITokens.Muted;
             dot.raycastTarget = false;
             var dotLayout = dotRect.gameObject.AddComponent<LayoutElement>();
-            dotLayout.minWidth = 8f; dotLayout.minHeight = 8f;
-            dotLayout.preferredWidth = 8f; dotLayout.preferredHeight = 8f;
+            dotLayout.minWidth = dotDiameter; dotLayout.minHeight = dotDiameter;
+            dotLayout.preferredWidth = dotDiameter; dotLayout.preferredHeight = dotDiameter;
             dotLayout.flexibleWidth = 0f;
 
-            var label = CreateText("Label", root, initialLabel, UITokens.FontCaption - 2f, UITokens.OnSurface, TextAlignmentOptions.Left);
+            var label = CreateText("Label", root, initialLabel, labelSize, UITokens.OnSurface, TextAlignmentOptions.Left);
             var labelLayout = label.gameObject.AddComponent<LayoutElement>();
             labelLayout.flexibleWidth = 1f;
 

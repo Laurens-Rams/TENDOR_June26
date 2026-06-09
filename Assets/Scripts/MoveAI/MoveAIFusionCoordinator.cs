@@ -171,6 +171,7 @@ namespace BodyTracking.MoveAI
             entry.jobId = null;
             entry.attempts = 0;
             entry.error = null;
+            entry.progressPercent = -1f;
             entry.State = MoveQueueState.Queued;
             SaveQueue();
 
@@ -180,12 +181,93 @@ namespace BodyTracking.MoveAI
             KickProcessor();
         }
 
-        int CountPending()
+        /// <summary>Read-only view of one queued Move AI job, for the recording-screen queue panel.</summary>
+        public struct MoveQueueItem
+        {
+            public string recordingFileName;
+            public string enqueuedUtc;
+            public MoveQueueState state;
+            public string error;
+            /// <summary>0–100 while uploading/processing; -1 when not applicable.</summary>
+            public float progressPercent;
+        }
+
+        /// <summary>
+        /// Snapshot of the current Move AI upload queue (newest first) for display. When
+        /// <paramref name="mapId"/> is set, only jobs for recordings on that Immersal map are included
+        /// (matches the playback recording list). Safe to call any time.
+        /// </summary>
+        public List<MoveQueueItem> GetQueueSnapshot(string mapId = null)
+        {
+            EnsureQueueLoaded();
+            var list = new List<MoveQueueItem>();
+            if (queue != null)
+            {
+                foreach (var e in queue.entries)
+                {
+                    if (!RecordingMatchesMap(e.recordingFileName, mapId))
+                        continue;
+                    list.Add(new MoveQueueItem
+                    {
+                        recordingFileName = e.recordingFileName,
+                        enqueuedUtc = e.enqueuedUtc,
+                        state = e.State,
+                        error = e.error,
+                        progressPercent = e.progressPercent,
+                    });
+                }
+            }
+            // Newest first so the most recent submission is at the top of the list.
+            list.Reverse();
+            return list;
+        }
+
+        /// <summary>Number of queue entries that are still pending or in flight (for the status badge).</summary>
+        public int PendingCount => CountPending();
+
+        /// <summary>Pending/in-flight jobs for recordings on the given map (empty mapId = all maps).</summary>
+        public int PendingCountForMap(string mapId) => CountPending(mapId);
+
+        /// <summary>
+        /// Remove a job from the upload queue by recording name (the little "x" in the queue panel). An
+        /// in-flight upload may still finish server-side, but it will no longer be tracked/baked here.
+        /// </summary>
+        public bool RemoveFromQueue(string recordingFileName)
+        {
+            if (string.IsNullOrEmpty(recordingFileName))
+                return false;
+            EnsureQueueLoaded();
+            int removed = queue.entries.RemoveAll(e => e.recordingFileName == recordingFileName);
+            if (removed <= 0)
+                return false;
+            // Mark dismissed on the recording JSON so legacy migration won't resurrect this job on relaunch.
+            PersistJobStateToRecording(recordingFileName, null, "DISMISSED");
+            SaveQueue();
+            int pending = CountPending();
+            SetStatus(pending > 0 ? $"Move AI: removed · {pending} pending" : "Move AI: idle");
+            return true;
+        }
+
+        static bool RecordingMatchesMap(string recordingFileName, string mapId)
+        {
+            if (string.IsNullOrEmpty(mapId))
+                return true;
+            var metadata = RecordingStorage.GetRecordingMetadata(recordingFileName);
+            if (metadata == null)
+                return false;
+            return string.Equals(metadata.mapId?.Trim(), mapId.Trim(), StringComparison.Ordinal);
+        }
+
+        int CountPending(string mapId = null)
         {
             if (queue == null) return 0;
             int n = 0;
             foreach (var e in queue.entries)
-                if (!e.IsTerminal) n++;
+            {
+                if (e.IsTerminal) continue;
+                if (!RecordingMatchesMap(e.recordingFileName, mapId)) continue;
+                n++;
+            }
             return n;
         }
 
@@ -272,7 +354,11 @@ namespace BodyTracking.MoveAI
                 bool done = false;
                 MoveJobResult result = null;
                 Action<MoveJobResult> onComplete = r => { result = r; done = true; };
-                Action<MoveJobProgress> onProgress = p => SetStatus(FormatProgress(p));
+                Action<MoveJobProgress> onProgress = p =>
+                {
+                    entry.progressPercent = p.percent;
+                    SetStatus(FormatProgress(p));
+                };
 
                 if (entry.NeedsUpload)
                 {
@@ -284,6 +370,7 @@ namespace BodyTracking.MoveAI
                     }
 
                     entry.State = MoveQueueState.Uploading;
+                    entry.progressPercent = 0f;
                     SaveQueue();
                     SetStatus(FormatStatus("reading video…"));
 
@@ -441,6 +528,7 @@ namespace BodyTracking.MoveAI
 
             entry.State = MoveQueueState.Done;
             entry.error = null;
+            entry.progressPercent = -1f;
             PersistJobStateToRecording(entry.recordingFileName, entry.jobId, "FINISHED");
             SaveQueue();
             SetStatus($"Fused replay ready · {entry.recordingFileName}");
@@ -451,6 +539,7 @@ namespace BodyTracking.MoveAI
         {
             entry.State = MoveQueueState.Failed;
             entry.error = error;
+            entry.progressPercent = -1f;
             Debug.LogWarning($"[MoveAIFusionCoordinator] Job failed for '{entry.recordingFileName}': {error}");
             SetStatus($"Move AI failed ({entry.recordingFileName}): {error}");
             SaveQueue();
@@ -549,6 +638,9 @@ namespace BodyTracking.MoveAI
 
             EnsureQueueLoaded();
 
+            // Drop queue rows whose recording JSON was deleted (e.g. rejected during review on another session).
+            PruneOrphanedEntries();
+
             // Close out jobs that are already fused (asset on disk).
             foreach (var e in queue.entries)
             {
@@ -576,19 +668,53 @@ namespace BodyTracking.MoveAI
             foreach (var fileName in recordings)
             {
                 if (HasFusionAsset(fileName)) continue;
-                if (queue.entries.Exists(e => e.recordingFileName == fileName && !e.IsTerminal)) continue;
+                // Never duplicate a row that is already tracked (including failed/dismissed history).
+                if (queue.entries.Exists(e => e.recordingFileName == fileName)) continue;
 
                 if (!RecordingStorage.TryGetMoveJobInfo(fileName, out string jobId, out string jobState)) continue;
-                if (jobState == "FAILED") continue;
+                if (jobState == "FAILED" || jobState == "DISMISSED") continue;
 
                 queue.entries.Add(new MoveQueueEntry
                 {
                     recordingFileName = fileName,
                     jobId = jobId,
                     videoFilePath = null,
+                    enqueuedUtc = GuessEnqueuedUtc(fileName),
                     State = MoveQueueState.Processing,
                 });
             }
+        }
+
+        static string GuessEnqueuedUtc(string recordingFileName)
+        {
+            if (string.IsNullOrEmpty(recordingFileName))
+                return DateTime.UtcNow.ToString("o");
+
+            // Prefer the timestamp encoded in hip_recording_yyyyMMdd_HHmmss so migrated rows don't look
+            // like they were "newly created" at app launch.
+            int idx = recordingFileName.LastIndexOf("recording_", StringComparison.OrdinalIgnoreCase);
+            string stamp = idx >= 0
+                ? recordingFileName.Substring(idx + "recording_".Length)
+                : recordingFileName;
+            if (DateTime.TryParseExact(
+                    stamp,
+                    "yyyyMMdd_HHmmss",
+                    System.Globalization.CultureInfo.InvariantCulture,
+                    System.Globalization.DateTimeStyles.AssumeLocal,
+                    out var localTime))
+            {
+                return localTime.ToUniversalTime().ToString("o");
+            }
+
+            return DateTime.UtcNow.ToString("o");
+        }
+
+        void PruneOrphanedEntries()
+        {
+            if (queue == null) return;
+            queue.entries.RemoveAll(e =>
+                string.IsNullOrEmpty(e.recordingFileName) ||
+                RecordingStorage.LoadRecording(e.recordingFileName) == null);
         }
 
         /// <summary>Persist the queue across app suspension and re-kick processing when the app returns to the

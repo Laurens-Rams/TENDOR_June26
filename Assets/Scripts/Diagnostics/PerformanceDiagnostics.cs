@@ -31,7 +31,9 @@ namespace BodyTracking.Diagnostics
         [Tooltip("Tag emitted with each record so initial vs post-fix runs can be compared.")]
         public string runId = "baseline";
 
-        private bool hudVisible = true;
+        // On-screen debug HUD is hidden by default so the record screen stays clean (toggle with a 3-finger
+        // tap on device, or F1 in the Editor). Console/NDJSON logging still runs for offline diagnostics.
+        private bool hudVisible = false;
 
         // Frame timing (smoothed + min/max over the interval).
         private float intervalTime;

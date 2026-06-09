@@ -27,33 +27,55 @@ namespace BodyTracking.Diagnostics
         [Tooltip("Master switch for the 3D planes/markers AND the status HUD.")]
         [SerializeField] private bool showVisuals = true;
         [Tooltip("Draw the on-screen colored status panel.")]
-        [SerializeField] private bool showStatusHud = true;
+        [SerializeField] private bool showStatusHud = false;
         [Tooltip("Draw the semi-transparent wall + floor planes.")]
         [SerializeField] private bool showPlanes = true;
         [Tooltip("Draw the per-limb hold-contact markers.")]
         [SerializeField] private bool showContactMarkers = true;
+        [Tooltip("Draw ALL inferred climbing holds on the wall (hands = spheres, feet = cubes), colored by confidence.")]
+        [SerializeField] private bool showHolds = true;
 
         [Header("Appearance")]
         [SerializeField] private float planeSize = 3f;
         [SerializeField] private float markerRadius = 0.06f;
         [SerializeField] private Color wallColor = new Color(0.15f, 0.6f, 1f, 0.22f);
         [SerializeField] private Color floorColor = new Color(0.3f, 1f, 0.4f, 0.22f);
+        [Tooltip("Limb anchored to a known hold.")]
         [SerializeField] private Color contactOnColor = new Color(0.2f, 1f, 0.3f, 0.95f);
-        [SerializeField] private Color contactOffColor = new Color(1f, 1f, 1f, 0.25f);
+        [Tooltip("Limb pushed out of the wall (no hold under it).")]
+        [SerializeField] private Color contactPushColor = new Color(1f, 0.85f, 0.1f, 0.95f);
+        [Tooltip("Limb still inside the wall after correction (failed to reach the surface).")]
+        [SerializeField] private Color contactInsideColor = new Color(1f, 0.2f, 0.15f, 0.95f);
+
+        [Header("Hold overlay")]
+        [Tooltip("Marker size (m) for an inferred hold.")]
+        [SerializeField] private float holdMarkerSize = 0.05f;
+        [Tooltip("Color for a low-confidence (just-guessed) hold.")]
+        [SerializeField] private Color holdLowConfidenceColor = new Color(1f, 0.35f, 0.2f, 1f);
+        [Tooltip("Color for a high-confidence (often-used) hold.")]
+        [SerializeField] private Color holdHighConfidenceColor = new Color(0.2f, 1f, 0.4f, 1f);
 
         public bool ShowVisuals { get => showVisuals; set { showVisuals = value; if (!value) HideAll(); } }
         public bool ShowStatusHud { get => showStatusHud; set => showStatusHud = value; }
+        public bool ShowHolds { get => showHolds; set { showHolds = value; if (!value) HideHoldMarkers(); } }
+        public bool ShowPlanes { get => showPlanes; set => showPlanes = value; }
+        public bool ShowContactMarkers { get => showContactMarkers; set => showContactMarkers = value; }
 
         private GameObject wallQuad;
         private GameObject floorQuad;
         private GameObject[] markers;
         private Material wallMat, floorMat;
-        private Material contactOnMat, contactOffMat;
+        private Material contactOnMat, contactPushMat, contactInsideMat;
+
+        // Hold overlay marker pool (one GameObject per inferred hold; sphere for hands, cube for feet).
+        private readonly System.Collections.Generic.List<GameObject> holdMarkers = new System.Collections.Generic.List<GameObject>();
+        private readonly System.Collections.Generic.List<bool> holdMarkerIsHand = new System.Collections.Generic.List<bool>();
 
         // Cached status for the HUD (refreshed in LateUpdate so the planes/markers and text agree).
         private bool stLocalized, stWall, stFloor, stPlaying;
         private readonly bool[] stContacts = new bool[4];
         private string stWallInfo = "";
+        private int stHoldHands, stHoldFeet;
 
         FusedCharacterPlayer Player()
         {
@@ -101,6 +123,7 @@ namespace BodyTracking.Diagnostics
             UpdateWallQuad(routeRoot, probe);
             UpdateFloorQuad(routeRoot, stFloor, floorY);
             UpdateContactMarkers(p);
+            UpdateHoldMarkers(p, routeRoot);
         }
 
         void UpdateWallQuad(Transform routeRoot, ARSurfaceProbe probe)
@@ -144,8 +167,8 @@ namespace BodyTracking.Diagnostics
         {
             for (int i = 0; i < stContacts.Length; i++) stContacts[i] = false;
 
-            var contacts = p != null ? p.LastWallContacts : null;
-            if (!showContactMarkers || contacts == null)
+            var push = p != null ? p.ContactPushStatus : null;
+            if (!showContactMarkers || push == null)
             {
                 if (markers != null)
                     foreach (var m in markers) SetActive(m, false);
@@ -153,16 +176,26 @@ namespace BodyTracking.Diagnostics
             }
 
             EnsureMarkers();
+            // green = anchored to a hold, yellow = pushed out of the wall (no hold), red = still inside after the fix.
             for (int i = 0; i < markers.Length; i++)
             {
-                bool active = i < contacts.Length && contacts[i].active;
-                stContacts[i] = active;
                 var m = markers[i];
                 if (m == null) continue;
-                if (active)
+                var ps = i < push.Count ? push[i] : default;
+                stContacts[i] = ps.status == PosePenetrationResolver.LimbPushStatus.Anchored;
+
+                Material mat = null;
+                switch (ps.status)
                 {
-                    m.transform.position = contacts[i].targetWorld;
-                    SetRendererMaterial(m, contactOnMat);
+                    case PosePenetrationResolver.LimbPushStatus.Anchored: mat = contactOnMat; break;
+                    case PosePenetrationResolver.LimbPushStatus.PushedOut: mat = contactPushMat; break;
+                    case PosePenetrationResolver.LimbPushStatus.Inside: mat = contactInsideMat; break;
+                }
+
+                if (mat != null)
+                {
+                    m.transform.position = ps.world;
+                    SetRendererMaterial(m, mat);
                     m.transform.localScale = Vector3.one * markerRadius * 2f;
                     SetActive(m, true);
                 }
@@ -171,6 +204,93 @@ namespace BodyTracking.Diagnostics
                     SetActive(m, false);
                 }
             }
+        }
+
+        void UpdateHoldMarkers(FusedCharacterPlayer p, Transform routeRoot)
+        {
+            stHoldHands = 0;
+            stHoldFeet = 0;
+
+            var map = p != null ? p.HoldMap : null;
+            if (!showHolds || map == null)
+            {
+                HideHoldMarkers();
+                return;
+            }
+
+            var holds = map.Holds;
+            for (int i = 0; i < holds.Count; i++)
+            {
+                var hold = holds[i];
+                if (hold.isHand) stHoldHands++; else stHoldFeet++;
+
+                var marker = EnsureHoldMarker(i, hold.isHand);
+                if (marker == null) continue;
+
+                marker.transform.position = hold.ToWorld(routeRoot);
+                marker.transform.localScale = Vector3.one * holdMarkerSize;
+                SetMarkerColor(marker, ConfidenceColor(hold.Confidence));
+                SetActive(marker, true);
+            }
+
+            // Hide any pooled markers beyond the current hold count.
+            for (int i = holds.Count; i < holdMarkers.Count; i++)
+                SetActive(holdMarkers[i], false);
+        }
+
+        GameObject EnsureHoldMarker(int index, bool isHand)
+        {
+            // Grow the pool as needed.
+            while (holdMarkers.Count <= index)
+            {
+                holdMarkers.Add(null);
+                holdMarkerIsHand.Add(false);
+            }
+            // (Re)create the primitive if missing or the hand/foot shape doesn't match.
+            if (holdMarkers[index] == null || holdMarkerIsHand[index] != isHand)
+            {
+                if (holdMarkers[index] != null) Destroy(holdMarkers[index]);
+                holdMarkers[index] = MakeHoldMarker(isHand);
+                holdMarkerIsHand[index] = isHand;
+            }
+            return holdMarkers[index];
+        }
+
+        GameObject MakeHoldMarker(bool isHand)
+        {
+            // Hands = spheres, feet = cubes, so foot-holds read as visually distinct from hand-holds.
+            var go = GameObject.CreatePrimitive(isHand ? PrimitiveType.Sphere : PrimitiveType.Cube);
+            go.name = isHand ? "Hold_Hand" : "Hold_Foot";
+            go.transform.SetParent(transform, false);
+            var col = go.GetComponent<Collider>();
+            if (col != null) Destroy(col);
+            SetRendererMaterial(go, DebugVisualizationMaterials.CreateTransparentColorMaterial(Color.white));
+            go.SetActive(false);
+            return go;
+        }
+
+        Color ConfidenceColor(float confidence)
+        {
+            float c = Mathf.Clamp01(confidence);
+            var col = Color.Lerp(holdLowConfidenceColor, holdHighConfidenceColor, c);
+            col.a = Mathf.Lerp(0.3f, 0.9f, c); // faint guesses stay translucent; sure holds read solid
+            return col;
+        }
+
+        static void SetMarkerColor(GameObject go, Color color)
+        {
+            if (go == null) return;
+            var r = go.GetComponent<Renderer>();
+            var m = r != null ? r.sharedMaterial : null;
+            if (m == null) return;
+            if (m.HasProperty("_BaseColor")) m.SetColor("_BaseColor", color);
+            if (m.HasProperty("_Color")) m.SetColor("_Color", color);
+        }
+
+        void HideHoldMarkers()
+        {
+            for (int i = 0; i < holdMarkers.Count; i++)
+                SetActive(holdMarkers[i], false);
         }
 
         // ---- HUD ----------------------------------------------------------------------------------
@@ -191,7 +311,7 @@ namespace BodyTracking.Diagnostics
             float y = pad;
 
             GUI.color = new Color(0f, 0f, 0f, 0.55f);
-            GUI.DrawTexture(new Rect(x - 6f, y - 6f, w, lineH * 8f + 12f), Texture2D.whiteTexture);
+            GUI.DrawTexture(new Rect(x - 6f, y - 6f, w, lineH * 9f + 12f), Texture2D.whiteTexture);
             GUI.color = Color.white;
 
             DrawStatus("Localized (RouteRoot)", stLocalized, ref x, ref y, lineH);
@@ -204,6 +324,10 @@ namespace BodyTracking.Diagnostics
             DrawStatus("Contact L-hand", stContacts[0], ref x, ref y, lineH);
             DrawStatus("Contact R-hand", stContacts[1], ref x, ref y, lineH);
             DrawStatus("Contact L-foot / R-foot", stContacts[2] || stContacts[3], ref x, ref y, lineH);
+            GUI.color = Color.white;
+            GUI.Label(new Rect(x, y, Screen.width * 0.5f, lineH),
+                $"Holds: {stHoldHands + stHoldFeet} (hands {stHoldHands} / feet {stHoldFeet})", hudStyle);
+            y += lineH;
         }
 
         void DrawStatus(string label, bool on, ref float x, ref float y, float lineH)
@@ -233,7 +357,8 @@ namespace BodyTracking.Diagnostics
         {
             if (markers != null) return;
             if (contactOnMat == null) contactOnMat = DebugVisualizationMaterials.CreateSolidColorMaterial(contactOnColor);
-            if (contactOffMat == null) contactOffMat = DebugVisualizationMaterials.CreateTransparentColorMaterial(contactOffColor);
+            if (contactPushMat == null) contactPushMat = DebugVisualizationMaterials.CreateSolidColorMaterial(contactPushColor);
+            if (contactInsideMat == null) contactInsideMat = DebugVisualizationMaterials.CreateSolidColorMaterial(contactInsideColor);
             string[] names = { "Contact_LeftHand", "Contact_RightHand", "Contact_LeftFoot", "Contact_RightFoot" };
             markers = new GameObject[4];
             for (int i = 0; i < 4; i++)
@@ -289,6 +414,7 @@ namespace BodyTracking.Diagnostics
             SetActive(floorQuad, false);
             if (markers != null)
                 foreach (var m in markers) SetActive(m, false);
+            HideHoldMarkers();
         }
 
         void OnDestroy()
@@ -297,6 +423,7 @@ namespace BodyTracking.Diagnostics
             if (floorQuad != null) Destroy(floorQuad);
             if (markers != null)
                 foreach (var m in markers) if (m != null) Destroy(m);
+            foreach (var m in holdMarkers) if (m != null) Destroy(m);
         }
     }
 }

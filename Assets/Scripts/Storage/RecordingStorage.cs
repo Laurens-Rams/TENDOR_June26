@@ -179,9 +179,10 @@ namespace BodyTracking.Storage
             foreach (var fileName in recordings)
             {
                 var metadata = GetRecordingMetadata(fileName, format);
-                if (metadata != null && metadata.recordingTimestamp > bestTimestamp)
+                DateTime candidateTimestamp = ResolveRecordingTimestamp(metadata, fileName, format);
+                if (candidateTimestamp > bestTimestamp)
                 {
-                    bestTimestamp = metadata.recordingTimestamp;
+                    bestTimestamp = candidateTimestamp;
                     bestFile = fileName;
                 }
             }
@@ -367,6 +368,9 @@ namespace BodyTracking.Storage
             using var _ = PerfSampler.Scope("Storage.ScanMetadataJson");
             string json = File.ReadAllText(filePath);
             int frameCount = CountOccurrences(json, "\"timestamp\"");
+            DateTime recordingTimestamp = TryParseTimestampFromFileName(fileName, out var parsedTimestamp)
+                ? parsedTimestamp
+                : fileInfo.LastWriteTime;
             var metadata = new RecordingMetadata
             {
                 fileName = fileName,
@@ -376,7 +380,7 @@ namespace BodyTracking.Storage
                 // above zero is enough to avoid parsing every saved joint array while opening the UI.
                 validFrameCount = frameCount,
                 frameRate = ExtractFloat(json, "frameRate"),
-                recordingTimestamp = DateTime.MinValue,
+                recordingTimestamp = recordingTimestamp,
                 fileSizeBytes = fileInfo.Length,
                 format = format,
                 mapId = ExtractString(json, "mapId") ?? "",
@@ -384,6 +388,47 @@ namespace BodyTracking.Storage
             };
             StoreMetadata(filePath, metadata);
             return metadata;
+        }
+
+        static DateTime ResolveRecordingTimestamp(RecordingMetadata metadata, string fileName, StorageFormat format)
+        {
+            if (metadata != null && metadata.recordingTimestamp > DateTime.MinValue)
+                return metadata.recordingTimestamp;
+
+            if (TryParseTimestampFromFileName(fileName, out var parsed))
+                return parsed;
+
+            try
+            {
+                string path = GetFilePath(fileName, format);
+                if (File.Exists(path))
+                    return File.GetLastWriteTime(path);
+            }
+            catch
+            {
+                // Best-effort fallback only.
+            }
+
+            return DateTime.MinValue;
+        }
+
+        static bool TryParseTimestampFromFileName(string fileName, out DateTime parsed)
+        {
+            parsed = DateTime.MinValue;
+            if (string.IsNullOrEmpty(fileName))
+                return false;
+
+            int idx = fileName.LastIndexOf("recording_", StringComparison.OrdinalIgnoreCase);
+            string stamp = idx >= 0
+                ? fileName.Substring(idx + "recording_".Length)
+                : fileName;
+
+            return DateTime.TryParseExact(
+                stamp,
+                "yyyyMMdd_HHmmss",
+                System.Globalization.CultureInfo.InvariantCulture,
+                System.Globalization.DateTimeStyles.None,
+                out parsed);
         }
 
         static int CountOccurrences(string text, string token)

@@ -44,6 +44,8 @@ namespace BodyTracking.MoveAI
         public int attempts;
         /// <summary>ISO-8601 UTC enqueue time, for ordering/diagnostics.</summary>
         public string enqueuedUtc = DateTime.UtcNow.ToString("o");
+        /// <summary>Last reported pipeline progress (0–100), or -1 when unknown/not in flight.</summary>
+        public float progressPercent = -1f;
 
         public MoveQueueState State
         {

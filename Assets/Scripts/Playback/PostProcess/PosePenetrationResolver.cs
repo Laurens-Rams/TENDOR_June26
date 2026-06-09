@@ -15,6 +15,11 @@ namespace BodyTracking.Playback.PostProcess
                  "this height (m) above the floor. Stops a mid-wall climbing pose — where a low foot happens to dangle " +
                  "near the floor plane — from lifting (floating) the whole climber. 0 = disabled (legacy behaviour).")]
         public float maxStandingHipHeightAboveFloor;
+        [Tooltip("How far (m) a standing pose may be DROPPED down onto the floor when it is floating above it. The floor " +
+                 "fix is bidirectional: a foot sunk into the floor is lifted up, and a foot floating above it (within this " +
+                 "distance, and below the hip-height climbing guard) is snapped back down so the lowest foot rests on the " +
+                 "floor. 0 = only correct feet that are at/below the floor (legacy: never drop a floating pose).")]
+        public float maxFloorSnapMeters;
 
         [Header("Wall (climbing)")]
         [Tooltip("Pin a hand to the wall surface (two-bone IK) when it sinks through the wall.")]
@@ -49,6 +54,7 @@ namespace BodyTracking.Playback.PostProcess
             enableFloorFix = false,
             floorContactBand = 0.12f,
             maxStandingHipHeightAboveFloor = 1.3f,
+            maxFloorSnapMeters = 0.5f,
             enableWallHandIK = true,
             enableWallFootIK = true,
             maxIkWeight = 1f,
@@ -72,11 +78,26 @@ namespace BodyTracking.Playback.PostProcess
     /// </summary>
     public sealed class PosePenetrationResolver
     {
+        /// <summary>Per-limb result of the contact push-out, for debug coloring.</summary>
+        public enum LimbPushStatus { None, Anchored, PushedOut, Inside }
+
+        public struct LimbPush
+        {
+            public LimbPushStatus status;
+            public Vector3 world; // the limb tip world position after correction
+        }
+
         ARSurfaceProbe probe;
         bool lastStanding;
 
+        // Indexed by (int)WallProjectionResolver.ClimbLimb (LeftHand, RightHand, LeftFoot, RightFoot).
+        readonly LimbPush[] limbPush = new LimbPush[4];
+
         public void SetProbe(ARSurfaceProbe p) => probe = p;
         public bool LastClassifiedStanding => lastStanding;
+
+        /// <summary>Latest per-limb push-out status (for the debug overlay). Index = ClimbLimb.</summary>
+        public System.Collections.Generic.IReadOnlyList<LimbPush> LastLimbPush => limbPush;
 
         /// <summary>
         /// World-array phase. <paramref name="footWorldIndices"/> are joint indices of the feet (ankles/toes).
@@ -127,16 +148,31 @@ namespace BodyTracking.Playback.PostProcess
 
                 if (lowestFoot < float.MaxValue)
                 {
-                    standing = lowestFoot <= floorY + s.floorContactBand;
-                    // Climbing guard: a mid-wall pose can have a trailing foot dangle near the floor plane. Only count
-                    // it as standing (and lift it) when the hips are low enough to plausibly be on the ground.
-                    if (standing && s.maxStandingHipHeightAboveFloor > 0f && !float.IsNaN(queryY) &&
-                        queryY - floorY > s.maxStandingHipHeightAboveFloor)
-                        standing = false;
-                    if (standing && !jumping && s.enableFloorFix && lowestFoot < floorY)
+                    float footAboveFloor = lowestFoot - floorY; // <0 sunk into floor, >0 floating above it
+
+                    // Climbing guard: a mid-wall pose can have a trailing foot dangle near the floor plane. Only treat
+                    // a pose as standing (and snap it to the floor) when the hips are low enough to plausibly be grounded.
+                    bool hipsLowEnough = s.maxStandingHipHeightAboveFloor <= 0f || float.IsNaN(queryY) ||
+                                         (queryY - floorY) <= s.maxStandingHipHeightAboveFloor;
+
+                    // The downward snap range: how far a floating pose may be pulled back onto the floor. Falls back to
+                    // the contact band when not configured, so the snap is at least symmetric with the touch tolerance.
+                    float snapDown = Mathf.Max(s.floorContactBand, Mathf.Max(0f, s.maxFloorSnapMeters));
+
+                    // "Standing" = the lowest foot is at/below the floor or floating within the snap range, and the hips
+                    // are low enough. This now includes floating ground poses so they get pulled DOWN, not just lifted up.
+                    standing = hipsLowEnough && footAboveFloor <= snapDown;
+
+                    if (standing && !jumping && s.enableFloorFix)
                     {
-                        float lift = floorY - lowestFoot; // only lift up; never push a floating pose down
-                        for (int i = 0; i < world.Length; i++) world[i] += new Vector3(0f, lift, 0f);
+                        // Bidirectional: lift up when the foot is sunk into the floor, drop down when it floats above it,
+                        // so the lowest foot ends up resting exactly on the floor plane.
+                        float delta = floorY - lowestFoot; // >0 lift up, <0 drop down
+                        // Cap the downward drop so a noisy floor probe can't slam a high pose to the ground.
+                        if (delta < 0f)
+                            delta = Mathf.Max(delta, -snapDown);
+                        if (Mathf.Abs(delta) > 1e-4f)
+                            for (int i = 0; i < world.Length; i++) world[i] += new Vector3(0f, delta, 0f);
                     }
 
                     if (s.debugDraw && rootIndex >= 0 && rootIndex < world.Length)
@@ -207,6 +243,94 @@ namespace BodyTracking.Playback.PostProcess
                         break;
                 }
             }
+        }
+
+        /// <summary>
+        /// Always-on contact push-out: for every hand/foot tip that sits BEHIND the wall skin (depth &lt; the slab's
+        /// wall-surface depth), pin the tip back onto the surface with two-bone IK. Unlike <see cref="ResolveLimbs"/>
+        /// this uses the SAME flat wall plane the depth slab uses (passed in) instead of the AR probe, and it is NOT
+        /// gated by the standing classification — so a GLB limb that the slab can't reach (the slab only moves world
+        /// joints, not the muscle-space mesh) is reliably brought out of the wall regardless of pose. Limbs already
+        /// latched to a hold (<paramref name="holdContacts"/> with kind Hold) are skipped so the two passes don't fight.
+        /// Records per-limb status for the debug overlay (green = on hold, yellow = pushed out, red = still inside).
+        /// </summary>
+        public void ResolveContactPlane(Animator animator, WallProjectionResolver.WallContact[] holdContacts,
+            Vector3 wallPoint, Vector3 wallNormal, float surfaceDepth, bool jumping, in PenetrationSettings s)
+        {
+            for (int i = 0; i < limbPush.Length; i++)
+                limbPush[i] = new LimbPush { status = LimbPushStatus.None, world = Vector3.zero };
+
+            if (animator == null || !animator.isHuman) return;
+            if (jumping && s.skipDuringJump) return;
+            if (wallNormal.sqrMagnitude < 1e-8f) return;
+            wallNormal.Normalize();
+
+            if (s.enableWallHandIK)
+            {
+                PushTipToPlane(animator, WallProjectionResolver.ClimbLimb.LeftHand, holdContacts,
+                    HumanBodyBones.LeftUpperArm, HumanBodyBones.LeftLowerArm, HumanBodyBones.LeftHand,
+                    wallPoint, wallNormal, surfaceDepth, s);
+                PushTipToPlane(animator, WallProjectionResolver.ClimbLimb.RightHand, holdContacts,
+                    HumanBodyBones.RightUpperArm, HumanBodyBones.RightLowerArm, HumanBodyBones.RightHand,
+                    wallPoint, wallNormal, surfaceDepth, s);
+            }
+            if (s.enableWallFootIK)
+            {
+                PushTipToPlane(animator, WallProjectionResolver.ClimbLimb.LeftFoot, holdContacts,
+                    HumanBodyBones.LeftUpperLeg, HumanBodyBones.LeftLowerLeg, FootTip(animator, HumanBodyBones.LeftToes, HumanBodyBones.LeftFoot),
+                    wallPoint, wallNormal, surfaceDepth, s);
+                PushTipToPlane(animator, WallProjectionResolver.ClimbLimb.RightFoot, holdContacts,
+                    HumanBodyBones.RightUpperLeg, HumanBodyBones.RightLowerLeg, FootTip(animator, HumanBodyBones.RightToes, HumanBodyBones.RightFoot),
+                    wallPoint, wallNormal, surfaceDepth, s);
+            }
+        }
+
+        void PushTipToPlane(Animator animator, WallProjectionResolver.ClimbLimb limb,
+            WallProjectionResolver.WallContact[] holdContacts, HumanBodyBones rootBone, HumanBodyBones midBone,
+            HumanBodyBones tipBone, Vector3 wallPoint, Vector3 wallNormal, float surfaceDepth, in PenetrationSettings s)
+        {
+            int li = (int)limb;
+            // A limb anchored to a hold is already being pinned to the surface by the hold pass — leave it alone.
+            if (holdContacts != null && li < holdContacts.Length && holdContacts[li].active &&
+                holdContacts[li].kind == WallProjectionResolver.ContactKind.Hold)
+            {
+                limbPush[li] = new LimbPush { status = LimbPushStatus.Anchored, world = holdContacts[li].targetWorld };
+                return;
+            }
+
+            Transform root = animator.GetBoneTransform(rootBone);
+            Transform mid = animator.GetBoneTransform(midBone);
+            Transform tip = animator.GetBoneTransform(tipBone);
+            if (root == null || mid == null || tip == null) return;
+
+            float depth = Vector3.Dot(tip.position - wallPoint, wallNormal);
+            float pen = surfaceDepth - depth; // >0 => the tip is behind the wall skin (inside the wall)
+            if (pen <= 0f)
+            {
+                limbPush[li] = new LimbPush { status = LimbPushStatus.None, world = tip.position };
+                return;
+            }
+
+            Vector3 target = tip.position + pen * wallNormal; // straight out onto the wall skin
+            float weight = Mathf.Clamp01(s.maxIkWeight <= 0f ? 1f : s.maxIkWeight);
+            Vector3 hint = mid.position + wallNormal * 0.1f;
+
+            if (s.debugDraw)
+            {
+                Debug.DrawLine(tip.position, target, Color.red);
+                Debug.DrawRay(target, wallNormal * 0.1f, Color.yellow);
+            }
+
+            LimbIKSolver.Solve(root, mid, tip, target, weight, hint);
+
+            // Re-measure after the solve: if the tip reached the skin it's a clean push-out (yellow); if it still
+            // can't reach (limb too short / weight capped) flag it inside (red) so it's visible in the overlay.
+            float postDepth = Vector3.Dot(tip.position - wallPoint, wallNormal);
+            limbPush[li] = new LimbPush
+            {
+                status = postDepth < surfaceDepth - 0.01f ? LimbPushStatus.Inside : LimbPushStatus.PushedOut,
+                world = tip.position,
+            };
         }
 
         // Prefer the toe bone (front of the shoe) as the foot IK effector; fall back to the ankle on rigs that have

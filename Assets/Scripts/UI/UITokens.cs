@@ -91,6 +91,8 @@ namespace BodyTracking.UI
         public const float TransportSecondaryDiameter = 46f;
         /// <summary>Height of the status pills in the top bar.</summary>
         public const float PillHeight = 28f;
+        /// <summary>Top-left round toolbar icons (screen toggle, settings) — matches playback side controls.</summary>
+        public const float ToolbarIconDiameter = 44f;
         /// <summary>Height of the scrub/timeline slider track.</summary>
         public const float ScrubTrackHeight = 5f;
         /// <summary>Diameter of the scrub handle.</summary>
@@ -104,7 +106,7 @@ namespace BodyTracking.UI
         public static readonly Color PlaybackNode = new Color(0.06f, 0.18f, 0.14f, 0.68f);
         public static readonly Color PlaybackNodeActive = new Color(0f, 0.82f, 0.72f, 0.82f);
         public static readonly Color PlaybackPlayhead = new Color(0f, 0.82f, 0.72f, 0.78f);
-        /// <summary>Secondary transport circles (−2, +2, speed, loop).</summary>
+        /// <summary>Secondary transport circles (−, +, speed, loop).</summary>
         public static readonly Color PlaybackTransportBtn = new Color(0.10f, 0.12f, 0.12f, 0.48f);
         /// <summary>Primary play/pause — teal to match the timeline, not system blue.</summary>
         public static readonly Color PlaybackTransportPlay = new Color(0f, 0.82f, 0.72f, 0.62f);

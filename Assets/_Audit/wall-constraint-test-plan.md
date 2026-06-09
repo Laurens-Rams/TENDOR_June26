@@ -237,37 +237,44 @@ Compared to Step 1 at same moments:
 
 ---
 
-## Step 3 — Contact lock (hold grabbing)
+## Step 3 — Snap onto holds (hold-gated, no speed)
+
+> **New model:** holds are detected **offline** (whole-recording scan) and playback only **reads** them. A hand/foot
+> is pulled onto the wall **only** when it is over a known hold AND close to the wall — there is **no live speed
+> gate** anymore. A limb with no hold under it (reaching through the air) is left floating, never stuck to the wall.
 
 **Add:**
 
 | Setting | Value |
 |---------|-------|
-| Hold contact lock | **On** |
-| Contact depth band | **0.14** |
-| Contact stillness | **0.08** |
-| Contact release | **0.25** |
-| Contact ease | **0.12** |
+| Auto-detect holds | **On** |
+| Snap hands/feet onto holds | **On** |
+| Snap depth band | **0.18** |
+| Snap radius | **0.12** |
+| Snap ease | **0.12** |
+
+- [ ] Tap **Regenerate holds from recording** once (or just play — it auto-builds on first load)
+- [ ] Turn **Show holds overlay** On to confirm holds sit on the real holds
 
 **Pass criteria:**
 
-- [ ] HUD: **Contact L-hand / R-hand / feet** go ● green while gripping
-- [ ] Green marker dots appear on locked limbs
-- [ ] Hands/feet stop jittering on holds
+- [ ] HUD: **Contact L-hand / R-hand / feet** go ● green while gripping a detected hold
+- [ ] Green marker dots appear on snapped limbs, exactly on the hold (no per-grab jitter)
+- [ ] A hand **reaching between holds** stays free (not stuck to a blank wall)
 
 **Pass:** [ ] Yes  [ ] No  
 
 **If fail, try:**
 
-- [ ] Contact depth band → **0.18**
-- [ ] Contact stillness → **0.05**
-- [ ] Contact release → **0.35** *(if hands feel stuck)*
+- [ ] Holds missing on the overlay → lower **Detect stillness** (e.g. 0.05) / **Hold dwell** (e.g. 0.2), then Regenerate
+- [ ] Limb won't snap onto a real hold → raise **Snap depth band** (0.25) or **Snap radius** (0.16)
+- [ ] Limb grabs a hold it isn't really on → lower **Snap radius** (0.08) and/or **Snap depth band** (0.12)
 
 **Notes:**
 
 ```
-Hands lock: [ ] good  [ ] never  [ ] too sticky
-Feet lock:  [ ] good  [ ] never  [ ] too sticky
+Hands snap: [ ] good  [ ] never  [ ] grabs wrong hold
+Feet snap:  [ ] good  [ ] never  [ ] grabs wrong hold
 ```
 
 ---
@@ -428,24 +435,34 @@ There are **two separate limb passes**, both run on the rig bones *after* the bo
 - **Strength scales with depth:** weight = `penetration / penetrationForFullWeight`. A hand 1 mm in gets a tiny nudge; a hand 8 cm in gets full correction. So shallow clips don't pop.
 - **Only while climbing:** this pass is skipped when the pose is classified *standing* (Step 4) and during jumps, so a grounded/airborne pose isn't disturbed.
 
-### B. Pull-ON pass (grab the hold) — Step 3
+### B. Pull-ON pass (snap onto a real hold) — Step 3
 
-- The contact detector watches each hand/foot and **latches** it to the wall only when **BOTH**:
-  - it is **near the wall** — within **contact depth band** (default 0.14 m) of the surface, **and**
-  - it is **barely moving** — smoothed speed below **stillness speed** (default 0.08 m/s).
-- When latched, the tip is eased onto the locked surface point (two-bone IK again, same single-limb rule).
-- It **releases** the moment the hand speeds up past **release speed** (0.25 m/s) or its depth grows past ~1.6× the band.
+- Holds are found **offline** by scanning the whole recording (where a limb rested still long enough becomes a hold).
+  Playback reads that map; it **never** uses limb speed.
+- At playback each hand/foot **latches** onto the nearest known hold only when **BOTH**:
+  - it is **over a hold** — within **snap radius** (default 0.12 m) in the along-wall plane, of the matching kind
+    (hand-hold vs foot-hold), **and**
+  - it is **close to the wall** — within **snap depth band** (default 0.18 m) of the surface.
+- When latched, the tip is eased onto the hold's stable point (two-bone IK, same single-limb rule).
+- It **releases** geometrically: once the limb leaves the hold's neighbourhood (moves on toward the next hold) or
+  lifts clearly off the surface (~1.8× the band). No speed threshold.
 
 ### How we DON'T pin a hand that's actually off the wall in reality
 
-This is the key question. A reaching/swinging hand out in the air is **never pulled to the wall**, because:
+A reaching/swinging hand out in the air is **never pulled to the wall**, because:
 
-1. **Depth gate:** if the hand's depth is bigger than the contact band, it fails the "near the wall" test → no latch. A hand reaching out at 0.4 m is far outside the 0.14 m band.
-2. **Stillness gate:** a moving hand (reaching, matching, flagging) is above the stillness speed → no latch. Only a hand that is *both close AND still* (i.e. actually resting on a hold) latches.
-3. **Hysteresis release:** once moving, it lets go immediately and won't re-grab until it's close + still again — so a hand that lifts off a hold isn't dragged back.
-4. **The push-out pass only fires on penetration:** if a hand is out in the air (not inside the wall), there is nothing to push, so it's left exactly where the capture put it.
+1. **No hold = no snap:** the limb only snaps onto a point that the offline detector recorded as a real hold. Blank
+   wall has no hold, so a hand over blank wall is left exactly where the capture put it (then clamped out by the slab).
+2. **U/V gate:** while reaching *between* holds, the hand is not within snap radius of any hold → no latch. It only
+   engages once it actually arrives over the destination hold.
+3. **Depth gate:** a hand floating far out (beyond the snap depth band) won't snap even if it drifts over a hold's
+   U/V — it has to come in close to the wall, i.e. actually be placed.
+4. **The push-out pass only fires on penetration:** if a hand is out in the air (not inside the wall), there is
+   nothing to push, so it's left exactly where the capture put it.
 
-So the only thing that gets pulled onto the wall is a hand the climber is genuinely holding still near the surface. The slab clamp (Step 2) separately caps how far *any* joint can float out, but it does **not** pull hands onto the wall — it only stops them sinking behind it or ballooning unrealistically far out.
+So the only thing pulled onto the wall is a hand/foot the climber genuinely placed on a detected hold. The slab clamp
+(Step 2) separately caps how far *any* joint can float out and pushes everything out of the wall — but it does **not**
+pull limbs onto the wall.
 
 ### What to watch for to confirm it looks good
 
@@ -455,8 +472,8 @@ So the only thing that gets pulled onto the wall is a hand the climber is genuin
 - [ ] Correcting one hand does **not** twist the shoulders/hips or move the other limbs
 - [ ] Releasing a hold happens **instantly** as the hand starts moving (no rubber-banding)
 
-**If a reaching hand wrongly sticks to the wall:** lower **contact depth band** (e.g. 0.10 m) and/or **stillness speed** (e.g. 0.05 m/s) so only truly-planted hands latch.
-**If a planted hand flickers off:** raise **contact depth band** slightly, or widen the gap between stillness and release speed.
+**If a reaching hand wrongly sticks to the wall:** lower **snap radius** (e.g. 0.08 m) and/or **snap depth band** (e.g. 0.12 m) so a limb only latches when it is genuinely on a hold.
+**If a planted hand won't snap:** raise **snap depth band** / **snap radius** slightly, or make sure the hold was detected (Show holds overlay → Regenerate).
 
 ---
 
@@ -466,9 +483,10 @@ So the only thing that gets pulled onto the wall is a hand the climber is genuin
 |---------|---------------|-----------------|
 | Inside wall | 2 + 0 | Wall depth offset, wall surface depth |
 | Floating off wall | 2 | Lower max body depth |
-| Hands swim on holds | 3 | Contact depth band / stillness |
-| Reaching hand sticks to wall | 3 | Lower contact depth band + stillness speed |
-| Planted hand flickers on/off | 3 | Raise depth band; widen stillness↔release gap |
+| Hands swim on holds | 3 | Snap depth band / snap radius; check holds detected |
+| Reaching hand sticks to wall | 3 | Lower snap radius + snap depth band |
+| Limb won't snap onto a real hold | 3 | Raise snap depth band / snap radius; Regenerate holds |
+| No holds detected | 3 | Lower Detect stillness / Hold dwell, then Regenerate |
 | One fix twists torso/other limb | 5 | Shouldn't happen (single-limb IK) — report it |
 | Whole body lifts mid-climb | 4 | Max standing hip height or floor fix off |
 | GLB hands clip wall | 5 | Max IK weight |

@@ -1020,8 +1020,8 @@ namespace BodyTracking
                 player.SeekToTime(time);
         }
 
-        /// <summary>Step forward/back by two frames on the active timeline.</summary>
-        public void StepPlaybackTwoFrames(int direction)
+        /// <summary>Step forward/back by one frame on the active timeline.</summary>
+        public void StepPlaybackFrame(int direction)
         {
             if (direction == 0) return;
 
@@ -1033,7 +1033,7 @@ namespace BodyTracking
                 PausePlayback();
             }
 
-            int delta = direction > 0 ? 2 : -2;
+            int delta = direction > 0 ? 1 : -1;
             if (IsFusedPlaying)
                 fusionCoordinator.StepFusedFrames(delta);
             else if (player != null)

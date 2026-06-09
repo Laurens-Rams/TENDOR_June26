@@ -2,18 +2,22 @@ using System;
 using TMPro;
 using UnityEngine;
 using UnityEngine.UI;
+using BodyTracking;
 using BodyTracking.Playback;
 using BodyTracking.Playback.PostProcess;
 using BodyTracking.MoveAI;
 using BodyTracking.Animation;
 using BodyTracking.Diagnostics;
 using BodyTracking.AR;
+using BodyTracking.Spatial;
 
 namespace BodyTracking.UI
 {
-    /// <summary>Top-level tabs in the tuning sheet (four categories only).</summary>
+    /// <summary>Top-level tabs in the tuning sheet.</summary>
     public enum TuningCategory
     {
+        /// <summary>Map switch, localization, session debug view.</summary>
+        General,
         /// <summary>Wall constraint test plan: slab, calibration, contact lock, debug planes.</summary>
         Wall,
         /// <summary>Penetration / floor gate / wall IK (test plan steps 4–5).</summary>
@@ -71,12 +75,33 @@ namespace BodyTracking.UI
         private Image[] categoryTabImages;
         private TextMeshProUGUI[] categoryTabLabels;
 
-        private static readonly string[] CategoryTabLabels = { "Wall", "IK", "Pose", "Play" };
+        private static readonly string[] CategoryTabLabels = { "Gen", "Wall", "IK", "Pose", "Play" };
+
+        private ImmersalMapSwitcher mapSwitcher;
+        private TMP_InputField mapIdInput;
+        private TextMeshProUGUI mapStatusLabel;
+        private Button mapLoadButton;
+        private RectTransform mapStrip;
+        private RectTransform scrollViewport;
+        private bool mapEventsSubscribed;
+
+        private const float MapStripHeight = 112f;
+
+        private DebugVisualsController debugVisuals;
 
         public Button BackButton => backButton;
         public TuningCategory ActiveCategory => activeCategory;
 
         void OnEnable() => EnsureInitialized();
+
+        void OnDestroy()
+        {
+            if (mapSwitcher != null)
+            {
+                mapSwitcher.OnStatusChanged -= OnMapStatusChanged;
+                mapSwitcher.OnMapSwitched -= OnMapSwitched;
+            }
+        }
 
         public void SetVisible(bool visible)
         {
@@ -85,7 +110,11 @@ namespace BodyTracking.UI
             if (uiRoot != null)
                 uiRoot.gameObject.SetActive(visible);
             if (visible)
+            {
+                UpdateMapStripLayout();
+                RefreshMapStatusLabel();
                 RebuildRows();
+            }
         }
 
         private FusedCharacterPlayer Player()
@@ -120,6 +149,66 @@ namespace BodyTracking.UI
                 visualizer = UnityEngine.Object.FindFirstObjectByType<WallFloorDebugVisualizer>(FindObjectsInactive.Include);
             }
             return visualizer;
+        }
+
+        /// <summary>Find or create the blue/green wall debug overlay (not always present in the scene).</summary>
+        private WallFloorDebugVisualizer EnsureVisualizer()
+        {
+            var v = Visualizer();
+            if (v != null) return v;
+
+            var host = Player()?.gameObject ?? Controller()?.gameObject ?? gameObject;
+            visualizer = host.AddComponent<WallFloorDebugVisualizer>();
+            searchedVisualizer = true;
+            return visualizer;
+        }
+
+        private void EnableWallPlanePreview()
+        {
+            var viz = EnsureVisualizer();
+            if (viz == null) return;
+            viz.ShowVisuals = true;
+            viz.ShowPlanes = true;
+        }
+
+        private DebugVisualsController EnsureDebugVisuals()
+        {
+            if (debugVisuals == null)
+                debugVisuals = UnityEngine.Object.FindFirstObjectByType<DebugVisualsController>(FindObjectsInactive.Include);
+            if (debugVisuals == null)
+                debugVisuals = gameObject.AddComponent<DebugVisualsController>();
+            return debugVisuals;
+        }
+
+        private bool EnsureMapSwitcher()
+        {
+            if (mapSwitcher != null)
+                return true;
+
+            mapSwitcher = UnityEngine.Object.FindFirstObjectByType<ImmersalMapSwitcher>();
+            if (mapSwitcher == null)
+            {
+                var c = Controller();
+                RouteRootManager rrm = c != null ? c.routeRootManager : null;
+                if (rrm == null)
+                    rrm = UnityEngine.Object.FindFirstObjectByType<RouteRootManager>();
+                GameObject host = rrm != null ? rrm.gameObject : (c != null ? c.gameObject : null);
+                if (host != null)
+                {
+                    mapSwitcher = host.GetComponent<ImmersalMapSwitcher>();
+                    if (mapSwitcher == null)
+                        mapSwitcher = host.AddComponent<ImmersalMapSwitcher>();
+                }
+            }
+
+            if (mapSwitcher != null && !mapEventsSubscribed)
+            {
+                mapSwitcher.OnStatusChanged += OnMapStatusChanged;
+                mapSwitcher.OnMapSwitched += OnMapSwitched;
+                mapEventsSubscribed = true;
+            }
+
+            return mapSwitcher != null;
         }
 
         private CharacterMouth mouth;
@@ -163,6 +252,7 @@ namespace BodyTracking.UI
             Player();
             Coordinator();
             Controller();
+            EnsureMapSwitcher();
             BuildShell();
             initialized = true;
         }
@@ -219,18 +309,19 @@ namespace BodyTracking.UI
             br.anchoredPosition = new Vector2(-UITokens.Space8, -UITokens.Space8);
 
             BuildCategoryTabs(sheet);
+            BuildMapStrip(sheet);
 
             float scrollTopInset = HeaderHeight + CategoryTabHeight + UITokens.Space8;
 
             // Scroll view filling the rest of the sheet.
-            var viewport = UIFactory.CreateRect("Viewport", sheet);
-            viewport.anchorMin = new Vector2(0f, 0f);
-            viewport.anchorMax = new Vector2(1f, 1f);
-            viewport.offsetMin = new Vector2(ViewportSideInset, UITokens.Space8);
-            viewport.offsetMax = new Vector2(-ViewportSideInset, -scrollTopInset);
-            viewport.gameObject.AddComponent<RectMask2D>();
+            scrollViewport = UIFactory.CreateRect("Viewport", sheet);
+            scrollViewport.anchorMin = new Vector2(0f, 0f);
+            scrollViewport.anchorMax = new Vector2(1f, 1f);
+            scrollViewport.offsetMin = new Vector2(ViewportSideInset, UITokens.Space8);
+            scrollViewport.offsetMax = new Vector2(-ViewportSideInset, -scrollTopInset);
+            scrollViewport.gameObject.AddComponent<RectMask2D>();
 
-            content = UIFactory.CreateRect("Content", viewport);
+            content = UIFactory.CreateRect("Content", scrollViewport);
             content.anchorMin = new Vector2(0f, 1f);
             content.anchorMax = new Vector2(1f, 1f);
             content.pivot = new Vector2(0.5f, 1f);
@@ -255,14 +346,96 @@ namespace BodyTracking.UI
 
             scrollRect = sheet.gameObject.AddComponent<ScrollRect>();
             scrollRect.content = content;
-            scrollRect.viewport = viewport;
+            scrollRect.viewport = scrollViewport;
             scrollRect.horizontal = false;
             scrollRect.vertical = true;
             scrollRect.movementType = ScrollRect.MovementType.Clamped;
             scrollRect.scrollSensitivity = 20f;
 
+            UpdateMapStripLayout();
             UpdateCategoryTabVisuals();
             uiRoot.gameObject.SetActive(isVisible);
+        }
+
+        /// <summary>Fixed map-id strip (not rebuilt with scroll rows) so the input stays tappable.</summary>
+        private void BuildMapStrip(RectTransform sheet)
+        {
+            EnsureMapSwitcher();
+
+            mapStrip = UIFactory.CreateRect("MapStrip", sheet);
+            mapStrip.anchorMin = new Vector2(0f, 1f);
+            mapStrip.anchorMax = new Vector2(1f, 1f);
+            mapStrip.pivot = new Vector2(0.5f, 1f);
+            mapStrip.anchoredPosition = new Vector2(0f, -(HeaderHeight + CategoryTabHeight));
+            mapStrip.sizeDelta = new Vector2(-ViewportSideInset * 2f, MapStripHeight);
+
+            var bg = mapStrip.gameObject.AddComponent<Image>();
+            bg.sprite = UIFactory.RoundedSprite((int)UITokens.RadiusMedium);
+            bg.type = Image.Type.Sliced;
+            bg.color = UITokens.SurfaceElevated;
+            bg.raycastTarget = true;
+
+            var col = mapStrip.gameObject.AddComponent<VerticalLayoutGroup>();
+            col.padding = new RectOffset((int)UITokens.Space8, (int)UITokens.Space8, (int)UITokens.Space8, (int)UITokens.Space8);
+            col.spacing = UITokens.Space4;
+            col.childAlignment = TextAnchor.UpperLeft;
+            col.childControlWidth = true;
+            col.childControlHeight = true;
+            col.childForceExpandWidth = true;
+            col.childForceExpandHeight = false;
+
+            mapStatusLabel = UIFactory.CreateText("MapStatus", mapStrip, GetActiveMapStatusText(),
+                ValueFontSize, UITokens.Muted, TextAlignmentOptions.Left);
+            ConfigureRowLabel(mapStatusLabel);
+            var statusLe = mapStatusLabel.gameObject.AddComponent<LayoutElement>();
+            statusLe.minHeight = 18f;
+            statusLe.preferredHeight = 18f;
+
+            mapIdInput = UIFactory.CreateInputField("MapIdInput", mapStrip, "e.g. 147190", 40f);
+            var inputLe = mapIdInput.gameObject.AddComponent<LayoutElement>();
+            inputLe.minHeight = 40f;
+            inputLe.preferredHeight = 40f;
+            inputLe.flexibleWidth = 1f;
+            inputLe.minWidth = 0f;
+            if (mapIdInput.textComponent != null)
+                mapIdInput.textComponent.fontSize = LabelFontSize;
+            if (mapIdInput.placeholder is TextMeshProUGUI ph)
+                ph.fontSize = LabelFontSize;
+            SyncMapInput();
+            mapIdInput.onSubmit.AddListener(_ => OnMapLoadClicked());
+
+            mapLoadButton = UIFactory.CreatePillButton("MapLoad", mapStrip, "Load map", ghost: false);
+            var loadLe = mapLoadButton.gameObject.AddComponent<LayoutElement>();
+            loadLe.minHeight = 36f;
+            loadLe.preferredHeight = 36f;
+            loadLe.flexibleWidth = 1f;
+            ConfigureCompactPillLabel(mapLoadButton.GetComponentInChildren<TextMeshProUGUI>());
+            mapLoadButton.onClick.AddListener(OnMapLoadClicked);
+
+            mapStrip.gameObject.SetActive(false);
+        }
+
+        private void UpdateMapStripLayout()
+        {
+            if (mapStrip == null || scrollViewport == null)
+                return;
+
+            bool showMap = isVisible && activeCategory == TuningCategory.General;
+            mapStrip.gameObject.SetActive(showMap);
+            if (showMap)
+                mapStrip.SetAsLastSibling();
+
+            float scrollTopInset = HeaderHeight + CategoryTabHeight + UITokens.Space8;
+            if (showMap)
+                scrollTopInset += MapStripHeight + UITokens.Space4;
+
+            scrollViewport.offsetMax = new Vector2(-ViewportSideInset, -scrollTopInset);
+        }
+
+        private void RefreshMapStatusLabel()
+        {
+            if (mapStatusLabel != null)
+                mapStatusLabel.text = GetActiveMapStatusText();
         }
 
         private void BuildCategoryTabs(RectTransform sheet)
@@ -320,6 +493,7 @@ namespace BodyTracking.UI
             if (activeCategory == category) return;
             activeCategory = category;
             UpdateCategoryTabVisuals();
+            UpdateMapStripLayout();
             RebuildRows();
         }
 
@@ -360,6 +534,9 @@ namespace BodyTracking.UI
 
             switch (activeCategory)
             {
+                case TuningCategory.General:
+                    BuildGeneralCategoryRows(p);
+                    break;
                 case TuningCategory.Wall:
                     BuildWallCategoryRows(p);
                     break;
@@ -380,10 +557,164 @@ namespace BodyTracking.UI
             UpdateCategoryTabVisuals();
         }
 
+        /// <summary>Map switch, localization, and session-level debug view.</summary>
+        private void BuildGeneralCategoryRows(FusedCharacterPlayer p)
+        {
+            AddSection("Localization");
+            AddButton("Re-align Immersal map", () => Controller()?.RealignToImmersal());
+            AddButton("Retarget & re-align Immersal", () => Controller()?.RetargetAndRealignImmersal());
+
+            AddSection("Debug view");
+            var dbg = EnsureDebugVisuals();
+            AddToggle("Skeleton & AR debug overlay", () => dbg.VisualsVisible, v => dbg.SetVisible(v));
+        }
+
+        private string GetActiveMapStatusText()
+        {
+            if (mapSwitcher != null && mapSwitcher.IsSwitching)
+                return $"Loading map {GetActiveMapIdLabel()}…";
+            return $"Active map: {GetActiveMapIdLabel()}";
+        }
+
+        private string GetActiveMapIdLabel()
+        {
+            if (mapSwitcher != null && mapSwitcher.ActiveMapId > 0)
+                return mapSwitcher.ActiveMapId.ToString();
+            var c = Controller();
+            string fromController = c != null ? c.GetActiveMapId() : "";
+            return string.IsNullOrWhiteSpace(fromController) ? "—" : fromController.Trim();
+        }
+
+        private void SyncMapInput()
+        {
+            if (mapIdInput == null || mapIdInput.isFocused)
+                return;
+
+            if (mapSwitcher != null)
+            {
+                int id = mapSwitcher.ActiveMapId > 0
+                    ? mapSwitcher.ActiveMapId
+                    : (mapSwitcher.PendingMapId > 0 ? mapSwitcher.PendingMapId : -1);
+                if (id > 0)
+                {
+                    mapIdInput.text = id.ToString();
+                    return;
+                }
+            }
+
+            var c = Controller();
+            string fromController = c != null ? c.GetActiveMapId() : "";
+            if (!string.IsNullOrWhiteSpace(fromController))
+                mapIdInput.text = fromController.Trim();
+        }
+
+        private void OnMapLoadClicked()
+        {
+            if (!EnsureMapSwitcher() || mapIdInput == null)
+            {
+                SetMapStatus("Map switcher not ready", error: true);
+                return;
+            }
+
+            mapIdInput.DeactivateInputField();
+            if (TouchScreenKeyboard.isSupported)
+                TouchScreenKeyboard.hideInput = true;
+
+            string idText = mapIdInput.text?.Trim();
+            if (string.IsNullOrEmpty(idText))
+            {
+                SetMapStatus("Enter a numeric map ID first", error: true);
+                return;
+            }
+
+            var c = Controller();
+            if (c != null && c.IsRecording)
+            {
+                SetMapStatus("Stop recording before switching maps", error: true);
+                return;
+            }
+
+            if (c != null && c.IsPlaying)
+                c.StopPlayback();
+
+            SetMapStatus($"Loading map {idText}…", error: false);
+            mapSwitcher.SwitchToMapFromInput(idText);
+        }
+
+        private void OnMapStatusChanged(string message)
+        {
+            SetMapStatus(message, mapSwitcher != null &&
+                mapSwitcher.LastStatusSeverity == ImmersalMapSwitcher.StatusSeverity.Error);
+            if (mapStatusLabel != null && mapSwitcher != null)
+            {
+                switch (mapSwitcher.LastStatusSeverity)
+                {
+                    case ImmersalMapSwitcher.StatusSeverity.Error:
+                        mapStatusLabel.color = UITokens.Danger;
+                        break;
+                    case ImmersalMapSwitcher.StatusSeverity.Success:
+                        mapStatusLabel.color = UITokens.Success;
+                        break;
+                    case ImmersalMapSwitcher.StatusSeverity.Working:
+                        mapStatusLabel.color = UITokens.OnSurface;
+                        break;
+                    default:
+                        mapStatusLabel.color = UITokens.Muted;
+                        break;
+                }
+            }
+        }
+
+        private void OnMapSwitched(int mapId)
+        {
+            SyncMapInput();
+            RefreshMapStatusLabel();
+            var c = Controller();
+            if (c != null)
+                c.LoadLatestRecording();
+            if (activeCategory == TuningCategory.General)
+                RebuildRows();
+        }
+
+        private void SetMapStatus(string message, bool error)
+        {
+            if (mapStatusLabel != null)
+            {
+                mapStatusLabel.text = message;
+                mapStatusLabel.color = error ? UITokens.Danger : UITokens.OnSurface;
+            }
+        }
+
         /// <summary>Wall constraint test plan: slab, calibration, contact lock, debug planes.</summary>
         private void BuildWallCategoryRows(FusedCharacterPlayer p)
         {
-            AddSection("Wall constraint");
+            var viz = EnsureVisualizer();
+
+            AddSection("Wall plane (blue quad)");
+            AddButton("Calibrate wall to AR plane (front)", () =>
+            {
+                EnableWallPlanePreview();
+                p.CalibrateWallFromArPlane();
+            });
+            AddButton("Calibrate wall to climb now", () =>
+            {
+                EnableWallPlanePreview();
+                p.AutoCalibrateWallDepth();
+            });
+            AddToggle("Debug overlay (planes + HUD)", () => viz.ShowVisuals, v => viz.ShowVisuals = v);
+            AddToggle("Blue / green planes", () => viz.ShowPlanes, v => viz.ShowPlanes = v);
+            AddToggle("Status HUD", () => viz.ShowStatusHud, v => viz.ShowStatusHud = v);
+            AddToggle("Hold contact markers", () => viz.ShowContactMarkers, v => viz.ShowContactMarkers = v);
+            if (p.SurfaceProbe != null)
+                AddModeToggle("Wall source",
+                    () => p.SurfaceProbe.WallSource == ARSurfaceProbe.WallSourceMode.ARVerticalPlane ? "AR plane" : "RouteRoot",
+                    () => p.SurfaceProbe.WallSource =
+                        p.SurfaceProbe.WallSource == ARSurfaceProbe.WallSourceMode.ARVerticalPlane
+                            ? ARSurfaceProbe.WallSourceMode.RouteRootPlane
+                            : ARSurfaceProbe.WallSourceMode.ARVerticalPlane);
+            AddToggle("Auto-calibrate wall on play", () => p.AutoCalibrateWallOnPlay, v => p.AutoCalibrateWallOnPlay = v);
+
+            AddSection("Depth slab");
             AddToggle("Enable wall projection", () => p.EnableWallProjection, v => p.EnableWallProjection = v);
             AddToggle("Depth slab clamp", () => p.WallProjectionSettingsLive.enableSlabClamp,
                 v => { var s = p.WallProjectionSettingsLive; s.enableSlabClamp = v; p.WallProjectionSettingsLive = s; });
@@ -397,36 +728,56 @@ namespace BodyTracking.UI
                     var s = p.WallProjectionSettingsLive; s.wallDepthOffset = v; p.WallProjectionSettingsLive = s;
                     if (p.SurfaceProbe != null) p.SurfaceProbe.WallLocalZOffset = v;
                 }, "0.000");
-            AddToggle("Auto-calibrate wall on play", () => p.AutoCalibrateWallOnPlay, v => p.AutoCalibrateWallOnPlay = v);
-            AddButton("Calibrate wall to climb now", () => p.AutoCalibrateWallDepth());
-            AddButton("Calibrate wall to AR plane (front)", () => p.CalibrateWallFromArPlane());
-            if (p.SurfaceProbe != null)
-                AddModeToggle("Wall source",
-                    () => p.SurfaceProbe.WallSource == ARSurfaceProbe.WallSourceMode.ARVerticalPlane ? "AR plane" : "RouteRoot",
-                    () => p.SurfaceProbe.WallSource =
-                        p.SurfaceProbe.WallSource == ARSurfaceProbe.WallSourceMode.ARVerticalPlane
-                            ? ARSurfaceProbe.WallSourceMode.RouteRootPlane
-                            : ARSurfaceProbe.WallSourceMode.ARVerticalPlane);
 
-            AddSection("Contact lock (holds)");
-            AddToggle("Hold contact lock", () => p.WallProjectionSettingsLive.enableContactLock,
+            AddSection("Walk-away release");
+            AddToggle("Release when off wall", () => p.WallProjectionSettingsLive.enableWalkAwayRelease,
+                v => { var s = p.WallProjectionSettingsLive; s.enableWalkAwayRelease = v; p.WallProjectionSettingsLive = s; });
+            AddSlider("Release distance (m)", 0.3f, 2f, () => p.WallProjectionSettingsLive.wallReleaseDepth,
+                v => { var s = p.WallProjectionSettingsLive; s.wallReleaseDepth = v; p.WallProjectionSettingsLive = s; }, "0.00");
+            AddSlider("Re-engage distance (m)", 0.1f, 1.5f, () => p.WallProjectionSettingsLive.wallReengageDepth,
+                v => { var s = p.WallProjectionSettingsLive; s.wallReengageDepth = v; p.WallProjectionSettingsLive = s; }, "0.00");
+            AddToggle("Don't pin while on floor", () => p.WallProjectionSettingsLive.enableFloorStandRelease,
+                v => { var s = p.WallProjectionSettingsLive; s.enableFloorStandRelease = v; p.WallProjectionSettingsLive = s; });
+            AddSlider("Wall engage ease (s)", 0f, 1f, () => p.WallProjectionSettingsLive.wallEngageEaseSeconds,
+                v => { var s = p.WallProjectionSettingsLive; s.wallEngageEaseSeconds = v; p.WallProjectionSettingsLive = s; }, "0.00");
+
+            AddSection("Snap onto holds (pull-on)");
+            AddToggle("Snap hands/feet onto holds", () => p.WallProjectionSettingsLive.enableContactLock,
                 v => { var s = p.WallProjectionSettingsLive; s.enableContactLock = v; p.WallProjectionSettingsLive = s; });
-            AddSlider("Contact depth band (m)", 0.04f, 0.3f, () => p.WallProjectionSettingsLive.contactDepthBand,
+            AddSlider("Snap depth band (m)", 0.04f, 0.4f, () => p.WallProjectionSettingsLive.contactDepthBand,
                 v => { var s = p.WallProjectionSettingsLive; s.contactDepthBand = v; p.WallProjectionSettingsLive = s; }, "0.00");
-            AddSlider("Contact stillness (m/s)", 0.02f, 0.3f, () => p.WallProjectionSettingsLive.contactStillnessSpeed,
-                v => { var s = p.WallProjectionSettingsLive; s.contactStillnessSpeed = v; p.WallProjectionSettingsLive = s; }, "0.00");
-            AddSlider("Contact release (m/s)", 0.05f, 0.6f, () => p.WallProjectionSettingsLive.contactReleaseSpeed,
-                v => { var s = p.WallProjectionSettingsLive; s.contactReleaseSpeed = v; p.WallProjectionSettingsLive = s; }, "0.00");
-            AddSlider("Contact ease (s)", 0.02f, 0.5f, () => p.WallProjectionSettingsLive.contactEaseSeconds,
+            AddSlider("Snap radius (m)", 0.03f, 0.4f, () => p.WallProjectionSettingsLive.holdSnapRadius,
+                v => { var s = p.WallProjectionSettingsLive; s.holdSnapRadius = v; p.WallProjectionSettingsLive = s; }, "0.00");
+            AddSlider("Snap ease (s)", 0.02f, 0.5f, () => p.WallProjectionSettingsLive.contactEaseSeconds,
                 v => { var s = p.WallProjectionSettingsLive; s.contactEaseSeconds = v; p.WallProjectionSettingsLive = s; }, "0.00");
 
-            var viz = Visualizer();
-            if (viz != null)
+            AddSection("Holds (offline pre-detection)");
+            AddToggle("Auto-detect holds", () => p.WallProjectionSettingsLive.enableHoldDetection,
+                v => { var s = p.WallProjectionSettingsLive; s.enableHoldDetection = v; p.WallProjectionSettingsLive = s; });
+            AddToggle("Show holds overlay", () => viz.ShowHolds, v => viz.ShowHolds = v);
+            AddSlider("Detect stillness (m/s)", 0.02f, 0.3f, () => p.WallProjectionSettingsLive.contactStillnessSpeed,
+                v => { var s = p.WallProjectionSettingsLive; s.contactStillnessSpeed = v; p.WallProjectionSettingsLive = s; }, "0.00");
+            AddSlider("Detect release (m/s)", 0.05f, 0.6f, () => p.WallProjectionSettingsLive.contactReleaseSpeed,
+                v => { var s = p.WallProjectionSettingsLive; s.contactReleaseSpeed = v; p.WallProjectionSettingsLive = s; }, "0.00");
+            AddSlider("Hold dwell (s)", 0.1f, 2f, () => p.WallProjectionSettingsLive.holdDwellSeconds,
+                v => { var s = p.WallProjectionSettingsLive; s.holdDwellSeconds = v; p.WallProjectionSettingsLive = s; }, "0.00");
+            AddSlider("Merge radius (m)", 0.03f, 0.4f, () => p.WallProjectionSettingsLive.holdMergeRadius,
+                v => { var s = p.WallProjectionSettingsLive; s.holdMergeRadius = v; p.WallProjectionSettingsLive = s; }, "0.00");
+            AddSlider("Detect wall range (m)", 0.08f, 0.8f, () => p.WallProjectionSettingsLive.holdDetectionDepthBand,
+                v => { var s = p.WallProjectionSettingsLive; s.holdDetectionDepthBand = v; p.WallProjectionSettingsLive = s; }, "0.00");
+            AddSlider("Floor exclusion (m)", 0f, 0.5f, () => p.WallProjectionSettingsLive.holdFloorExclusionBand,
+                v => { var s = p.WallProjectionSettingsLive; s.holdFloorExclusionBand = v; p.WallProjectionSettingsLive = s; }, "0.00");
+            AddStatusLabel($"Detected holds: {p.HoldMap?.Count ?? 0}");
+            AddButton("Regenerate holds from recording", () =>
             {
-                AddSection("Debug (test plan)");
-                AddToggle("Debug overlay (planes/HUD)", () => viz.ShowVisuals, v => viz.ShowVisuals = v);
-                AddToggle("Status HUD", () => viz.ShowStatusHud, v => viz.ShowStatusHud = v);
-            }
+                p.RegenerateHoldsFromRecording();
+                RebuildRows();
+            });
+            AddButton("Clear holds (this map)", () =>
+            {
+                p.ClearHolds();
+                RebuildRows();
+            });
         }
 
         /// <summary>Penetration, floor gate, wall IK (test plan steps 4–5).</summary>
@@ -440,6 +791,8 @@ namespace BodyTracking.UI
                 v => { var s = p.PenetrationSettingsLive; s.floorContactBand = v; p.PenetrationSettingsLive = s; }, "0.00");
             AddSlider("Max standing hip height (m)", 0f, 2.5f, () => p.PenetrationSettingsLive.maxStandingHipHeightAboveFloor,
                 v => { var s = p.PenetrationSettingsLive; s.maxStandingHipHeightAboveFloor = v; p.PenetrationSettingsLive = s; }, "0.0");
+            AddSlider("Max floor drop (m)", 0f, 1f, () => p.PenetrationSettingsLive.maxFloorSnapMeters,
+                v => { var s = p.PenetrationSettingsLive; s.maxFloorSnapMeters = v; p.PenetrationSettingsLive = s; }, "0.00");
 
             AddSection("Wall IK");
             AddToggle("Wall hand IK", () => p.PenetrationSettingsLive.enableWallHandIK,
@@ -494,6 +847,16 @@ namespace BodyTracking.UI
                 v => { var s = p.PostProcessSettings; s.maxJointSpeed = v; p.PostProcessSettings = s; }, "0.0");
             AddSlider("Bone-length tolerance", 0.1f, 1f, () => p.PostProcessSettings.boneLengthTolerance,
                 v => { var s = p.PostProcessSettings; s.boneLengthTolerance = v; p.PostProcessSettings = s; }, "0.00");
+
+            // The glitch guard above only cleans the POSE (joints vs the pelvis). This caps how fast the whole body's
+            // WORLD placement can travel, so the final GLB/procedural render can never lurch from one spot to another.
+            AddSection("Root motion guard (no teleport)");
+            AddToggle("Enable root motion guard", () => p.EnableRootMotionGuard, v => p.EnableRootMotionGuard = v);
+            AddSlider("Max root speed (m/s)", 1f, 20f, () => p.MaxRootSpeed, v => p.MaxRootSpeed = v, "0.0");
+            AddSlider("Teleport snap distance (m)", 0.3f, 3f, () => p.RootTeleportSnapDistance,
+                v => p.RootTeleportSnapDistance = v, "0.00");
+            AddSlider("Max turn speed (deg/s)", 90f, 1080f, () => p.MaxRootTurnSpeed, v => p.MaxRootTurnSpeed = v, "0");
+            AddSlider("Turn snap (deg)", 30f, 180f, () => p.RootTurnSnapDegrees, v => p.RootTurnSnapDegrees = v, "0");
         }
 
         /// <summary>Movement, anchor, fit, face, fusion bake.</summary>
@@ -820,23 +1183,35 @@ namespace BodyTracking.UI
             });
         }
 
-        /// <summary>A full-width action button.</summary>
+        /// <summary>A full-width action button (label rendered inside the pill, not clipped to zero width).</summary>
         private void AddButton(string label, Action onClick)
         {
+            const float buttonHeight = ControlRowHeight + 8f;
+
             var row = UIFactory.CreateRect("Btn_" + label, content);
-            ApplyRowWidthConstraint(row);
-            var le = row.GetComponent<LayoutElement>();
-            le.minHeight = ControlRowHeight + 4f;
+            AddStackedRow(row, buttonHeight + UITokens.Space4);
 
             var btn = UIFactory.CreatePillButton("Action", row, label, ghost: false);
-            ConfigureCompactPillLabel(btn.GetComponentInChildren<TextMeshProUGUI>());
-            var btnRect = (RectTransform)btn.transform;
-            btnRect.sizeDelta = new Vector2(0f, ControlRowHeight);
+            var btnText = btn.GetComponentInChildren<TextMeshProUGUI>();
+            if (btnText != null)
+            {
+                btnText.fontSize = LabelFontSize - 1f;
+                btnText.extraPadding = false;
+                btnText.margin = Vector4.zero;
+                btnText.textWrappingMode = TextWrappingModes.Normal;
+                btnText.overflowMode = TextOverflowModes.Ellipsis;
+                btnText.enableWordWrapping = true;
+                btnText.alignment = TextAlignmentOptions.Center;
+                UIFactory.Stretch(btnText.rectTransform, UITokens.Space8);
+            }
+
             var btnLe = btn.gameObject.AddComponent<LayoutElement>();
             btnLe.minWidth = 0f;
             btnLe.flexibleWidth = 1f;
-            btnLe.preferredHeight = ControlRowHeight;
-            btnLe.minHeight = ControlRowHeight;
+            btnLe.preferredHeight = buttonHeight;
+            btnLe.minHeight = buttonHeight;
+            var btnRect = (RectTransform)btn.transform;
+            btnRect.sizeDelta = new Vector2(0f, buttonHeight);
 
             btn.onClick.AddListener(() =>
             {

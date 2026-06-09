@@ -87,7 +87,7 @@ namespace BodyTracking.MoveAI
                 correctXZOnly = false,
                 moveDrivenFacing = true,
                 facingCorrectionSeconds = 2f,
-                moveAutoRealign = true,
+                moveAutoRealign = false,
                 moveRealignDriftThreshold = 0.2f,
                 moveRealignEaseSeconds = 0.4f,
             };

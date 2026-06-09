@@ -617,12 +617,42 @@ namespace BodyTracking.MoveAI
             }
             if (parsed.TryGetValue("errors", out var errs) && errs != null)
             {
-                onError?.Invoke($"GraphQL errors: {MiniJson.Serialize(errs)}");
+                    string errText = MiniJson.Serialize(errs);
+                    // Move sometimes returns a spurious "insufficient credits / not enough funds" GraphQL error
+                    // (HTTP 200, so the network-retry path above doesn't see it) even when the account is funded —
+                    // typically a transient balance-check race at job-creation time. Retry these with backoff
+                    // instead of failing the whole upload, so a funded account isn't blocked by a momentary glitch.
+                    if (LooksLikeRetryableBillingError(errText) && attempt < MaxTransientRetries)
+                    {
+                        Debug.LogWarning($"[MoveApiClient] Retryable billing/credits error from Move (account is funded?) — retrying: {errText}");
+                        continue;
+                    }
+                onError?.Invoke($"GraphQL errors: {errText}");
                 yield break;
             }
             onOk?.Invoke(parsed);
                 yield break;
             }
+        }
+
+        /// <summary>
+        /// True when a GraphQL error payload looks like a transient billing/credits rejection (insufficient
+        /// funds/credits/balance/quota). These are retried rather than treated as terminal, since the account
+        /// may actually be funded and Move's balance check can race at job-creation time.
+        /// </summary>
+        static bool LooksLikeRetryableBillingError(string errText)
+        {
+            if (string.IsNullOrEmpty(errText))
+                return false;
+            string s = errText.ToLowerInvariant();
+            return s.Contains("insufficient")
+                || s.Contains("not enough")
+                || s.Contains("credit")
+                || s.Contains("funds")
+                || s.Contains("balance")
+                || s.Contains("quota")
+                || s.Contains("payment")
+                || s.Contains("billing");
         }
 
         IEnumerator DownloadBytesWithRetry(string url, int timeoutSeconds, string label,

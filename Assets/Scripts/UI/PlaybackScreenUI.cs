@@ -1,4 +1,5 @@
 using System.Collections.Generic;
+using System.Globalization;
 using TMPro;
 using UnityEngine;
 using UnityEngine.UI;
@@ -10,15 +11,24 @@ namespace BodyTracking.UI
 {
     /// <summary>
     /// Dedicated playback-only screen: vertical move timeline on the right, frame-step transport on the
-    /// bottom-left. Reached via <see cref="BodyTrackingUISwitcher"/> from the record/settings screen.
+    /// bottom-left, top-left screen toggle + settings icons, recording picker on the timeline toolbar.
+    /// Reached via <see cref="BodyTrackingUISwitcher"/> from the record screen.
     /// </summary>
     public class PlaybackScreenUI : MonoBehaviour
     {
         private const string RootName = "PlaybackUIRoot";
         private const float TimelineColumnWidth = 72f;
-        private const float CharacterCycleButtonSize = 44f;
-        private const float TimelineHeightFraction = 0.82f;
+        private const float RecordingPickerPanelWidth = 252f;
+        private const float RecordingPickerRowHeight = 36f;
+        private const float RecordingPickerToggleWidth = 42f;
+        private const float RecordingPickerRowFont = 13f;
+        private const float RecordingPickerToggleFont = 11f;
         private const float PlaybackEdgeInset = UITokens.Space12;
+        /// <summary>Top band reserved for the recording/character toolbar (matches top-left screen toggle row).</summary>
+        private static float TopToolbarBand => PlaybackEdgeInset + UITokens.ToolbarIconDiameter + UITokens.Space8;
+        /// <summary>Bottom inset shared with the left transport cluster (circle bottoms sit on this line).</summary>
+        private static float BottomChromeInset => PlaybackEdgeInset;
+        private static float PlayheadRadius => UITokens.PlaybackPlayheadDiameter * 0.5f;
 
         [Header("System")]
         public BodyTrackingController controller;
@@ -40,12 +50,12 @@ namespace BodyTracking.UI
         private GameObject pauseIcon;
         private Button backToRecordButton;
         private Button tuneButton;
-        private Button recordingsButton;
+        private Button recordingPickerButton;
+        private GameObject recordingPickerPanel;
+        private RectTransform recordingPickerList;
+        private bool recordingPickerVisible;
+        private bool rebuildingRecordingPicker;
         private Button characterCycleButton;
-        private Button recordingCycleButton;
-        private Button debugToggleButton;
-        private RectTransform debugToggleIcon;
-        private DebugVisualsController debugVisuals;
         private CharacterSwitcher characterSwitcher;
         private Button finishButton;
         private Image finishCircle;
@@ -94,7 +104,7 @@ namespace BodyTracking.UI
 
             BuildVerticalTimeline(uiRoot);
             BuildTransportCluster(uiRoot);
-            BuildBackButton(uiRoot);
+            BuildTopLeftToolbar(uiRoot);
 
             uiRoot.gameObject.SetActive(isVisible);
         }
@@ -105,6 +115,12 @@ namespace BodyTracking.UI
             EnsureInitialized();
             if (uiRoot != null)
                 uiRoot.gameObject.SetActive(visible);
+            if (!visible)
+            {
+                recordingPickerVisible = false;
+                if (recordingPickerPanel != null)
+                    recordingPickerPanel.SetActive(false);
+            }
             if (visible)
                 RefreshAll();
         }
@@ -118,15 +134,28 @@ namespace BodyTracking.UI
 
             BuildUI();
             HookUpEvents();
+            RecordingSelection.Instance.OnChanged += OnRecordingSelectionChanged;
             initialized = true;
+        }
+
+        void OnDestroy()
+        {
+            if (initialized)
+                RecordingSelection.Instance.OnChanged -= OnRecordingSelectionChanged;
+        }
+
+        private void OnRecordingSelectionChanged()
+        {
+            if (recordingPickerVisible && !rebuildingRecordingPicker)
+                RebuildRecordingPickerList();
         }
 
         private void HookUpEvents()
         {
             if (stepBackButton != null)
-                stepBackButton.onClick.AddListener(() => controller?.StepPlaybackTwoFrames(-1));
+                stepBackButton.onClick.AddListener(() => controller?.StepPlaybackFrame(-1));
             if (stepForwardButton != null)
-                stepForwardButton.onClick.AddListener(() => controller?.StepPlaybackTwoFrames(1));
+                stepForwardButton.onClick.AddListener(() => controller?.StepPlaybackFrame(1));
             if (playPauseButton != null)
                 playPauseButton.onClick.AddListener(OnPlayPauseClicked);
             if (speedButton != null)
@@ -160,63 +189,45 @@ namespace BodyTracking.UI
 
         private void BuildVerticalTimeline(RectTransform root)
         {
-            const float switchTimelineGap = UITokens.Space16;
             float finishTopPad = UITokens.TransportPrimaryDiameter * 0.5f + UITokens.Space8;
             float timelineCenterX = -(PlaybackEdgeInset + TimelineColumnWidth * 0.5f);
+            float toolbarY = -(PlaybackEdgeInset + UITokens.ToolbarIconDiameter * 0.5f);
+            float iconSize = UITokens.ToolbarIconDiameter;
 
             var column = UIFactory.CreateRect("VerticalTimeline", root);
             column.anchorMin = new Vector2(1f, 0f);
-            column.anchorMax = new Vector2(1f, TimelineHeightFraction);
+            column.anchorMax = new Vector2(1f, 1f);
             column.pivot = new Vector2(1f, 0f);
-            column.offsetMin = new Vector2(-(TimelineColumnWidth + PlaybackEdgeInset), PlaybackEdgeInset);
-            column.offsetMax = new Vector2(-PlaybackEdgeInset, 0f);
+            column.offsetMin = new Vector2(-(TimelineColumnWidth + PlaybackEdgeInset), BottomChromeInset);
+            column.offsetMax = new Vector2(-PlaybackEdgeInset, -TopToolbarBand);
 
             characterCycleButton = UIFactory.CreateCircleButton(
-                "CharacterCycle", root, CharacterCycleButtonSize, UITokens.PlaybackTransportBtn);
+                "CharacterCycle", root, iconSize, UITokens.PlaybackTransportBtn);
             var cycleRect = (RectTransform)characterCycleButton.transform;
-            cycleRect.anchorMin = new Vector2(1f, TimelineHeightFraction);
-            cycleRect.anchorMax = new Vector2(1f, TimelineHeightFraction);
-            cycleRect.pivot = new Vector2(0.5f, 0f);
-            cycleRect.anchoredPosition = new Vector2(timelineCenterX, switchTimelineGap);
-            UIFactory.AddSwitchIcon(cycleRect, CharacterCycleButtonSize * 0.46f, UITokens.OnSurface);
+            cycleRect.anchorMin = new Vector2(1f, 1f);
+            cycleRect.anchorMax = new Vector2(1f, 1f);
+            cycleRect.pivot = new Vector2(0.5f, 0.5f);
+            cycleRect.anchoredPosition = new Vector2(timelineCenterX, toolbarY);
+            UIFactory.AddSwitchIcon(cycleRect, iconSize * 0.46f, UITokens.OnSurface);
             characterSwitcher = Object.FindFirstObjectByType<CharacterSwitcher>();
             characterCycleButton.onClick.AddListener(OnCycleCharacterClicked);
 
-            // Cycle-recordings button: steps the single active recording through all clips for this map,
-            // re-syncing each to the current playhead. Sits just left of the character-switch button.
-            recordingCycleButton = UIFactory.CreateCircleButton(
-                "RecordingCycle", root, CharacterCycleButtonSize, UITokens.PlaybackTransportBtn);
-            var recCycleRect = (RectTransform)recordingCycleButton.transform;
-            recCycleRect.anchorMin = new Vector2(1f, TimelineHeightFraction);
-            recCycleRect.anchorMax = new Vector2(1f, TimelineHeightFraction);
-            recCycleRect.pivot = new Vector2(0.5f, 0f);
-            recCycleRect.anchoredPosition = new Vector2(
-                timelineCenterX - (CharacterCycleButtonSize + UITokens.Space8), switchTimelineGap);
-            UIFactory.AddClimberIcon(recCycleRect, CharacterCycleButtonSize * 0.5f, UITokens.OnSurface);
-            recordingCycleButton.onClick.AddListener(OnCycleRecordingClicked);
-
-            // Skeleton / debug-visuals toggle: sits just left of the recording-switch button. Shows or hides
-            // the AR debug overlays (skeletons, Immersal/AR-plane dots, compare skeletons). Moved here from the
-            // record screen so all visualization controls live alongside the character/recording switches.
-            debugToggleButton = UIFactory.CreateCircleButton(
-                "DebugToggle", root, CharacterCycleButtonSize, UITokens.PlaybackTransportBtn);
-            var dbgRect = (RectTransform)debugToggleButton.transform;
-            dbgRect.anchorMin = new Vector2(1f, TimelineHeightFraction);
-            dbgRect.anchorMax = new Vector2(1f, TimelineHeightFraction);
-            dbgRect.pivot = new Vector2(0.5f, 0f);
-            dbgRect.anchoredPosition = new Vector2(
-                timelineCenterX - 2f * (CharacterCycleButtonSize + UITokens.Space8), switchTimelineGap);
-            debugToggleIcon = (RectTransform)UIFactory.AddPlayIcon(dbgRect, CharacterCycleButtonSize * 0.28f, UITokens.OnSurface).transform;
-            debugVisuals = Object.FindFirstObjectByType<DebugVisualsController>();
-            if (debugVisuals == null)
-                debugVisuals = gameObject.AddComponent<DebugVisualsController>();
-            debugToggleButton.onClick.AddListener(OnToggleDebugVisualsClicked);
-            UpdateDebugToggleIcon();
+            recordingPickerButton = UIFactory.CreateCircleButton(
+                "RecordingPicker", root, iconSize, UITokens.PlaybackTransportBtn);
+            var pickerRect = (RectTransform)recordingPickerButton.transform;
+            pickerRect.anchorMin = new Vector2(1f, 1f);
+            pickerRect.anchorMax = new Vector2(1f, 1f);
+            pickerRect.pivot = new Vector2(0.5f, 0.5f);
+            float pickerX = timelineCenterX - (iconSize + UITokens.Space8);
+            pickerRect.anchoredPosition = new Vector2(pickerX, toolbarY);
+            UIFactory.AddListIcon(pickerRect, iconSize * 0.46f, UITokens.OnSurface);
+            recordingPickerButton.onClick.AddListener(ToggleRecordingPicker);
+            BuildRecordingPickerPanel(root, pickerX);
 
             trackArea = UIFactory.CreateRect("TrackArea", column);
             trackArea.anchorMin = Vector2.zero;
             trackArea.anchorMax = Vector2.one;
-            trackArea.offsetMin = new Vector2(UITokens.Space8, UITokens.Space8);
+            trackArea.offsetMin = new Vector2(UITokens.Space8, PlayheadRadius);
             trackArea.offsetMax = new Vector2(-UITokens.Space8, -(finishTopPad + UITokens.Space8));
 
             // White vertical track line.
@@ -363,7 +374,7 @@ namespace BodyTracking.UI
             clusterRect.anchorMin = new Vector2(0f, 0f);
             clusterRect.anchorMax = new Vector2(0f, 0f);
             clusterRect.pivot = new Vector2(0f, 0f);
-            clusterRect.anchoredPosition = new Vector2(PlaybackEdgeInset, PlaybackEdgeInset);
+            clusterRect.anchoredPosition = new Vector2(BottomChromeInset, BottomChromeInset);
             clusterRect.sizeDelta = new Vector2(272f, UITokens.TransportPrimaryDiameter);
 
             var layout = clusterRect.gameObject.AddComponent<HorizontalLayoutGroup>();
@@ -376,7 +387,7 @@ namespace BodyTracking.UI
 
             stepBackButton = UIFactory.CreateCircleButton("StepBack", clusterRect, 44f, UITokens.PlaybackTransportBtn);
             SetTransportLayout(stepBackButton.gameObject, 44f);
-            UIFactory.CreateText("Label", stepBackButton.transform, "−2", UITokens.FontCaption, UITokens.OnSurface,
+            UIFactory.CreateText("Label", stepBackButton.transform, "−", UITokens.FontCaption, UITokens.OnSurface,
                 TextAlignmentOptions.Center);
 
             playPauseButton = UIFactory.CreateCircleButton("PlayPause", clusterRect,
@@ -388,7 +399,7 @@ namespace BodyTracking.UI
 
             stepForwardButton = UIFactory.CreateCircleButton("StepForward", clusterRect, 44f, UITokens.PlaybackTransportBtn);
             SetTransportLayout(stepForwardButton.gameObject, 44f);
-            UIFactory.CreateText("Label", stepForwardButton.transform, "+2", UITokens.FontCaption, UITokens.OnSurface,
+            UIFactory.CreateText("Label", stepForwardButton.transform, "+", UITokens.FontCaption, UITokens.OnSurface,
                 TextAlignmentOptions.Center);
 
             speedButton = UIFactory.CreateCircleButton("Speed", clusterRect, 44f, UITokens.PlaybackTransportBtn);
@@ -522,66 +533,239 @@ namespace BodyTracking.UI
                 sel.SetCharacterIndex(primary, characterSwitcher.CurrentIndex);
         }
 
-        private void OnCycleRecordingClicked()
+        private void ToggleRecordingPicker()
         {
-            if (controller != null)
-                controller.CycleRecording();
+            recordingPickerVisible = !recordingPickerVisible;
+            if (recordingPickerPanel != null)
+            {
+                if (recordingPickerVisible)
+                    RebuildRecordingPickerList();
+                recordingPickerPanel.SetActive(recordingPickerVisible);
+            }
+        }
+
+        private void BuildRecordingPickerPanel(RectTransform root, float anchorX)
+        {
+            var panelRect = UIFactory.CreateRect("RecordingPickerPanel", root);
+            panelRect.anchorMin = new Vector2(1f, 1f);
+            panelRect.anchorMax = new Vector2(1f, 1f);
+            panelRect.pivot = new Vector2(1f, 1f);
+            panelRect.anchoredPosition = new Vector2(
+                anchorX + UITokens.ToolbarIconDiameter * 0.5f,
+                -TopToolbarBand);
+            panelRect.sizeDelta = new Vector2(RecordingPickerPanelWidth, 0f);
+
+            var bg = panelRect.gameObject.AddComponent<Image>();
+            bg.sprite = UIFactory.RoundedSprite((int)UITokens.RadiusMedium);
+            bg.type = Image.Type.Sliced;
+            bg.color = UITokens.SurfaceElevated;
+            bg.raycastTarget = true;
+
+            var panelLe = panelRect.gameObject.AddComponent<LayoutElement>();
+            panelLe.minWidth = RecordingPickerPanelWidth;
+            panelLe.preferredWidth = RecordingPickerPanelWidth;
+            panelLe.flexibleWidth = 0f;
+
+            var vlayout = panelRect.gameObject.AddComponent<VerticalLayoutGroup>();
+            vlayout.padding = new RectOffset((int)UITokens.Space8, (int)UITokens.Space8, (int)UITokens.Space8, (int)UITokens.Space8);
+            vlayout.spacing = UITokens.Space4;
+            vlayout.childAlignment = TextAnchor.UpperLeft;
+            vlayout.childControlWidth = true;
+            vlayout.childControlHeight = true;
+            vlayout.childForceExpandWidth = true;
+            vlayout.childForceExpandHeight = false;
+
+            var fitter = panelRect.gameObject.AddComponent<ContentSizeFitter>();
+            fitter.horizontalFit = ContentSizeFitter.FitMode.Unconstrained;
+            fitter.verticalFit = ContentSizeFitter.FitMode.PreferredSize;
+
+            var header = UIFactory.CreateText("RecordingPickerHeader", panelRect, "Recordings",
+                UITokens.FontCaption - 4f, UITokens.Muted, TextAlignmentOptions.Left);
+            var headerLe = header.gameObject.AddComponent<LayoutElement>();
+            headerLe.minHeight = 18f;
+            headerLe.preferredHeight = 18f;
+
+            recordingPickerList = UIFactory.CreateRect("RecordingPickerList", panelRect);
+            var listLe = recordingPickerList.gameObject.AddComponent<LayoutElement>();
+            listLe.minWidth = 0f;
+            listLe.flexibleWidth = 1f;
+            var rows = recordingPickerList.gameObject.AddComponent<VerticalLayoutGroup>();
+            rows.spacing = UITokens.Space4;
+            rows.childControlWidth = true;
+            rows.childControlHeight = true;
+            rows.childForceExpandWidth = true;
+            rows.childForceExpandHeight = false;
+            var rowsFitter = recordingPickerList.gameObject.AddComponent<ContentSizeFitter>();
+            rowsFitter.horizontalFit = ContentSizeFitter.FitMode.Unconstrained;
+            rowsFitter.verticalFit = ContentSizeFitter.FitMode.PreferredSize;
+
+            recordingPickerPanel = panelRect.gameObject;
+            recordingPickerPanel.SetActive(false);
+        }
+
+        private void RebuildRecordingPickerList()
+        {
+            if (recordingPickerList == null || rebuildingRecordingPicker)
+                return;
+
+            rebuildingRecordingPicker = true;
+            try
+            {
+                for (int i = recordingPickerList.childCount - 1; i >= 0; i--)
+                {
+                    var child = recordingPickerList.GetChild(i);
+                    if (Application.isPlaying) Destroy(child.gameObject);
+                    else DestroyImmediate(child.gameObject);
+                }
+
+                var sel = RecordingSelection.Instance;
+                if (controller != null)
+                    sel.Refresh(controller.GetActiveMapId());
+
+                var entries = sel.Entries;
+
+                if (entries.Count == 0)
+                {
+                    var empty = UIFactory.CreateText("Empty", recordingPickerList, "No recordings yet",
+                        RecordingPickerRowFont, UITokens.Muted, TextAlignmentOptions.Left);
+                    var emptyLe = empty.gameObject.AddComponent<LayoutElement>();
+                    emptyLe.minHeight = RecordingPickerRowHeight;
+                    emptyLe.preferredHeight = RecordingPickerRowHeight;
+                    return;
+                }
+
+                foreach (var entry in entries)
+                    BuildRecordingPickerRow(entry);
+            }
+            finally
+            {
+                rebuildingRecordingPicker = false;
+            }
+        }
+
+        private void BuildRecordingPickerRow(RecordingSelection.Entry entry)
+        {
+            var row = UIFactory.CreateRect("Row_" + entry.fileName, recordingPickerList);
+            var rowLe = row.gameObject.AddComponent<LayoutElement>();
+            rowLe.minHeight = RecordingPickerRowHeight;
+            rowLe.preferredHeight = RecordingPickerRowHeight;
+            rowLe.minWidth = 0f;
+            rowLe.flexibleWidth = 1f;
+
+            var rowBg = row.gameObject.AddComponent<Image>();
+            rowBg.sprite = UIFactory.RoundedSprite((int)UITokens.RadiusSmall);
+            rowBg.type = Image.Type.Sliced;
+            rowBg.color = UITokens.Surface;
+            rowBg.raycastTarget = false;
+
+            var hlg = row.gameObject.AddComponent<HorizontalLayoutGroup>();
+            hlg.padding = new RectOffset((int)UITokens.Space8, (int)UITokens.Space8, 0, 0);
+            hlg.spacing = UITokens.Space8;
+            hlg.childAlignment = TextAnchor.MiddleLeft;
+            hlg.childControlWidth = true;
+            hlg.childControlHeight = true;
+            hlg.childForceExpandWidth = false;
+            hlg.childForceExpandHeight = false;
+
+            var label = UIFactory.CreateText("Label", row, FormatRecordingPickerLabel(entry),
+                RecordingPickerRowFont, entry.hasFusion ? UITokens.OnSurface : UITokens.Muted,
+                TextAlignmentOptions.Left);
+            label.textWrappingMode = TextWrappingModes.NoWrap;
+            label.overflowMode = TextOverflowModes.Ellipsis;
+            var labelLe = label.gameObject.AddComponent<LayoutElement>();
+            labelLe.flexibleWidth = 1f;
+            labelLe.minWidth = 0f;
+            labelLe.preferredHeight = RecordingPickerRowHeight;
+
+            var toggle = UIFactory.CreatePillButton("Toggle", row, entry.enabled ? "On" : "Off", ghost: true);
+            ConfigurePickerToggle(toggle);
+            var toggleText = toggle.GetComponentInChildren<TextMeshProUGUI>();
+            var toggleImg = toggle.GetComponent<Image>();
+            ApplyPickerToggleVisual(toggleImg, toggleText, entry.enabled);
+
+            string file = entry.fileName;
+            toggle.onClick.AddListener(() => OnRecordingToggleClicked(file, toggleImg, toggleText));
+        }
+
+        private static string FormatRecordingPickerLabel(RecordingSelection.Entry entry)
+        {
+            if (entry == null)
+                return "—";
+            if (entry.timestamp > System.DateTime.MinValue)
+                return entry.timestamp.ToString("MMM d · HH:mm", CultureInfo.InvariantCulture);
+            return entry.ShortLabel;
+        }
+
+        private static void ConfigurePickerToggle(Button btn)
+        {
+            var le = btn.gameObject.GetComponent<LayoutElement>();
+            if (le == null) le = btn.gameObject.AddComponent<LayoutElement>();
+            le.preferredWidth = RecordingPickerToggleWidth;
+            le.minWidth = RecordingPickerToggleWidth;
+            le.flexibleWidth = 0f;
+            le.preferredHeight = RecordingPickerRowHeight - 8f;
+            le.minHeight = RecordingPickerRowHeight - 8f;
+            le.flexibleHeight = 0f;
+            ((RectTransform)btn.transform).sizeDelta = new Vector2(RecordingPickerToggleWidth, RecordingPickerRowHeight - 8f);
+
+            var text = btn.GetComponentInChildren<TextMeshProUGUI>();
+            if (text != null)
+            {
+                text.fontSize = RecordingPickerToggleFont;
+                text.textWrappingMode = TextWrappingModes.NoWrap;
+                text.overflowMode = TextOverflowModes.Overflow;
+                text.margin = Vector4.zero;
+                UIFactory.Stretch(text.rectTransform, 2f);
+            }
+        }
+
+        private static void ApplyPickerToggleVisual(Image img, TextMeshProUGUI text, bool on)
+        {
+            if (text != null)
+            {
+                text.text = on ? "On" : "Off";
+                text.color = on ? Color.white : UITokens.Muted;
+            }
+            if (img != null)
+                img.color = on ? UITokens.Primary : UITokens.SurfaceElevated;
+        }
+
+        private void OnRecordingToggleClicked(string fileName, Image toggleImg, TextMeshProUGUI toggleText)
+        {
+            if (controller == null || string.IsNullOrEmpty(fileName))
+                return;
+
+            bool enabled = !RecordingSelection.Instance.IsEnabled(fileName);
+            RecordingSelection.Instance.SetEnabled(fileName, enabled);
+            ApplyPickerToggleVisual(toggleImg, toggleText, enabled);
+
+            float t = controller.IsPlaying ? controller.PlaybackCurrentTime : 0f;
+            controller.ApplyRecordingSelection(t);
             RefreshAll();
         }
 
-        private void OnToggleDebugVisualsClicked()
-        {
-            if (debugVisuals == null)
-                debugVisuals = Object.FindFirstObjectByType<DebugVisualsController>();
-            if (debugVisuals != null)
-                debugVisuals.Toggle();
-            UpdateDebugToggleIcon();
-        }
-
-        private void UpdateDebugToggleIcon()
-        {
-            if (debugToggleIcon == null)
-                return;
-            bool showing = debugVisuals != null && debugVisuals.VisualsVisible;
-            // Point the chevron down while debug visuals are shown (tap to hide), up once hidden.
-            debugToggleIcon.localRotation = Quaternion.Euler(0f, 0f, showing ? -90f : 90f);
-        }
-
         // ============================================================================================
-        // SCREEN SWITCH
+        // TOP-LEFT TOOLBAR (screen toggle + settings)
         // ============================================================================================
 
-        private void BuildBackButton(RectTransform root)
+        private void BuildTopLeftToolbar(RectTransform root)
         {
-            backToRecordButton = UIFactory.CreatePillButton("BackToRecord", root, "Record", ghost: true);
-            var rect = (RectTransform)backToRecordButton.transform;
-            rect.sizeDelta = new Vector2(96f, 34f);
-            rect.anchorMin = new Vector2(0f, 1f);
-            rect.anchorMax = new Vector2(0f, 1f);
-            rect.pivot = new Vector2(0f, 1f);
-            rect.anchoredPosition = new Vector2(UITokens.Space12, -UITokens.Space8);
+            backToRecordButton = UIFactory.CreateCircleButton(
+                "ScreenToggle", root, UITokens.ToolbarIconDiameter, UITokens.PlaybackTransportBtn);
+            UIFactory.PlaceTopLeftToolbarButton(
+                (RectTransform)backToRecordButton.transform, 0, UITokens.ToolbarIconDiameter, PlaybackEdgeInset);
+            UIFactory.AddRecordIcon(backToRecordButton.transform, UITokens.ToolbarIconDiameter * 0.28f,
+                UITokens.Danger, square: false);
 
-            tuneButton = UIFactory.CreatePillButton("OpenTuning", root, "Tune", ghost: true);
-            var trect = (RectTransform)tuneButton.transform;
-            trect.sizeDelta = new Vector2(84f, 34f);
-            trect.anchorMin = new Vector2(0f, 1f);
-            trect.anchorMax = new Vector2(0f, 1f);
-            trect.pivot = new Vector2(0f, 1f);
-            trect.anchoredPosition = new Vector2(UITokens.Space12 + 96f + UITokens.Space8, -UITokens.Space8);
-
-            recordingsButton = UIFactory.CreatePillButton("OpenRecordings", root, "Recordings", ghost: true);
-            var rrect = (RectTransform)recordingsButton.transform;
-            rrect.sizeDelta = new Vector2(120f, 34f);
-            rrect.anchorMin = new Vector2(0f, 1f);
-            rrect.anchorMax = new Vector2(0f, 1f);
-            rrect.pivot = new Vector2(0f, 1f);
-            rrect.anchoredPosition = new Vector2(
-                UITokens.Space12 + 96f + UITokens.Space8 + 84f + UITokens.Space8, -UITokens.Space8);
+            tuneButton = UIFactory.CreateCircleButton(
+                "OpenTuning", root, UITokens.ToolbarIconDiameter, UITokens.PlaybackTransportBtn);
+            UIFactory.PlaceTopLeftToolbarButton(
+                (RectTransform)tuneButton.transform, 1, UITokens.ToolbarIconDiameter, PlaybackEdgeInset);
+            UIFactory.AddSettingsIcon(tuneButton.transform, UITokens.ToolbarIconDiameter * 0.46f, UITokens.OnSurface);
         }
 
         public Button BackToRecordButton => backToRecordButton;
         public Button TuneButton => tuneButton;
-        public Button RecordingsButton => recordingsButton;
 
         // ============================================================================================
         // SHARED CANVAS / EVENT SYSTEM

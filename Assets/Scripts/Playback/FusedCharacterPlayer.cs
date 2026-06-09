@@ -84,13 +84,13 @@ namespace BodyTracking.Playback
             correctXZOnly = false,
             moveDrivenFacing = true,
             facingCorrectionSeconds = 1.141143f,
-            moveAutoRealign = true,
+            moveAutoRealign = false,
             moveRealignDriftThreshold = 0.2f,
             moveRealignEaseSeconds = 0.4f,
         };
 
-        [Tooltip("World position source during PLAYBACK. FollowMoveGlbRoot = Move GLB root motion (aligned once to ARKit, " +
-                 "auto re-align on drift; default). FollowBakedRoot = baked Move+ARKit fused trajectory. FollowArkit = " +
+        [Tooltip("World position source during PLAYBACK. FollowMoveGlbRoot = Move GLB root motion (aligned once to ARKit; " +
+                 "use Re-align button or enable auto re-align in tuning). FollowBakedRoot = baked Move+ARKit fused trajectory. FollowArkit = " +
                  "recorded ARKit pelvis every frame (original).")]
         [SerializeField] private FusedPoseSolver.AnchorMode playbackAnchorMode = FusedPoseSolver.AnchorMode.FollowMoveGlbRoot;
 
@@ -152,7 +152,7 @@ namespace BodyTracking.Playback
         [SerializeField] private bool enablePoseSmoothing = true;
         [SerializeField] private PosePostProcessSettings postProcessSettings = new PosePostProcessSettings
         {
-            enableGlitchGuard = false,
+            enableGlitchGuard = true,
             maxJointSpeed = 6f,
             boneLengthTolerance = 0.25f,
             enableSmoothing = true,
@@ -162,6 +162,27 @@ namespace BodyTracking.Playback
             jumpVelocityThreshold = 1.5f,
             jumpBetaScale = 8f,
         };
+
+        [Header("Root-motion guard (final placement safety net)")]
+        [Tooltip("Clamp how fast the placed character ROOT can travel per frame so neither the procedural nor the GLB " +
+                 "path can ever lurch/teleport across the room from an anchor spike or re-align. The pose (muscle) " +
+                 "glitch guard above only cleans joints RELATIVE to the pelvis; this is the only thing that guards the " +
+                 "body's WORLD position. Works in RouteRoot-local space, so moving the phone is never clamped.")]
+        [SerializeField] private bool enableRootMotionGuard = true;
+        [Tooltip("Top speed (m/s) the character root may move at 1x playback. Travel faster than this is eased to this " +
+                 "speed instead of snapping. Set just above a fast climb/jump (~4-8 m/s) so real motion passes but " +
+                 "single-frame teleports are absorbed.")]
+        [SerializeField] private float maxRootSpeed = 6f;
+        [Tooltip("A single-frame root jump larger than this (m) is treated as a genuine relocation (loop restart / " +
+                 "re-anchor to a far pelvis) and allowed through 1:1 so the body recovers instead of crawling. Keep " +
+                 "above the largest legitimate per-frame move but below a full across-the-wall jump. 0 = always clamp.")]
+        [SerializeField] private float rootTeleportSnapDistance = 1.25f;
+        [Tooltip("Top turn rate (deg/s) the character's FACING may change at. Smooths out sudden body spins from a " +
+                 "noisy/flipped facing without lagging a normal climb turn. 0 = no rotation clamp.")]
+        [SerializeField] private float maxRootTurnSpeed = 540f;
+        [Tooltip("A single-frame facing change larger than this (deg) is treated as a genuine re-facing (loop wrap) " +
+                 "and allowed through 1:1 so it recovers instead of slowly spinning. 0 = always clamp.")]
+        [SerializeField] private float rootTurnSnapDegrees = 135f;
         [Tooltip("Master switch for wall/floor penetration correction + closest-hand IK (Step 4). On by default with " +
                  "feet-on-floor only (wall IK stays off) to complement Move GLB root motion.")]
         [SerializeField] private bool enablePenetrationFix = true;
@@ -170,6 +191,7 @@ namespace BodyTracking.Playback
             enableFloorFix = true,
             floorContactBand = 0.12f,
             maxStandingHipHeightAboveFloor = 1.3f,
+            maxFloorSnapMeters = 0.5f,
             enableWallHandIK = false,
             enableWallFootIK = false,
             maxIkWeight = 1f,
@@ -201,8 +223,20 @@ namespace BodyTracking.Playback
         private readonly WallProjectionResolver wallProjection = new WallProjectionResolver();
         private WallProjectionResolver.ContactJoint[] contactJointTable = System.Array.Empty<WallProjectionResolver.ContactJoint>();
         private WallProjectionResolver.WallContact[] lastWallContacts;
+        // Wall plane used this frame (slab + contact push-out), cached so the post-pose rig IK can reuse it on both
+        // the procedural and GLB paths.
+        private Vector3 lastWallPoint;
+        private Vector3 lastWallNormal = Vector3.forward;
+        private bool lastWallValid;
         private int[] footWorldIndices = System.Array.Empty<int>();
         private int[] wallContactWorldIndices = System.Array.Empty<int>();
+
+        // Inferred climbing holds for the current spatial map. Generated once by scanning the complete fused
+        // recording (or loaded from disk), then consumed during playback for overlay/snap. Playback itself does not
+        // add observations, so pausing/scrubbing cannot create duplicate holds.
+        private readonly ClimbingHoldMap holdMap = new ClimbingHoldMap();
+        private string loadedHoldsMapId;
+        private bool holdsDirty;
 
         [Header("Fit")]
         [Tooltip("How the one uniform character scale is chosen. RenderedMeshHeight (default) matches the visible " +
@@ -331,6 +365,37 @@ namespace BodyTracking.Playback
                 RefreshGlbPostProcess();
             }
         }
+        /// <summary>Final world-placement safety net: clamp the character root's per-frame travel so it can never
+        /// teleport/lurch (the muscle glitch guard only cleans the pose, not the body's world position).</summary>
+        public bool EnableRootMotionGuard
+        {
+            get => enableRootMotionGuard;
+            set => enableRootMotionGuard = value;
+        }
+        /// <summary>Top speed (m/s, at 1x playback) the placed character root may move; faster travel is eased.</summary>
+        public float MaxRootSpeed
+        {
+            get => maxRootSpeed;
+            set => maxRootSpeed = Mathf.Max(0f, value);
+        }
+        /// <summary>Single-frame root jump (m) above which motion is treated as a genuine relocation and passed 1:1.</summary>
+        public float RootTeleportSnapDistance
+        {
+            get => rootTeleportSnapDistance;
+            set => rootTeleportSnapDistance = Mathf.Max(0f, value);
+        }
+        /// <summary>Top turn rate (deg/s) the character facing may change at (anti body-spin). 0 = no clamp.</summary>
+        public float MaxRootTurnSpeed
+        {
+            get => maxRootTurnSpeed;
+            set => maxRootTurnSpeed = Mathf.Max(0f, value);
+        }
+        /// <summary>Single-frame facing change (deg) above which a turn is treated as a genuine re-facing and passed 1:1.</summary>
+        public float RootTurnSnapDegrees
+        {
+            get => rootTurnSnapDegrees;
+            set => rootTurnSnapDegrees = Mathf.Max(0f, value);
+        }
         public bool EnablePenetrationFix
         {
             get => enablePenetrationFix;
@@ -362,8 +427,87 @@ namespace BodyTracking.Playback
         /// <summary>Per-limb wall-contact state from the last applied frame (null until a frame is applied). For
         /// debug visualizers that draw which hands/feet are currently locked to a hold.</summary>
         public WallProjectionResolver.WallContact[] LastWallContacts => lastWallContacts;
+        /// <summary>Per-limb push-out status from the last applied frame (anchored / pushed out / still inside). For
+        /// the debug overlay to color limbs green/yellow/red. Index = WallProjectionResolver.ClimbLimb.</summary>
+        public System.Collections.Generic.IReadOnlyList<PostProcess.PosePenetrationResolver.LimbPush> ContactPushStatus
+            => penetrationResolver.LastLimbPush;
         /// <summary>AR surface probe (wall plane + floor) the player is driving. For debug visualizers.</summary>
         public ARSurfaceProbe SurfaceProbe => surfaceProbe;
+
+        /// <summary>Inferred climbing holds for the current map (drives the hold overlay and optional snapping).</summary>
+        public ClimbingHoldMap HoldMap => holdMap;
+
+        /// <summary>Spatial map id (Immersal map / image target) the holds are keyed to.</summary>
+        public string HoldsMapId
+        {
+            get
+            {
+                string providerMap = routeRootProvider != null ? routeRootProvider.MapId : "";
+                if (!string.IsNullOrEmpty(providerMap)) return providerMap;
+                return asset != null ? asset.mapId : "";
+            }
+        }
+
+        /// <summary>
+        /// Load the persisted holds for the active map into <see cref="holdMap"/>. If no JSON exists yet, build the
+        /// hold list by scanning the full recording immediately and save it, so playback starts from a complete map.
+        /// </summary>
+        private void EnsureHoldsLoaded()
+        {
+            string mapId = HoldsMapId;
+            if (mapId == loadedHoldsMapId) return;
+            loadedHoldsMapId = mapId;
+            holdsDirty = false;
+            bool loaded = BodyTracking.Storage.ClimbingHoldStorage.LoadInto(mapId, holdMap);
+            if (!loaded)
+                RegenerateHoldsFromRecording();
+        }
+
+        /// <summary>Persist the current holds for the active map (no-op when nothing changed).</summary>
+        public void SaveHolds()
+        {
+            if (!holdsDirty) return;
+            if (BodyTracking.Storage.ClimbingHoldStorage.Save(loadedHoldsMapId ?? HoldsMapId, holdMap))
+                holdsDirty = false;
+        }
+
+        /// <summary>Forget all inferred holds for the active map (clears memory + the persisted file).</summary>
+        public void ClearHolds()
+        {
+            holdMap.Clear();
+            string mapId = loadedHoldsMapId ?? HoldsMapId;
+            // Save an empty map rather than deleting the file; otherwise the next load would auto-generate again.
+            BodyTracking.Storage.ClimbingHoldStorage.Save(mapId, holdMap);
+            holdsDirty = false;
+        }
+
+        /// <summary>Force a fresh full-recording hold detection pass and save the resulting map.</summary>
+        public bool RegenerateHoldsFromRecording()
+        {
+            if (asset?.pose == null)
+                return false;
+            if (contactJointTable == null || contactJointTable.Length == 0)
+                ConfigurePostProcessing(asset.pose);
+
+            if (!wallProjectionSettings.enableHoldDetection)
+            {
+                holdMap.Clear();
+                holdsDirty = true;
+                SaveHolds();
+                return true;
+            }
+
+            bool ok = ClimbingHoldDetector.GenerateFromRecording(asset, recording, contactJointTable,
+                wallProjectionSettings, EffectivePlaybackAnchorSettings(), invertFacing, routeRootLocalOffset, out var generated);
+            if (!ok)
+                return false;
+
+            holdMap.LoadFromJson(generated.ToJson());
+            holdsDirty = true;
+            SaveHolds();
+            Debug.Log($"[FusedCharacterPlayer] Generated {holdMap.Count} inferred climbing holds for map '{HoldsMapId}'.");
+            return true;
+        }
 
         /// <summary>
         /// Calibrate the wall plane from the loaded recording (the climbing prior: the wall is where hands/feet get
@@ -427,6 +571,19 @@ namespace BodyTracking.Playback
             return true;
         }
 
+        /// <summary>
+        /// Startup calibration should match the manual "Calibrate wall to AR plane (front)" button first. If ARKit
+        /// has not detected a usable vertical plane yet, fall back to the older recording-depth estimate so playback
+        /// still has a reasonable wall instead of doing nothing.
+        /// </summary>
+        bool AutoCalibrateWallForPlayback()
+        {
+            if (CalibrateWallFromArPlane())
+                return true;
+
+            return !float.IsNaN(AutoCalibrateWallDepth());
+        }
+
         public float AutoCalibrateWallDepth()
         {
             if (!WallProjectionResolver.TryEstimateWallDepth(recording, out float wallDepth))
@@ -480,6 +637,7 @@ namespace BodyTracking.Playback
                 StopCoroutine(tuningSnapshotLogRoutine);
                 tuningSnapshotLogRoutine = null;
             }
+            SaveHolds();
         }
 
         IEnumerator TuningSnapshotLogLoop()
@@ -529,6 +687,11 @@ namespace BodyTracking.Playback
             sb.AppendLine("    smoothRootTranslation: " + YBool(pp.smoothRootTranslation));
             sb.AppendLine("    jumpVelocityThreshold: " + YFloat(pp.jumpVelocityThreshold));
             sb.AppendLine("    jumpBetaScale: " + YFloat(pp.jumpBetaScale));
+            sb.AppendLine("  enableRootMotionGuard: " + YBool(enableRootMotionGuard));
+            sb.AppendLine("  maxRootSpeed: " + YFloat(maxRootSpeed));
+            sb.AppendLine("  rootTeleportSnapDistance: " + YFloat(rootTeleportSnapDistance));
+            sb.AppendLine("  maxRootTurnSpeed: " + YFloat(maxRootTurnSpeed));
+            sb.AppendLine("  rootTurnSnapDegrees: " + YFloat(rootTurnSnapDegrees));
             sb.AppendLine("  enablePenetrationFix: " + YBool(enablePenetrationFix));
             sb.AppendLine("  penetrationSettings:");
             sb.AppendLine("    enableFloorFix: " + YBool(pen.enableFloorFix));
@@ -751,8 +914,18 @@ namespace BodyTracking.Playback
             Debug.Log($"[FusedCharacterPlayer] Rebound character to '{newRoot.name}' (playing={isPlaying}).");
         }
 
-        /// <summary>The ARKit recording the asset was baked from; used to anchor the pelvis and align facing.</summary>
-        public void SetSourceRecording(HipRecording sourceRecording) => recording = sourceRecording;
+        /// <summary>The ARKit recording the asset was baked from; used to anchor the pelvis, align facing, and pre-detect holds.</summary>
+        public void SetSourceRecording(HipRecording sourceRecording)
+        {
+            recording = sourceRecording;
+            if (asset != null)
+            {
+                if (autoCalibrateWallOnPlay && enableWallProjection)
+                    AutoCalibrateWallForPlayback();
+                loadedHoldsMapId = null;
+                EnsureHoldsLoaded();
+            }
+        }
 
         public bool LoadAsset(MoveAIFusionAsset fusionAsset)
         {
@@ -778,6 +951,12 @@ namespace BodyTracking.Playback
                     EnsureCharacterHumanoid();
                 ApplyRecordingHeightScale();
             }
+            if (asset.pose != null && (contactJointTable == null || contactJointTable.Length == 0))
+                ConfigurePostProcessing(asset.pose);
+            if (autoCalibrateWallOnPlay && enableWallProjection)
+                AutoCalibrateWallForPlayback();
+            loadedHoldsMapId = null;
+            EnsureHoldsLoaded();
             return true;
         }
 
@@ -831,9 +1010,11 @@ namespace BodyTracking.Playback
             loggedPlacement = false;
             anchorState = default;
             postProcessor.Reset();
+            ResetRootMotionGuard();
             wallProjection.Reset();
             if (autoCalibrateWallOnPlay && enableWallProjection)
-                AutoCalibrateWallDepth();
+                AutoCalibrateWallForPlayback();
+            EnsureHoldsLoaded();
             RefreshGlbPostProcess();
             glbSource?.ResetSmoothing();
             pendingPosedHeightRefit = glbActive;
@@ -850,6 +1031,7 @@ namespace BodyTracking.Playback
             isPaused = false;
             readyToApply = false;
             loggedPlacement = false;
+            SaveHolds();
             RestoreBindRootPose();
             SetCharacterVisible(false);
             OnPlaybackStopped?.Invoke();
@@ -874,6 +1056,8 @@ namespace BodyTracking.Playback
         {
             if (asset == null) return;
             playbackTime = Mathf.Clamp(time, 0f, asset.Duration);
+            // A seek is a deliberate relocation — let the body snap there instead of gliding from the old spot.
+            ResetRootMotionGuard();
             // Re-apply the frozen frame next LateUpdate so the character snaps to the new time even when paused.
             readyToApply = isPlaying && !waitingForLocalization;
         }
@@ -938,11 +1122,14 @@ namespace BodyTracking.Playback
             if (segmentLoopEnabled && segmentLoopEnd > segmentLoopStart)
             {
                 if (playbackTime >= segmentLoopEnd)
+                {
                     playbackTime = segmentLoopStart;
+                    ResetRootMotionGuard(); // loop wrap teleports the pelvis back to the start — snap, don't glide
+                }
             }
             else if (playbackTime >= duration)
             {
-                if (loop) playbackTime %= duration;
+                if (loop) { playbackTime %= duration; ResetRootMotionGuard(); }
                 else { StopPlayback(); return; }
             }
 
@@ -1019,13 +1206,30 @@ namespace BodyTracking.Playback
             // lock hands/feet that are gripping holds onto the wall surface. Runs on the shared world array so both
             // the procedural and GLB paths inherit it; the per-limb contacts also drive a rig-IK contact pass below.
             lastWallContacts = null;
+            lastWallValid = false;
             if (enableWallProjection && TryGetWallPlane(out Vector3 wallPoint, out Vector3 wallNormal))
             {
                 // #region agent log
                 PerfSampler.Begin("WallProjection");
                 // #endregion
-                wallProjection.ProjectIntoSlab(world, wallPoint, wallNormal, wallProjectionSettings);
-                lastWallContacts = wallProjection.ResolveContacts(world, contactJointTable, wallPoint, wallNormal, Time.deltaTime, wallProjectionSettings);
+                // Only constrain to the wall while the climber is actually on it. If they walk away — or are just
+                // standing on the floor in front of it — let the raw pose pass through (eased) so they aren't snapped
+                // onto the wall. Floor data is needed by the engagement gate, so resolve it first.
+                Transform routeRoot = routeRootProvider != null ? routeRootProvider.RouteRoot : null;
+                float floorWorldY = 0f;
+                bool hasFloor = surfaceProbe != null && surfaceProbe.HasFloor(out floorWorldY);
+                if (wallProjection.UpdateWallEngagement(world, wallPoint, wallNormal, hasFloor, floorWorldY,
+                        footWorldIndices, rootJointIndex, Time.deltaTime, wallProjectionSettings))
+                {
+                    wallProjection.ProjectIntoSlab(world, wallPoint, wallNormal, wallProjectionSettings);
+                    float contactDt = Mathf.Max(1f / FrameRate, Time.deltaTime * Mathf.Max(0.01f, playbackSpeed));
+                    lastWallContacts = wallProjection.ResolveContacts(world, contactJointTable, wallPoint, wallNormal,
+                        routeRoot, contactDt, hasFloor, floorWorldY, holdMap, wallProjectionSettings);
+                    // Cache the plane so the post-pose rig IK push-out (procedural + GLB) uses the exact same wall.
+                    lastWallPoint = wallPoint;
+                    lastWallNormal = wallNormal;
+                    lastWallValid = true;
+                }
                 // #region agent log
                 PerfSampler.End("WallProjection");
                 // #endregion
@@ -1087,6 +1291,11 @@ namespace BodyTracking.Playback
             // Pull any gripping hand/foot onto its locked hold.
             if (enableWallProjection && lastWallContacts != null)
                 penetrationResolver.ResolveContactLimbs(characterAnimator, lastWallContacts, jumping, penetrationSettings);
+            // Push any hand/foot still behind the wall skin back onto the surface (hold-independent), using the same
+            // flat wall plane as the slab so it works even where the AR probe / standing classification would skip it.
+            if (enableWallProjection && lastWallValid)
+                penetrationResolver.ResolveContactPlane(characterAnimator, lastWallContacts, lastWallPoint, lastWallNormal,
+                    wallProjectionSettings.wallSurfaceDepth, jumping, penetrationSettings);
             // #region agent log
             PerfSampler.End("Frame.ApplyFrame");
             // #endregion
@@ -1143,6 +1352,11 @@ namespace BodyTracking.Playback
             // Pull any gripping hand/foot onto its locked hold (works in GLB muscle space too).
             if (enableWallProjection && lastWallContacts != null)
                 penetrationResolver.ResolveContactLimbs(characterAnimator, lastWallContacts, postProcessor.LastJumping, penetrationSettings);
+            // Push any hand/foot still behind the wall skin back onto the surface — this is the path that fixes the
+            // GLB mesh limbs the slab can't reach (the slab only moves the world joints, not the muscle-space mesh).
+            if (enableWallProjection && lastWallValid)
+                penetrationResolver.ResolveContactPlane(characterAnimator, lastWallContacts, lastWallPoint, lastWallNormal,
+                    wallProjectionSettings.wallSurfaceDepth, postProcessor.LastJumping, penetrationSettings);
 
             if (!loggedPlacement)
             {
@@ -1187,23 +1401,112 @@ namespace BodyTracking.Playback
             hasLastFacingForward = true;
 
             Quaternion targetAnatomical = Quaternion.LookRotation(forward, Vector3.up);
-            if (hasRigBindAnatomical)
-                characterRoot.rotation = targetAnatomical * Quaternion.Inverse(rigBindLocalAnatomical);
-            else
-                characterRoot.rotation = targetAnatomical;
+            Quaternion desiredRotation = hasRigBindAnatomical
+                ? targetAnatomical * Quaternion.Inverse(rigBindLocalAnatomical)
+                : targetAnatomical;
+            characterRoot.rotation = ClampRootRotation(desiredRotation);
 
             // Foot-anchored placement: scale is head-to-foot, so pin feet to the orange skeleton — not hips.
             // Hip-only pinning made the feet look right but the head too high; shrinking fit-scale then floated the feet.
+            Vector3 targetPos;
             if (heightFitMode == HeightFitMode.SkeletonJoints && TryComputeFootPlacementCorrection(world, out Vector3 footCorrection))
+                targetPos = characterRoot.position + footCorrection;
+            else if (boneByJoint.TryGetValue(rootJointIndex, out var hipsBone) && hipsBone != null)
+                targetPos = characterRoot.position + (hipsW - hipsBone.position);
+            else
+                targetPos = hipsW;
+
+            characterRoot.position = ClampRootMotion(targetPos);
+        }
+
+        // --- Final root-motion safety net --------------------------------------------------------------------
+        // The muscle-space glitch guard / smoothing only clean the POSE (joints relative to the pelvis), and the GLB
+        // path even strips the clip's root motion entirely — so the body's WORLD placement (the fused anchor) is the
+        // one thing nothing else guards. A tracking spike, an anchor re-align, or the solver accepting a sustained
+        // pelvis jump can therefore make the body lurch "from one position to another". This caps the per-frame travel
+        // of the placed root to a sane top speed so neither the procedural nor the GLB path can ever teleport. It runs
+        // in RouteRoot-local space so that moving the phone (which moves referenceFrame) is never mistaken for the body
+        // moving, and a jump beyond rootTeleportSnapDistance (loop restart / genuine relocation) is allowed through 1:1
+        // so the guard recovers instead of crawling across the wall.
+        private Vector3 lastRootLocal;
+        private bool hasLastRootLocal;
+        private Quaternion lastRootLocalRot;
+        private bool hasLastRootLocalRot;
+
+        /// <summary>Forget the last placed root so the next frame seeds fresh (no glide from a stale spot). Call on
+        /// (re)start, seek, and loop wrap.</summary>
+        void ResetRootMotionGuard()
+        {
+            hasLastRootLocal = false;
+            hasLastRootLocalRot = false;
+        }
+
+        /// <summary>Cap how fast the character's facing can turn per frame so a noisy/flipped facing can't snap the
+        /// whole body around. Worked in RouteRoot-local space (like the position clamp) so turning the phone is never
+        /// clamped. A jump beyond rootTurnSnapDegrees (loop wrap / genuine re-facing) is allowed through 1:1.</summary>
+        Quaternion ClampRootRotation(Quaternion targetWorld)
+        {
+            if (!enableRootMotionGuard || maxRootTurnSpeed <= 0f)
+                return targetWorld;
+
+            Quaternion targetLocal = Quaternion.Inverse(referenceFrame.rotation) * targetWorld;
+            if (!hasLastRootLocalRot)
             {
-                characterRoot.position += footCorrection;
-                return;
+                lastRootLocalRot = targetLocal;
+                hasLastRootLocalRot = true;
+                return targetWorld;
             }
 
-            if (boneByJoint.TryGetValue(rootJointIndex, out var hipsBone) && hipsBone != null)
-                characterRoot.position += hipsW - hipsBone.position;
-            else
-                characterRoot.position = hipsW;
+            float ang = Quaternion.Angle(lastRootLocalRot, targetLocal);
+            if (rootTurnSnapDegrees > 0f && ang > rootTurnSnapDegrees)
+            {
+                lastRootLocalRot = targetLocal;
+                return targetWorld;
+            }
+
+            float dt = Mathf.Max(1e-4f, Time.deltaTime) * Mathf.Max(0.01f, playbackSpeed);
+            float maxDeg = maxRootTurnSpeed * dt;
+            if (maxDeg > 0f && ang > maxDeg)
+                targetLocal = Quaternion.RotateTowards(lastRootLocalRot, targetLocal, maxDeg);
+
+            lastRootLocalRot = targetLocal;
+            return referenceFrame.rotation * targetLocal;
+        }
+
+        Vector3 ClampRootMotion(Vector3 targetWorld)
+        {
+            if (!enableRootMotionGuard)
+                return targetWorld;
+
+            Vector3 targetLocal = referenceFrame.InverseTransformPoint(targetWorld);
+            if (!hasLastRootLocal)
+            {
+                lastRootLocal = targetLocal;
+                hasLastRootLocal = true;
+                return targetWorld;
+            }
+
+            Vector3 delta = targetLocal - lastRootLocal;
+            float dist = delta.magnitude;
+
+            // Genuine relocation (loop wrap / re-anchor to a far pelvis): accept it so we never crawl across the room.
+            if (rootTeleportSnapDistance > 0f && dist > rootTeleportSnapDistance)
+            {
+                lastRootLocal = targetLocal;
+                return targetWorld;
+            }
+
+            // Scale the budget by playbackSpeed so fast-forward isn't throttled, but a single-frame spike still is.
+            float dt = Mathf.Max(1e-4f, Time.deltaTime) * Mathf.Max(0.01f, playbackSpeed);
+            float maxStep = Mathf.Max(0f, maxRootSpeed) * dt;
+            if (maxStep > 0f && dist > maxStep)
+            {
+                targetLocal = lastRootLocal + delta * (maxStep / dist);
+                targetWorld = referenceFrame.TransformPoint(targetLocal);
+            }
+
+            lastRootLocal = targetLocal;
+            return targetWorld;
         }
 
         /// <summary>Average left/right foot error so both land on the orange skeleton after uniform scale.</summary>

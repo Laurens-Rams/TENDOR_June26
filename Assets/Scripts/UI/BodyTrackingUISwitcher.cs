@@ -131,12 +131,6 @@ namespace BodyTracking.UI
                 tuningScreen.BackButton.onClick.AddListener(ShowPlayback);
             }
 
-            if (playbackScreen != null && playbackScreen.RecordingsButton != null)
-            {
-                playbackScreen.RecordingsButton.onClick.RemoveListener(ShowRecordings);
-                playbackScreen.RecordingsButton.onClick.AddListener(ShowRecordings);
-            }
-
             if (recordingsScreen != null && recordingsScreen.BackButton != null)
             {
                 recordingsScreen.BackButton.onClick.RemoveListener(ShowPlayback);

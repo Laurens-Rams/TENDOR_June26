@@ -7,6 +7,7 @@ using BodyTracking;
 using BodyTracking.Spatial;
 using BodyTracking.Storage;
 using BodyTracking.Animation;
+using BodyTracking.MoveAI;
 
 namespace BodyTracking.UI
 {
@@ -20,8 +21,8 @@ namespace BodyTracking.UI
     /// the canvas contents.
     ///
     /// Layout:
-    ///   • Top status bar  — AR/body-tracking status, localization status, tracked-joint count (pills).
-    ///   • Move AI strip   — full-width line below the pills showing upload / fusion progress.
+    ///   • Top-left toolbar — round screen-toggle (play ↔ record) matching playback chrome.
+    ///   • Top status bar  — alignment + Move AI pills on one compact row (margined from screen edges).
     ///   • Bottom transport bar — media-style record / play-pause / stop controls, a recording selector,
     ///     and a scrub/timeline slider with current/total mm:ss labels.
     ///
@@ -58,11 +59,16 @@ namespace BodyTracking.UI
         private Image recordIcon;
         private GameObject playIcon;
         private GameObject pauseIcon;
-        private Image arDot, locDot, jointsDot;
-        private TextMeshProUGUI arLabel, locLabel, jointsLabel;
         private Image moveDot;
         private TextMeshProUGUI moveLabel;
-        private GameObject moveStatusRow;
+        private GameObject moveStatusPill;
+        private Button moveStatusButton;
+        private TextMeshProUGUI moveCountBadge;
+        private GameObject moveQueuePanel;
+        private RectTransform moveQueueListContent;
+        private TextMeshProUGUI moveQueueEmptyLabel;
+        private bool moveQueuePanelVisible;
+        private float nextMoveQueueRefreshTime;
         private TextMeshProUGUI currentTimeLabel, totalTimeLabel, recordingNameLabel;
         private Slider scrubSlider;
         private Button prevRecordingButton, nextRecordingButton;
@@ -81,6 +87,11 @@ namespace BodyTracking.UI
 
         // Record + review controls (minimal record screen).
         private const float RecordButtonDiameter = 74f;
+        private const float TopBarInset = UITokens.Space12;
+        private const float TopBarPillHeight = 20f;
+        private const float TopBarPillFont = 12f;
+        private const float TopBarDotSize = 6f;
+        private const float TopLeftToolbarInset = UITokens.Space12;
         private GameObject reviewRoot;
         private Button reviewReplayButton;
         private GameObject reviewReplayIcon;
@@ -203,6 +214,13 @@ namespace BodyTracking.UI
 
             if (Time.frameCount % 10 == 0)
                 UpdateUI();
+
+            // Keep the open Move AI queue panel live (states advance as jobs upload/process).
+            if (moveQueuePanelVisible && Time.unscaledTime >= nextMoveQueueRefreshTime)
+            {
+                nextMoveQueueRefreshTime = Time.unscaledTime + 0.5f;
+                RebuildMoveQueueList();
+            }
         }
 
         // ============================================================================================
@@ -335,16 +353,14 @@ namespace BodyTracking.UI
             le.preferredWidth = size; le.preferredHeight = size;
         }
 
-        /// <summary>Pill button that switches to the dedicated playback screen.</summary>
+        /// <summary>Round top-left button that switches to the dedicated playback screen (play icon).</summary>
         private void BuildScreenSwitchButton(RectTransform root)
         {
-            goToPlaybackButton = UIFactory.CreatePillButton("GoToPlaybackButton", root, "Playback", ghost: true);
-            var rect = (RectTransform)goToPlaybackButton.transform;
-            rect.sizeDelta = new Vector2(108f, 34f);
-            rect.anchorMin = new Vector2(0f, 1f);
-            rect.anchorMax = new Vector2(0f, 1f);
-            rect.pivot = new Vector2(0f, 1f);
-            rect.anchoredPosition = new Vector2(UITokens.Space12, -UITokens.Space8);
+            goToPlaybackButton = UIFactory.CreateCircleButton(
+                "GoToPlaybackButton", root, UITokens.ToolbarIconDiameter, UITokens.PlaybackTransportBtn);
+            UIFactory.PlaceTopLeftToolbarButton(
+                (RectTransform)goToPlaybackButton.transform, 0, UITokens.ToolbarIconDiameter, TopLeftToolbarInset);
+            UIFactory.AddPlayIcon(goToPlaybackButton.transform, UITokens.ToolbarIconDiameter * 0.34f, UITokens.OnSurface);
         }
 
         /// <summary>Wire the Playback pill to a screen switcher (called by <see cref="BodyTrackingUISwitcher"/>).</summary>
@@ -423,12 +439,15 @@ namespace BodyTracking.UI
             area.anchorMin = new Vector2(0f, 1f);
             area.anchorMax = new Vector2(1f, 1f);
             area.pivot = new Vector2(0.5f, 1f);
-            area.anchoredPosition = new Vector2(0f, -UITokens.Space8);
+            area.anchoredPosition = new Vector2(0f, -TopBarInset);
+            float leftReserve = UIFactory.TopLeftToolbarWidth(1, UITokens.ToolbarIconDiameter, TopLeftToolbarInset);
+            area.offsetMin = new Vector2(leftReserve, area.offsetMin.y);
+            area.offsetMax = new Vector2(-TopBarInset, area.offsetMax.y);
 
-            var layout = area.gameObject.AddComponent<VerticalLayoutGroup>();
-            layout.padding = new RectOffset((int)UITokens.Space12, (int)UITokens.Space12, 0, 0);
+            var layout = area.gameObject.AddComponent<HorizontalLayoutGroup>();
+            layout.padding = new RectOffset(0, 0, 0, 0);
             layout.spacing = UITokens.Space4;
-            layout.childAlignment = TextAnchor.UpperCenter;
+            layout.childAlignment = TextAnchor.MiddleCenter;
             layout.childControlWidth = true;
             layout.childControlHeight = true;
             layout.childForceExpandWidth = true;
@@ -438,67 +457,274 @@ namespace BodyTracking.UI
             areaFitter.horizontalFit = ContentSizeFitter.FitMode.Unconstrained;
             areaFitter.verticalFit = ContentSizeFitter.FitMode.PreferredSize;
 
+            var areaLayout = area.gameObject.AddComponent<LayoutElement>();
+            areaLayout.preferredHeight = TopBarPillHeight;
+            areaLayout.minHeight = TopBarPillHeight;
+
             BuildTopPillsRow(area);
-            BuildMoveStatusRow(area);
         }
 
         private void BuildTopPillsRow(RectTransform parent)
         {
-            var bar = UIFactory.CreateRect("TopPillsRow", parent);
-            var rowLayout = bar.gameObject.AddComponent<LayoutElement>();
-            rowLayout.preferredHeight = UITokens.PillHeight;
-            rowLayout.minHeight = UITokens.PillHeight;
-
-            var layout = bar.gameObject.AddComponent<HorizontalLayoutGroup>();
-            layout.spacing = UITokens.Space8;
-            layout.childAlignment = TextAnchor.MiddleCenter;
-            layout.childForceExpandWidth = true;
-            layout.childForceExpandHeight = false;
-            layout.childControlWidth = true;
-            layout.childControlHeight = true;
-
-            var ar = UIFactory.CreateStatusPill("Pill_AR", bar, "AR", autoSize: false);
-            arDot = ar.dot; arLabel = ar.label;
-            SetPillFlex(ar.root, 1f);
-
-            var loc = UIFactory.CreateStatusPill("Pill_Localization", bar, "Not localized", autoSize: false);
-            locDot = loc.dot; locLabel = loc.label;
-            SetPillFlex(loc.root, 1.7f);
-
-            var joints = UIFactory.CreateStatusPill("Pill_Joints", bar, "J: 0", autoSize: false);
-            jointsDot = joints.dot; jointsLabel = joints.label;
-            SetPillFlex(joints.root, 0.9f);
-
-            // Alignment / drift pill. Shows how far Immersal thinks the locked anchor has drifted (passive
-            // measure-only checks); tap to fully re-scan (clears the anchor and re-localizes). Hidden when
-            // Immersal isn't the active spatial source.
-            var align = UIFactory.CreateStatusPill("Pill_Align", bar, "Align", autoSize: false);
+            var align = UIFactory.CreateStatusPill("Pill_Align", parent, "Align", autoSize: false,
+                height: TopBarPillHeight, fontSize: TopBarPillFont, dotSize: TopBarDotSize);
             alignDot = align.dot; alignLabel = align.label;
             var alignBg = align.root.GetComponent<Image>();
             if (alignBg != null) alignBg.raycastTarget = true;
             alignButton = align.root.gameObject.AddComponent<Button>();
             alignButton.targetGraphic = alignBg;
-            // No color tint transition so the Button doesn't recolor the pill background (we drive the dot color).
             alignButton.transition = Selectable.Transition.None;
             alignButton.onClick.AddListener(OnAlignDotClicked);
-            SetPillFlex(align.root, 1.4f);
-        }
+            SetPillFlex(align.root, 1f);
 
-        private void BuildMoveStatusRow(RectTransform parent)
-        {
-            moveStatusRow = UIFactory.CreateRect("MoveStatusRow", parent).gameObject;
-            var rowLayout = moveStatusRow.AddComponent<LayoutElement>();
-            rowLayout.preferredHeight = UITokens.PillHeight;
-            rowLayout.minHeight = UITokens.PillHeight;
-
-            var pill = UIFactory.CreateStatusPill("MoveStatusPill", moveStatusRow.transform, "Move AI · idle", autoSize: false);
-            UIFactory.Stretch(pill.root);
+            var pill = UIFactory.CreateStatusPill("MoveStatusPill", parent, "Move AI · idle", autoSize: false,
+                height: TopBarPillHeight, fontSize: TopBarPillFont, dotSize: TopBarDotSize);
+            moveStatusPill = pill.root.gameObject;
             moveDot = pill.dot;
             moveLabel = pill.label;
             if (moveLabel != null)
             {
                 moveLabel.textWrappingMode = TMPro.TextWrappingModes.NoWrap;
                 moveLabel.overflowMode = TextOverflowModes.Ellipsis;
+            }
+            SetPillFlex(pill.root, 1.4f);
+
+            moveCountBadge = UIFactory.CreateText("MoveCountBadge", pill.root, "", TopBarPillFont - 1f,
+                UITokens.Muted, TextAlignmentOptions.Right);
+            var badgeLayout = moveCountBadge.gameObject.AddComponent<LayoutElement>();
+            badgeLayout.flexibleWidth = 0f;
+            badgeLayout.minWidth = 28f;
+            badgeLayout.preferredWidth = 36f;
+
+            var pillBg = pill.root.GetComponent<Image>();
+            if (pillBg != null) pillBg.raycastTarget = true;
+            moveStatusButton = pill.root.gameObject.AddComponent<Button>();
+            moveStatusButton.targetGraphic = pillBg;
+            moveStatusButton.transition = Selectable.Transition.None;
+            moveStatusButton.onClick.AddListener(ToggleMoveQueuePanel);
+
+            BuildMoveQueuePanel();
+        }
+
+        /// <summary>
+        /// Dropdown panel (hidden until the Move AI pill is tapped) listing every job in the upload queue —
+        /// recording name, enqueue date/time and live state — each with a small "x" to remove it from the queue.
+        /// </summary>
+        private void BuildMoveQueuePanel()
+        {
+            // Anchored to the top, overlaying the screen below the status area (not part of the top layout flow).
+            var panelRect = UIFactory.CreateRect("MoveQueuePanel", uiRoot);
+            panelRect.anchorMin = new Vector2(0f, 1f);
+            panelRect.anchorMax = new Vector2(1f, 1f);
+            panelRect.pivot = new Vector2(0.5f, 1f);
+            panelRect.anchoredPosition = new Vector2(0f, -(TopBarPillHeight + TopBarInset + UITokens.Space8));
+            panelRect.offsetMin = new Vector2(TopBarInset, panelRect.offsetMin.y);
+            panelRect.offsetMax = new Vector2(-TopBarInset, panelRect.offsetMax.y);
+
+            var bg = panelRect.gameObject.AddComponent<Image>();
+            bg.sprite = UIFactory.RoundedSprite((int)UITokens.RadiusMedium);
+            bg.type = Image.Type.Sliced;
+            bg.color = UITokens.SurfaceElevated;
+            bg.raycastTarget = true;
+
+            var vlayout = panelRect.gameObject.AddComponent<VerticalLayoutGroup>();
+            vlayout.padding = new RectOffset((int)UITokens.Space8, (int)UITokens.Space8, (int)UITokens.Space8, (int)UITokens.Space8);
+            vlayout.spacing = UITokens.Space4;
+            vlayout.childAlignment = TextAnchor.UpperCenter;
+            vlayout.childControlWidth = true;
+            vlayout.childControlHeight = true;
+            vlayout.childForceExpandWidth = true;
+            vlayout.childForceExpandHeight = false;
+
+            var fitter = panelRect.gameObject.AddComponent<ContentSizeFitter>();
+            fitter.horizontalFit = ContentSizeFitter.FitMode.Unconstrained;
+            fitter.verticalFit = ContentSizeFitter.FitMode.PreferredSize;
+
+            var header = UIFactory.CreateText("MoveQueueHeader", panelRect, "Move AI queue", UITokens.FontCaption,
+                UITokens.OnSurface, TextAlignmentOptions.Left);
+            var headerLayout = header.gameObject.AddComponent<LayoutElement>();
+            headerLayout.minHeight = 20f;
+            headerLayout.preferredHeight = 20f;
+
+            var listRect = UIFactory.CreateRect("MoveQueueList", panelRect);
+            var listLayout = listRect.gameObject.AddComponent<VerticalLayoutGroup>();
+            listLayout.spacing = UITokens.Space4;
+            listLayout.childControlWidth = true;
+            listLayout.childControlHeight = true;
+            listLayout.childForceExpandWidth = true;
+            listLayout.childForceExpandHeight = false;
+            var listFitter = listRect.gameObject.AddComponent<ContentSizeFitter>();
+            listFitter.horizontalFit = ContentSizeFitter.FitMode.Unconstrained;
+            listFitter.verticalFit = ContentSizeFitter.FitMode.PreferredSize;
+            moveQueueListContent = listRect;
+
+            moveQueueEmptyLabel = UIFactory.CreateText("MoveQueueEmpty", panelRect, "Nothing queued — record to send a climb.",
+                UITokens.FontCaption - 2f, UITokens.Muted, TextAlignmentOptions.Left);
+            var emptyLayout = moveQueueEmptyLabel.gameObject.AddComponent<LayoutElement>();
+            emptyLayout.minHeight = 18f;
+            emptyLayout.preferredHeight = 18f;
+
+            moveQueuePanel = panelRect.gameObject;
+            moveQueuePanel.SetActive(false);
+        }
+
+        private void ToggleMoveQueuePanel()
+        {
+            moveQueuePanelVisible = !moveQueuePanelVisible;
+            if (moveQueuePanel != null)
+            {
+                moveQueuePanel.SetActive(moveQueuePanelVisible);
+                if (moveQueuePanelVisible)
+                    moveQueuePanel.transform.SetAsLastSibling(); // overlay above the rest of the screen
+            }
+            if (moveQueuePanelVisible)
+                RebuildMoveQueueList();
+        }
+
+        private MoveAIFusionCoordinator MoveCoordinator =>
+            controller != null ? controller.fusionCoordinator : null;
+
+        /// <summary>Rebuild the queue rows from the coordinator snapshot (recording, date/time, state, remove "x").</summary>
+        private void RebuildMoveQueueList()
+        {
+            if (moveQueueListContent == null)
+                return;
+
+            for (int i = moveQueueListContent.childCount - 1; i >= 0; i--)
+                Destroy(moveQueueListContent.GetChild(i).gameObject);
+
+            var coordinator = MoveCoordinator;
+            string mapId = controller != null ? controller.GetActiveMapId() : "";
+            var items = coordinator != null
+                ? coordinator.GetQueueSnapshot(mapId)
+                : new System.Collections.Generic.List<MoveAIFusionCoordinator.MoveQueueItem>();
+
+            if (moveQueueEmptyLabel != null)
+                moveQueueEmptyLabel.gameObject.SetActive(items.Count == 0);
+
+            foreach (var item in items)
+                BuildMoveQueueRow(item);
+        }
+
+        private void BuildMoveQueueRow(MoveAIFusionCoordinator.MoveQueueItem item)
+        {
+            var row = UIFactory.CreateRect("Row_" + item.recordingFileName, moveQueueListContent);
+            var rowLayout = row.gameObject.AddComponent<HorizontalLayoutGroup>();
+            rowLayout.spacing = UITokens.Space8;
+            rowLayout.childAlignment = TextAnchor.MiddleLeft;
+            rowLayout.childControlWidth = true;
+            rowLayout.childControlHeight = true;
+            rowLayout.childForceExpandWidth = false;
+            rowLayout.childForceExpandHeight = false;
+            var rowLe = row.gameObject.AddComponent<LayoutElement>();
+            rowLe.minHeight = 38f;
+            rowLe.preferredHeight = 38f;
+
+            var rowBg = row.gameObject.AddComponent<Image>();
+            rowBg.sprite = UIFactory.RoundedSprite((int)UITokens.RadiusSmall);
+            rowBg.type = Image.Type.Sliced;
+            rowBg.color = UITokens.Surface;
+            rowBg.raycastTarget = false;
+
+            // State dot.
+            var dotRect = UIFactory.CreateRect("Dot", row);
+            var dotImg = dotRect.gameObject.AddComponent<Image>();
+            dotImg.sprite = UIFactory.CircleSprite();
+            dotImg.color = QueueStateColor(item.state);
+            dotImg.raycastTarget = false;
+            var dotLe = dotRect.gameObject.AddComponent<LayoutElement>();
+            dotLe.minWidth = 9f; dotLe.minHeight = 9f;
+            dotLe.preferredWidth = 9f; dotLe.preferredHeight = 9f;
+            dotLe.flexibleWidth = 0f;
+
+            // Name + date/time + state (two short lines).
+            string when = FormatEnqueuedTime(item.enqueuedUtc);
+            string stateText = QueueStateText(item.state, item.error, item.progressPercent);
+            var text = UIFactory.CreateText("Info", row,
+                $"{item.recordingFileName}\n{when} · {stateText}",
+                UITokens.FontCaption - 3f, UITokens.OnSurface, TextAlignmentOptions.Left);
+            text.textWrappingMode = TMPro.TextWrappingModes.NoWrap;
+            text.overflowMode = TextOverflowModes.Ellipsis;
+            var textLe = text.gameObject.AddComponent<LayoutElement>();
+            textLe.flexibleWidth = 1f;
+
+            // Remove ("x") button.
+            var removeBtn = UIFactory.CreateCircleButton("Remove", row, 26f, UITokens.Danger);
+            var removeLe = removeBtn.gameObject.AddComponent<LayoutElement>();
+            removeLe.minWidth = 26f; removeLe.minHeight = 26f;
+            removeLe.preferredWidth = 26f; removeLe.preferredHeight = 26f;
+            removeLe.flexibleWidth = 0f;
+            AddCrossIcon(removeBtn.transform, 11f, Color.white);
+            string fileName = item.recordingFileName;
+            removeBtn.onClick.AddListener(() => OnRemoveFromQueueClicked(fileName));
+        }
+
+        private void OnRemoveFromQueueClicked(string recordingFileName)
+        {
+            var coordinator = MoveCoordinator;
+            if (coordinator != null)
+                coordinator.RemoveFromQueue(recordingFileName);
+            RebuildMoveQueueList();
+            UpdateMoveStatusLine();
+        }
+
+        /// <summary>Two crossed strokes forming an "x" (remove glyph), built from primitives so it always renders.</summary>
+        private static void AddCrossIcon(Transform parent, float size, Color color)
+        {
+            for (int i = 0; i < 2; i++)
+            {
+                var bar = UIFactory.CreateRect(i == 0 ? "CrossA" : "CrossB", parent);
+                bar.anchorMin = new Vector2(0.5f, 0.5f);
+                bar.anchorMax = new Vector2(0.5f, 0.5f);
+                bar.pivot = new Vector2(0.5f, 0.5f);
+                bar.sizeDelta = new Vector2(Mathf.Max(2f, size * 0.18f), size);
+                bar.anchoredPosition = Vector2.zero;
+                bar.localRotation = Quaternion.Euler(0f, 0f, i == 0 ? 45f : -45f);
+                var img = bar.gameObject.AddComponent<Image>();
+                img.sprite = UIFactory.RoundedSprite(2);
+                img.type = Image.Type.Sliced;
+                img.color = color;
+                img.raycastTarget = false;
+            }
+        }
+
+        private static string FormatEnqueuedTime(string enqueuedUtc)
+        {
+            if (string.IsNullOrEmpty(enqueuedUtc))
+                return "—";
+            if (System.DateTime.TryParse(enqueuedUtc, null, System.Globalization.DateTimeStyles.RoundtripKind, out var utc))
+                return utc.ToLocalTime().ToString("MMM d, HH:mm");
+            return enqueuedUtc;
+        }
+
+        private static string QueueStateText(MoveQueueState state, string error, float progressPercent = -1f)
+        {
+            string label;
+            switch (state)
+            {
+                case MoveQueueState.Queued: return "queued";
+                case MoveQueueState.Uploading: label = "uploading"; break;
+                case MoveQueueState.Processing: label = "processing"; break;
+                case MoveQueueState.Downloading: label = "downloading"; break;
+                case MoveQueueState.Baking: label = "baking"; break;
+                case MoveQueueState.Done: return "done";
+                case MoveQueueState.Failed: return string.IsNullOrEmpty(error) ? "failed" : "failed: " + error;
+                default: return state.ToString().ToLowerInvariant();
+            }
+
+            if (progressPercent >= 0f && progressPercent <= 100f)
+                return $"{label} · {progressPercent:F0}%";
+            return label;
+        }
+
+        private static Color QueueStateColor(MoveQueueState state)
+        {
+            switch (state)
+            {
+                case MoveQueueState.Done: return UITokens.Success;
+                case MoveQueueState.Failed: return UITokens.Danger;
+                case MoveQueueState.Queued: return UITokens.Muted;
+                default: return UITokens.Primary; // uploading / processing / downloading / baking
             }
         }
 
@@ -693,6 +919,9 @@ namespace BodyTracking.UI
             if (controller != null)
                 controller.LoadLatestRecording();
             RefreshRecordingsList();
+            if (moveQueuePanelVisible)
+                RebuildMoveQueueList();
+            UpdateMoveStatusLine();
             UpdateUI();
         }
 
@@ -896,36 +1125,8 @@ namespace BodyTracking.UI
         {
             if (controller == null) return;
 
-            // AR / body tracking pill.
-            bool hasBody = controller.recorder != null && controller.recorder.HasTrackedBody;
-            if (arLabel != null) arLabel.text = hasBody ? "Body OK" : (controller.IsInitialized ? "No body" : "Starting");
-            if (arDot != null) arDot.color = hasBody ? UITokens.Success : UITokens.Warning;
-
-            // Localization pill — green dot = success; label names the active source (no unicode symbols;
-            // LiberationSans on device does not render checkmarks).
-            bool localized = controller.IsLocalized;
-            bool locked = controller.IsAnchorLocked;
-            string source = controller.SpatialSourceLabel;
-            if (locLabel != null)
-            {
-                if (locked)
-                    locLabel.text = "Locked — ready";
-                else if (localized)
-                    locLabel.text = source == "Immersal" ? "Aligning…" : "Marker OK";
-                else if (source == "Immersal")
-                    locLabel.text = "Scanning…";
-                else
-                    locLabel.text = "Need marker";
-            }
-            // Green only once truly locked/stable; amber while still aligning so you know to keep scanning.
-            if (locDot != null)
-                locDot.color = locked ? UITokens.Success : (localized ? UITokens.Primary : UITokens.Warning);
-
-            // Tracked-joint count pill.
-            int joints = controller.recorder != null ? controller.recorder.LastTrackedJointCount : 0;
-            if (jointsLabel != null) jointsLabel.text = $"J: {joints}";
-            if (jointsDot != null) jointsDot.color = joints > 0 ? UITokens.Success : UITokens.Muted;
-
+            // AR / body-tracking, localization and joint-count pills were removed from the top bar; only the
+            // alignment / drift pill remains (the rest surfaces through the mode caption above the record button).
             UpdateAlignPill();
         }
 
@@ -993,20 +1194,34 @@ namespace BodyTracking.UI
 
         private void UpdateMoveStatusLine()
         {
-            if (moveStatusRow == null || moveLabel == null)
+            if (moveStatusPill == null || moveLabel == null)
                 return;
 
             if (controller == null || !controller.MoveAIEnabled)
             {
-                moveStatusRow.SetActive(false);
+                moveStatusPill.SetActive(false);
+                if (moveQueuePanel != null && moveQueuePanelVisible)
+                {
+                    moveQueuePanelVisible = false;
+                    moveQueuePanel.SetActive(false);
+                }
                 return;
             }
 
-            moveStatusRow.SetActive(true);
+            moveStatusPill.SetActive(true);
             string text = GetMoveStatusText();
             moveLabel.text = text;
             if (moveDot != null)
                 moveDot.color = GetMoveStatusColor(text);
+
+            // Count badge: number of jobs still pending/in flight, plus a chevron hint that it opens a list.
+            if (moveCountBadge != null)
+            {
+                string mapId = controller != null ? controller.GetActiveMapId() : "";
+                int pending = MoveCoordinator != null ? MoveCoordinator.PendingCountForMap(mapId) : 0;
+                moveCountBadge.text = pending > 0 ? $"{pending}  >" : ">";
+                moveCountBadge.color = pending > 0 ? UITokens.Primary : UITokens.Muted;
+            }
         }
 
         private string GetMoveStatusText()
@@ -1044,7 +1259,12 @@ namespace BodyTracking.UI
             return UITokens.Muted;
         }
 
-        private void OnFusionStatusChanged(string message) => UpdateMoveStatusLine();
+        private void OnFusionStatusChanged(string message)
+        {
+            UpdateMoveStatusLine();
+            if (moveQueuePanelVisible)
+                RebuildMoveQueueList();
+        }
 
         private void UpdateTransportTime()
         {
