@@ -46,9 +46,8 @@ namespace BodyTracking.UI
         public TMP_Dropdown recordingsDropdown;
 
         [Header("UI visibility")]
-        [Tooltip("Panel hidden when the visibility toggle is tapped. Auto-set to the bottom transport bar.")]
+        [Tooltip("Optional panel toggled with the main UI visibility (legacy; unused on the minimal record screen).")]
         [SerializeField] private GameObject mainUiPanel;
-        [SerializeField] private bool createToggleIfMissing = true;
 
         [Header("System")]
         public BodyTrackingController controller;
@@ -67,15 +66,8 @@ namespace BodyTracking.UI
         private TextMeshProUGUI currentTimeLabel, totalTimeLabel, recordingNameLabel;
         private Slider scrubSlider;
         private Button prevRecordingButton, nextRecordingButton;
-        private Button visibilityToggleButton;
         private Button realignButton;
-        private RectTransform visibilityToggleIcon;
-        private CharacterSwitcher characterSwitcher;
-        private Button debugToggleButton;
-        private RectTransform debugToggleIcon;
-        private DebugVisualsController debugVisuals;
         private ImmersalMapSwitcher mapSwitcher;
-        private Button mapToggleButton;
         private TextMeshProUGUI mapToggleLabel;
         private GameObject mapPanel;
         private TMP_InputField mapIdInput;
@@ -85,6 +77,16 @@ namespace BodyTracking.UI
         private bool mapPanelVisible;
         private Button goToPlaybackButton;
 
+        // Record + review controls (minimal record screen).
+        private const float RecordButtonDiameter = 74f;
+        private GameObject reviewRoot;
+        private Button reviewReplayButton;
+        private GameObject reviewReplayIcon;
+        private GameObject reviewPauseIcon;
+        private Button rejectButton;
+        private Button confirmButton;
+        private TextMeshProUGUI reviewCaption;
+
         // State
         private readonly List<string> availableRecordings = new List<string>();
         private int selectedRecordingIndex;
@@ -92,6 +94,7 @@ namespace BodyTracking.UI
         private bool suppressScrubCallback;
         private const float TransportRefreshInterval = 0.1f;
         private float nextTransportRefreshTime;
+        private float selectedRecordingDuration;
 
         private bool initialized;
 
@@ -156,9 +159,13 @@ namespace BodyTracking.UI
             controller.OnModeChanged -= OnModeChanged;
             controller.OnRecordingComplete -= OnRecordingComplete;
             controller.OnFusionStatusChanged -= OnFusionStatusChanged;
+            controller.OnReviewStarted -= OnReviewStarted;
+            controller.OnReviewResolved -= OnReviewResolved;
             controller.OnModeChanged += OnModeChanged;
             controller.OnRecordingComplete += OnRecordingComplete;
             controller.OnFusionStatusChanged += OnFusionStatusChanged;
+            controller.OnReviewStarted += OnReviewStarted;
+            controller.OnReviewResolved += OnReviewResolved;
         }
 
         private void UnsubscribeControllerEvents()
@@ -169,6 +176,8 @@ namespace BodyTracking.UI
             controller.OnModeChanged -= OnModeChanged;
             controller.OnRecordingComplete -= OnRecordingComplete;
             controller.OnFusionStatusChanged -= OnFusionStatusChanged;
+            controller.OnReviewStarted -= OnReviewStarted;
+            controller.OnReviewResolved -= OnReviewResolved;
         }
 
         void Update()
@@ -225,12 +234,103 @@ namespace BodyTracking.UI
             DeactivateLegacyUI(canvas);
 
             BuildTopStatusArea(uiRoot);
-            BuildBottomTransportBar(uiRoot);
-            BuildVisibilityToggle(uiRoot);
+            BuildModeCaption(uiRoot);
+            BuildRecordButton(uiRoot);
+            BuildReviewControls(uiRoot);
             BuildMapSwitcher(uiRoot);
             BuildScreenSwitchButton(uiRoot);
 
             ApplyMainUiVisibility();
+        }
+
+        /// <summary>Mode hint shown just above the record button (e.g. "Localized — tap Record", "Recording").</summary>
+        private void BuildModeCaption(RectTransform root)
+        {
+            // statusText is referenced by tooling/map feedback but hidden from the minimal record UI.
+            var hidden = UIFactory.CreateText("StatusText", root, string.Empty, UITokens.FontCaption, UITokens.Muted, TextAlignmentOptions.Center);
+            statusText = hidden;
+            statusText.gameObject.SetActive(false);
+
+            modeText = UIFactory.CreateText("ModeCaption", root, "Initializing…", UITokens.FontCaption, UITokens.OnSurface, TextAlignmentOptions.Center);
+            var rect = modeText.rectTransform;
+            rect.anchorMin = new Vector2(0.5f, 0f);
+            rect.anchorMax = new Vector2(0.5f, 0f);
+            rect.pivot = new Vector2(0.5f, 0f);
+            rect.sizeDelta = new Vector2(320f, 24f);
+            rect.anchoredPosition = new Vector2(0f, RecordButtonDiameter + UITokens.Space12 + UITokens.Space8);
+        }
+
+        /// <summary>Single large record button, bottom-center (playback-style glass circle).</summary>
+        private void BuildRecordButton(RectTransform root)
+        {
+            recordButton = UIFactory.CreateCircleButton("RecordButton", root, RecordButtonDiameter, UITokens.PlaybackTransportBtn);
+            var rect = (RectTransform)recordButton.transform;
+            rect.anchorMin = new Vector2(0.5f, 0f);
+            rect.anchorMax = new Vector2(0.5f, 0f);
+            rect.pivot = new Vector2(0.5f, 0f);
+            rect.anchoredPosition = new Vector2(0f, UITokens.Space12);
+            recordIcon = UIFactory.AddRecordIcon(recordButton.transform, 22f, UITokens.Danger, square: false);
+        }
+
+        /// <summary>
+        /// Bottom-center review cluster shown after a recording stops: replay the skeleton, then Discard or
+        /// Confirm. Confirm sends the clip to Move AI; Discard deletes it. Hidden until a review is pending.
+        /// </summary>
+        private void BuildReviewControls(RectTransform root)
+        {
+            var clusterRect = UIFactory.CreateRect("ReviewControls", root);
+            clusterRect.anchorMin = new Vector2(0.5f, 0f);
+            clusterRect.anchorMax = new Vector2(0.5f, 0f);
+            clusterRect.pivot = new Vector2(0.5f, 0f);
+            clusterRect.anchoredPosition = new Vector2(0f, UITokens.Space12);
+            clusterRect.sizeDelta = new Vector2(320f, RecordButtonDiameter);
+            reviewRoot = clusterRect.gameObject;
+
+            var layout = clusterRect.gameObject.AddComponent<HorizontalLayoutGroup>();
+            layout.spacing = UITokens.Space12;
+            layout.childAlignment = TextAnchor.MiddleCenter;
+            layout.childForceExpandWidth = false;
+            layout.childForceExpandHeight = false;
+            layout.childControlWidth = true;
+            layout.childControlHeight = true;
+
+            // Discard (danger).
+            rejectButton = UIFactory.CreateCircleButton("RejectButton", clusterRect, 52f, UITokens.Danger);
+            SetReviewButtonSize(rejectButton.gameObject, 52f);
+            UIFactory.AddStopIcon(rejectButton.transform, 16f, Color.white);
+
+            // Replay / pause (glass, teal-style like the playback transport).
+            reviewReplayButton = UIFactory.CreateCircleButton("ReviewReplayButton", clusterRect, RecordButtonDiameter, UITokens.PlaybackTransportPlay);
+            SetReviewButtonSize(reviewReplayButton.gameObject, RecordButtonDiameter);
+            reviewReplayIcon = UIFactory.AddPlayIcon(reviewReplayButton.transform, 26f, Color.white).gameObject;
+            reviewPauseIcon = UIFactory.AddPauseIcon(reviewReplayButton.transform, 22f, Color.white);
+            reviewPauseIcon.SetActive(false);
+
+            // Confirm (primary accent).
+            confirmButton = UIFactory.CreateCircleButton("ConfirmButton", clusterRect, 52f, UITokens.Success);
+            SetReviewButtonSize(confirmButton.gameObject, 52f);
+            UIFactory.AddCheckmarkIcon(confirmButton.transform, 22f, Color.white);
+
+            // Caption above the cluster.
+            reviewCaption = UIFactory.CreateText("ReviewCaption", root, "Review the skeleton — keep or discard?",
+                UITokens.FontCaption, UITokens.OnSurface, TextAlignmentOptions.Center);
+            var capRect = reviewCaption.rectTransform;
+            capRect.anchorMin = new Vector2(0.5f, 0f);
+            capRect.anchorMax = new Vector2(0.5f, 0f);
+            capRect.pivot = new Vector2(0.5f, 0f);
+            capRect.sizeDelta = new Vector2(340f, 24f);
+            capRect.anchoredPosition = new Vector2(0f, RecordButtonDiameter + UITokens.Space12 + UITokens.Space8);
+
+            reviewRoot.SetActive(false);
+            reviewCaption.gameObject.SetActive(false);
+        }
+
+        private static void SetReviewButtonSize(GameObject go, float size)
+        {
+            var le = go.GetComponent<LayoutElement>();
+            if (le == null) le = go.AddComponent<LayoutElement>();
+            le.minWidth = size; le.minHeight = size;
+            le.preferredWidth = size; le.preferredHeight = size;
         }
 
         /// <summary>Pill button that switches to the dedicated playback screen.</summary>
@@ -401,167 +501,6 @@ namespace BodyTracking.UI
             le.preferredWidth = 0f;
         }
 
-        private void BuildBottomTransportBar(RectTransform root)
-        {
-            var bar = UIFactory.CreatePanel("BottomTransportBar", root, UITokens.Surface, UITokens.RadiusLarge);
-            var barRect = bar.rectTransform;
-            barRect.anchorMin = new Vector2(0f, 0f);
-            barRect.anchorMax = new Vector2(1f, 0f);
-            barRect.pivot = new Vector2(0.5f, 0f);
-            barRect.sizeDelta = new Vector2(-UITokens.Space12 * 2f, 192f);
-            barRect.anchoredPosition = new Vector2(0f, UITokens.Space8);
-            bar.raycastTarget = true; // bar absorbs taps so they don't fall through to AR content
-
-            mainUiPanel = bar.gameObject;
-
-            var column = bar.gameObject.AddComponent<VerticalLayoutGroup>();
-            column.padding = new RectOffset((int)UITokens.Space16, (int)UITokens.Space16, (int)UITokens.Space12, (int)UITokens.Space16);
-            column.spacing = UITokens.Space8;
-            column.childAlignment = TextAnchor.UpperCenter;
-            column.childControlWidth = true;
-            column.childControlHeight = true;
-            column.childForceExpandWidth = true;
-            column.childForceExpandHeight = false;
-
-            BuildHeaderRow(barRect);
-            // Recording selection + Load/Re-align controls removed: playback always uses the latest recording,
-            // and the timeline (scrub) below is the only transport affordance besides play/pause/stop.
-            BuildScrubRow(barRect);
-            BuildTransportRow(barRect);
-        }
-
-        private void BuildHeaderRow(RectTransform parent)
-        {
-            var row = UIFactory.CreateRect("HeaderRow", parent);
-            SetRowHeight(row, 28f);
-
-            modeText = UIFactory.CreateText("ModeText", row, "Initializing…", UITokens.FontBody, UITokens.OnSurface, TextAlignmentOptions.Left);
-            UIFactory.Stretch(modeText.rectTransform);
-
-            // statusText is kept (referenced by tooling/controller) but hidden from the minimal UI; it
-            // carries an optional concise status string for diagnostics.
-            statusText = UIFactory.CreateText("StatusText", row, string.Empty, UITokens.FontCaption, UITokens.Muted, TextAlignmentOptions.Left);
-            UIFactory.Stretch(statusText.rectTransform);
-            statusText.gameObject.SetActive(false);
-        }
-
-        private void BuildScrubRow(RectTransform parent)
-        {
-            var row = UIFactory.CreateRect("ScrubRow", parent);
-            SetRowHeight(row, 26f);
-
-            var layout = row.gameObject.AddComponent<HorizontalLayoutGroup>();
-            layout.spacing = UITokens.Space8;
-            layout.childAlignment = TextAnchor.MiddleCenter;
-            layout.childForceExpandWidth = false;
-            layout.childForceExpandHeight = true;
-            layout.childControlWidth = true;
-            layout.childControlHeight = true;
-
-            currentTimeLabel = UIFactory.CreateText("CurrentTime", row, "00:00", UITokens.FontCaption, UITokens.Muted, TextAlignmentOptions.Center);
-            SetLayout(currentTimeLabel.gameObject, prefW: 56f);
-
-            scrubSlider = UIFactory.CreateScrubSlider("Scrubber", row);
-            SetLayout(scrubSlider.gameObject, flexW: 1f, prefH: UITokens.ScrubHandleDiameter);
-            scrubSlider.onValueChanged.AddListener(OnScrubChanged);
-
-            totalTimeLabel = UIFactory.CreateText("TotalTime", row, "00:00", UITokens.FontCaption, UITokens.Muted, TextAlignmentOptions.Center);
-            SetLayout(totalTimeLabel.gameObject, prefW: 56f);
-        }
-
-        private void BuildTransportRow(RectTransform parent)
-        {
-            var row = UIFactory.CreateRect("TransportRow", parent);
-            SetRowHeight(row, UITokens.TransportPrimaryDiameter);
-
-            var layout = row.gameObject.AddComponent<HorizontalLayoutGroup>();
-            layout.spacing = UITokens.Space24;
-            layout.childAlignment = TextAnchor.MiddleCenter;
-            layout.childForceExpandWidth = false;
-            layout.childForceExpandHeight = false;
-            layout.childControlWidth = true;
-            layout.childControlHeight = true;
-
-            // Record (toggles between record-dot and stop-square).
-            recordButton = UIFactory.CreateCircleButton("RecordButton", row, UITokens.TransportSecondaryDiameter, UITokens.SurfaceElevated);
-            SetLayout(recordButton.gameObject, prefW: UITokens.TransportSecondaryDiameter, prefH: UITokens.TransportSecondaryDiameter);
-            recordIcon = UIFactory.AddRecordIcon(recordButton.transform, 18f, UITokens.Danger, square: false);
-
-            // Play / pause (primary accent).
-            playButton = UIFactory.CreateCircleButton("PlayButton", row, UITokens.TransportPrimaryDiameter, UITokens.Primary);
-            SetLayout(playButton.gameObject, prefW: UITokens.TransportPrimaryDiameter, prefH: UITokens.TransportPrimaryDiameter);
-            playIcon = UIFactory.AddPlayIcon(playButton.transform, 26f, Color.white).gameObject;
-            pauseIcon = UIFactory.AddPauseIcon(playButton.transform, 22f, Color.white);
-            pauseIcon.SetActive(false);
-
-            // Stop (also wired to the public stopPlayButton field).
-            stopPlayButton = UIFactory.CreateCircleButton("StopButton", row, UITokens.TransportSecondaryDiameter, UITokens.SurfaceElevated);
-            SetLayout(stopPlayButton.gameObject, prefW: UITokens.TransportSecondaryDiameter, prefH: UITokens.TransportSecondaryDiameter);
-            UIFactory.AddStopIcon(stopPlayButton.transform, 16f, UITokens.OnSurface);
-        }
-
-        private void BuildVisibilityToggle(RectTransform root)
-        {
-            if (!createToggleIfMissing)
-                return;
-
-            float topY = -(UITokens.Space8 + UITokens.PillHeight * 2f + UITokens.Space4 + 4f);
-
-            // Top-right circle: cycle through the available playback characters.
-            visibilityToggleButton = UIFactory.CreateCircleButton("CharacterCycleButton", root, 34f, UITokens.SurfaceElevated);
-            var cycleRect = (RectTransform)visibilityToggleButton.transform;
-            cycleRect.anchorMin = new Vector2(1f, 1f);
-            cycleRect.anchorMax = new Vector2(1f, 1f);
-            cycleRect.pivot = new Vector2(1f, 1f);
-            cycleRect.anchoredPosition = new Vector2(-UITokens.Space12, topY);
-            visibilityToggleIcon = (RectTransform)UIFactory.AddPlayIcon(cycleRect, 12f, UITokens.OnSurface).transform;
-
-            characterSwitcher = UnityEngine.Object.FindFirstObjectByType<CharacterSwitcher>();
-            visibilityToggleButton.onClick.AddListener(OnCycleCharacterClicked);
-
-            // Second circle just below: toggle the AR debug visuals (skeletons, Immersal/AR-plane dots, overlays).
-            debugVisuals = UnityEngine.Object.FindFirstObjectByType<DebugVisualsController>();
-            if (debugVisuals == null)
-                debugVisuals = gameObject.AddComponent<DebugVisualsController>();
-
-            debugToggleButton = UIFactory.CreateCircleButton("DebugToggleButton", root, 34f, UITokens.Primary);
-            var dbgRect = (RectTransform)debugToggleButton.transform;
-            dbgRect.anchorMin = new Vector2(1f, 1f);
-            dbgRect.anchorMax = new Vector2(1f, 1f);
-            dbgRect.pivot = new Vector2(1f, 1f);
-            dbgRect.anchoredPosition = new Vector2(-UITokens.Space12, topY - 42f);
-            debugToggleIcon = (RectTransform)UIFactory.AddPlayIcon(dbgRect, 12f, Color.white).transform;
-
-            debugToggleButton.onClick.AddListener(OnToggleDebugVisualsClicked);
-            UpdateDebugToggleIcon();
-        }
-
-        private void OnCycleCharacterClicked()
-        {
-            if (characterSwitcher == null)
-                characterSwitcher = UnityEngine.Object.FindFirstObjectByType<CharacterSwitcher>();
-            if (characterSwitcher != null)
-                characterSwitcher.CycleCharacter();
-            else
-                UnityEngine.Debug.LogWarning("[BodyTrackingUI] No CharacterSwitcher found in scene — cannot cycle characters.");
-        }
-
-        private void OnToggleDebugVisualsClicked()
-        {
-            if (debugVisuals != null)
-                debugVisuals.Toggle();
-            UpdateDebugToggleIcon();
-        }
-
-        private void UpdateDebugToggleIcon()
-        {
-            if (debugToggleIcon == null)
-                return;
-            bool showing = debugVisuals == null || debugVisuals.VisualsVisible;
-            // Point the chevron down while debug visuals are shown (tap to hide), up once hidden.
-            debugToggleIcon.localRotation = Quaternion.Euler(0f, 0f, showing ? -90f : 90f);
-        }
-
         /// <summary>
         /// Top-left control to enter a new Immersal map id at runtime (device builds). Downloads map
         /// data and the sparse visualization, then updates localization for the whole session.
@@ -609,9 +548,7 @@ namespace BodyTracking.UI
                 return;
 
             BuildMapSwitcher(uiRoot);
-            mapUiBuilt = mapToggleButton != null;
-            if (mapUiBuilt)
-                SyncMapInputFromSwitcher();
+            mapUiBuilt = realignButton != null;
         }
 
         private void BuildMapSwitcher(RectTransform root)
@@ -622,25 +559,16 @@ namespace BodyTracking.UI
                 return;
             }
 
+            // Map id switching now lives in the dedicated Recordings menu (RecordingsMenuUI). We still listen for
+            // map switches here so the record screen reloads the latest recording + refreshes its list, but the
+            // map id pill/panel is no longer built on this screen.
             mapSwitcher.OnStatusChanged -= OnMapSwitcherStatusChanged;
             mapSwitcher.OnMapSwitched -= OnMapSwitched;
             mapSwitcher.OnStatusChanged += OnMapSwitcherStatusChanged;
             mapSwitcher.OnMapSwitched += OnMapSwitched;
 
             float topY = -(UITokens.Space8 + UITokens.PillHeight * 2f + UITokens.Space4 + 4f);
-            const float mapPillWidth = 120f;
             const float mapPillHeight = 34f;
-            const float mapPillGap = UITokens.Space8;
-
-            mapToggleButton = UIFactory.CreatePillButton("MapToggle", root, "Map —", ghost: true);
-            var toggleRect = (RectTransform)mapToggleButton.transform;
-            toggleRect.sizeDelta = new Vector2(mapPillWidth, mapPillHeight);
-            toggleRect.anchorMin = new Vector2(0f, 1f);
-            toggleRect.anchorMax = new Vector2(0f, 1f);
-            toggleRect.pivot = new Vector2(0f, 1f);
-            toggleRect.anchoredPosition = new Vector2(UITokens.Space12, topY - 42f);
-            mapToggleLabel = mapToggleButton.GetComponentInChildren<TextMeshProUGUI>();
-            mapToggleButton.onClick.AddListener(ToggleMapPanel);
 
             realignButton = UIFactory.CreatePillButton("ImmersalRetargetRealign", root, "Retarget & align", ghost: true);
             var realignRect = (RectTransform)realignButton.transform;
@@ -648,59 +576,10 @@ namespace BodyTracking.UI
             realignRect.anchorMin = new Vector2(0f, 1f);
             realignRect.anchorMax = new Vector2(0f, 1f);
             realignRect.pivot = new Vector2(0f, 1f);
-            realignRect.anchoredPosition = new Vector2(UITokens.Space12, topY - 42f - mapPillHeight - mapPillGap);
+            realignRect.anchoredPosition = new Vector2(UITokens.Space12, topY - 42f);
             realignButton.onClick.RemoveListener(OnRetargetRealignClicked);
             realignButton.onClick.AddListener(OnRetargetRealignClicked);
 
-            mapPanel = UIFactory.CreatePanel("MapPanel", root, UITokens.Surface, UITokens.RadiusLarge).gameObject;
-            var panelRect = mapPanel.GetComponent<RectTransform>();
-            panelRect.anchorMin = new Vector2(0f, 1f);
-            panelRect.anchorMax = new Vector2(0f, 1f);
-            panelRect.pivot = new Vector2(0f, 1f);
-            panelRect.sizeDelta = new Vector2(280f, 168f);
-            panelRect.anchoredPosition = new Vector2(UITokens.Space12, topY - 42f - (mapPillHeight + mapPillGap) * 2f - UITokens.Space8);
-            var panelImage = mapPanel.GetComponent<Image>();
-            panelImage.raycastTarget = true;
-            // Keep the map panel above transport controls so Load is always tappable.
-            panelRect.SetAsLastSibling();
-
-            var column = mapPanel.AddComponent<VerticalLayoutGroup>();
-            column.padding = new RectOffset((int)UITokens.Space12, (int)UITokens.Space12, (int)UITokens.Space8, (int)UITokens.Space8);
-            column.spacing = UITokens.Space8;
-            column.childAlignment = TextAnchor.UpperLeft;
-            column.childControlWidth = true;
-            column.childControlHeight = true;
-            column.childForceExpandWidth = true;
-            column.childForceExpandHeight = false;
-
-            mapStatusLabel = UIFactory.CreateText("MapStatus", mapPanel.transform, "Tap Load after entering map ID", UITokens.FontCaption, UITokens.Muted, TextAlignmentOptions.Left);
-            SetLayout(mapStatusLabel.gameObject, prefH: 36f);
-            mapStatusLabel.textWrappingMode = TMPro.TextWrappingModes.Normal;
-
-            mapIdInput = UIFactory.CreateInputField("MapIdInput", mapPanel.transform, "e.g. 147190");
-            SetLayout(mapIdInput.gameObject, prefH: 40f);
-            mapIdInput.onSubmit.AddListener(_ => OnMapLoadClicked());
-            SyncMapInputFromSwitcher();
-
-            var row = UIFactory.CreateRect("MapActions", mapPanel.transform);
-            SetLayout(row.gameObject, prefH: 40f);
-            var rowLayout = row.gameObject.AddComponent<HorizontalLayoutGroup>();
-            rowLayout.spacing = UITokens.Space8;
-            rowLayout.childAlignment = TextAnchor.MiddleCenter;
-            rowLayout.childForceExpandWidth = false;
-            rowLayout.childForceExpandHeight = true;
-            rowLayout.childControlWidth = true;
-            rowLayout.childControlHeight = true;
-
-            mapLoadButton = UIFactory.CreatePillButton("MapLoadButton", row, "Load map", ghost: false);
-            SetLayout(mapLoadButton.gameObject, flexW: 1f, prefH: 40f);
-            mapLoadButtonLabel = mapLoadButton.GetComponentInChildren<TextMeshProUGUI>();
-            mapLoadButton.onClick.AddListener(OnMapLoadClicked);
-
-            mapPanelVisible = false;
-            mapPanel.SetActive(false);
-            UpdateMapToggleLabel();
-            UpdateMapControls();
             mapUiBuilt = true;
         }
 
@@ -870,7 +749,43 @@ namespace BodyTracking.UI
             if (playButton != null) playButton.onClick.AddListener(OnPlayToggleClicked);
             if (stopPlayButton != null) stopPlayButton.onClick.AddListener(OnStopClicked);
             if (loadButton != null) loadButton.onClick.AddListener(OnLoadClicked);
+
+            if (reviewReplayButton != null) reviewReplayButton.onClick.AddListener(OnReviewReplayClicked);
+            if (rejectButton != null) rejectButton.onClick.AddListener(OnRejectClicked);
+            if (confirmButton != null) confirmButton.onClick.AddListener(OnConfirmClicked);
         }
+
+        private void OnReviewReplayClicked()
+        {
+            if (controller == null) return;
+            // Toggle the review skeleton replay: start if idle, otherwise pause / resume.
+            if (!controller.IsPlaying)
+                controller.StartReviewPlayback();
+            else if (controller.IsPaused)
+                controller.ResumePlayback();
+            else
+                controller.PausePlayback();
+            UpdateUI();
+        }
+
+        private void OnRejectClicked()
+        {
+            if (controller == null) return;
+            controller.RejectRecording();
+            RefreshRecordingsList();
+            UpdateUI();
+        }
+
+        private void OnConfirmClicked()
+        {
+            if (controller == null) return;
+            controller.ConfirmRecording();
+            RefreshRecordingsList();
+            UpdateUI();
+        }
+
+        private void OnReviewStarted() => UpdateUI();
+        private void OnReviewResolved() => UpdateUI();
 
         private void OnRetargetRealignClicked()
         {
@@ -882,6 +797,23 @@ namespace BodyTracking.UI
         // STATE / UPDATE
         // ============================================================================================
 
+        /// <summary>Show/hide and refresh the post-recording review cluster (Discard / Replay / Confirm).</summary>
+        private void UpdateReviewControls(bool awaitingReview)
+        {
+            if (reviewRoot != null && reviewRoot.activeSelf != awaitingReview)
+                reviewRoot.SetActive(awaitingReview);
+            if (reviewCaption != null && reviewCaption.gameObject.activeSelf != awaitingReview)
+                reviewCaption.gameObject.SetActive(awaitingReview);
+
+            if (!awaitingReview)
+                return;
+
+            // Replay/pause icon mirrors the actual playback state of the review clip.
+            bool showPause = controller.IsPlaying && !controller.IsPaused;
+            if (reviewReplayIcon != null) reviewReplayIcon.SetActive(!showPause);
+            if (reviewPauseIcon != null) reviewPauseIcon.SetActive(showPause);
+        }
+
         private void UpdateUI()
         {
             if (controller == null) return;
@@ -891,6 +823,7 @@ namespace BodyTracking.UI
 
             if (modeText != null)
             {
+                modeText.gameObject.SetActive(!controller.IsAwaitingReview);
                 modeText.text = GetModeText();
                 modeText.color = GetModeColor();
             }
@@ -900,10 +833,15 @@ namespace BodyTracking.UI
             bool isRecording = controller.IsRecording;
             bool isPlaying = controller.IsPlaying;
             bool isWaitingForBody = controller.IsWaitingForBody;
+            bool awaitingReview = controller.IsAwaitingReview;
+
+            UpdateReviewControls(awaitingReview);
 
             // Record button: record-dot when idle, red stop-square while recording or waiting-to-arm (tap to cancel).
+            // Hidden during review (the review cluster takes its place).
             if (recordButton != null)
             {
+                recordButton.gameObject.SetActive(!awaitingReview);
                 recordButton.interactable = canRecord || isRecording || isWaitingForBody;
                 if (recordIcon != null)
                 {
@@ -1099,10 +1037,7 @@ namespace BodyTracking.UI
 
         private float GetSelectedRecordingDuration()
         {
-            if (availableRecordings.Count == 0) return 0f;
-            int idx = Mathf.Clamp(selectedRecordingIndex, 0, availableRecordings.Count - 1);
-            var meta = RecordingStorage.GetRecordingMetadata(availableRecordings[idx]);
-            return meta != null ? meta.duration : 0f;
+            return selectedRecordingDuration;
         }
 
         private static string FormatTime(float seconds)
@@ -1180,10 +1115,12 @@ namespace BodyTracking.UI
             if (availableRecordings.Count == 0)
             {
                 recordingNameLabel.text = "No recordings";
+                selectedRecordingDuration = 0f;
                 return;
             }
             int idx = Mathf.Clamp(selectedRecordingIndex, 0, availableRecordings.Count - 1);
             var meta = RecordingStorage.GetRecordingMetadata(availableRecordings[idx]);
+            selectedRecordingDuration = meta != null ? meta.duration : 0f;
             recordingNameLabel.text = meta != null
                 ? $"{availableRecordings[idx]}  ·  {meta.FormattedDuration}"
                 : availableRecordings[idx];
@@ -1204,7 +1141,6 @@ namespace BodyTracking.UI
         {
             if (mainUiPanel != null)
                 mainUiPanel.SetActive(mainUiVisible);
-            // Icon rotation is now driven by the debug-visuals toggle (see UpdateDebugToggleIcon).
         }
 
         // ============================================================================================

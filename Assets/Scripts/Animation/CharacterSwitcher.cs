@@ -96,6 +96,64 @@ namespace BodyTracking.Animation
             return Current != null;
         }
 
+        /// <summary>
+        /// Instantiate a standalone clone of a display character so the multi-recording overlap engine can give
+        /// each overlaid recording its own visible rig. The clone is independent of the cycle list (cloning the
+        /// shared scene rigs would make them flicker as the engine shows/hides them). Returns the clone's root,
+        /// or null when no GLB character is available to copy.
+        /// </summary>
+        public Transform CreateRigInstance(Transform parent) => CreateRigInstance(parent, -1);
+
+        /// <summary>
+        /// Clone a specific display character by index (so the recordings list can give each recording its own
+        /// chosen character). Pass -1 to use the currently selected character. Out-of-range indices wrap.
+        /// </summary>
+        public Transform CreateRigInstance(Transform parent, int index)
+        {
+            if (!EnsureBound())
+                return null;
+
+            GameObject template = GetCharacter(index);
+            if (template == null)
+                template = Current != null ? Current : (characters.Count > 0 ? characters[0] : null);
+            if (template == null)
+                return null;
+
+            // The template may be hidden (it is only shown during playback); force the clone active so the
+            // overlay player can drive + reveal it.
+            bool wasActive = template.activeSelf;
+            if (!wasActive) template.SetActive(true);
+            var clone = Object.Instantiate(template, parent != null ? parent : template.transform.parent);
+            if (!wasActive) template.SetActive(false);
+
+            clone.name = template.name + "_Overlay";
+            clone.SetActive(true);
+
+            // Strip the legacy FBX controller from the clone — overlays are driven directly by their own
+            // FusedCharacterPlayer, and a stray controller would fight for the rig.
+            var fbx = clone.GetComponentInChildren<FBXCharacterController>(true);
+            if (fbx != null)
+                Object.Destroy(fbx);
+
+            CharacterLookLab.PrepareForDisplay(clone.transform);
+            return clone.transform;
+        }
+
+        /// <summary>Default articulation mode the engine should use for cloned overlay rigs.</summary>
+        public FusedCharacterPlayer.BodyArticulationSource DefaultArticulation => defaultArticulation;
+
+        /// <summary>Character root at an index (wrapping), or null when there are no characters.</summary>
+        public GameObject GetCharacter(int index)
+        {
+            if (characters.Count == 0 && !EnsureBound())
+                return null;
+            if (characters.Count == 0)
+                return null;
+            if (index < 0)
+                return Current;
+            return characters[((index % characters.Count) + characters.Count) % characters.Count];
+        }
+
         /// <summary>Advance to the next character (wraps around). Hook UI Button OnClick here.</summary>
         public void CycleCharacter()
         {

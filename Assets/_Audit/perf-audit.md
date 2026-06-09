@@ -34,7 +34,7 @@ Severity key: P0 = critical/security/data integrity, P1 = high frame-budget or c
 
 ### P1 - AR image target overlay and update events run every frame
 
-- Status: [ ] Pending - ✅ Overlay material texture/color/cull updates are now cached and axis diagnostics are development-only; per-frame pose/event policy remains to be reviewed.
+- Status: ✅ Completed - overlay material updates were already cached; now the per-frame `OnImageTargetUpdated` invoke is removed (the only subscriber, `ImageTargetRouteRootProvider`, already follows the marker in its own `Update`), and overlay/bounds `SetParent` only runs when the parent actually changes instead of every frame.
 - Issue: `ARImageTargetManager.Update()` calls `UpdateReferenceImageOverlay(currentTrackedImage)` and invokes `OnImageTargetUpdated` every frame while the tracked image is usable. Overlay refresh also reassigns material properties and repositions/reparents visuals.
 - Why it matters: Marker tracking is often active while the user is idle or preparing to record, so this becomes steady per-frame transform/material/event work. Downstream route-root providers may copy marker pose every frame as a result.
 - Proposed fix: Split state-change work from pose-follow work. Refresh overlay material only when texture/alpha/state changes, and only fire continuous pose events when a consumer actually needs live marker following.
@@ -55,14 +55,14 @@ Severity key: P0 = critical/security/data integrity, P1 = high frame-budget or c
 
 ### P2 - Plane and raycast managers are enabled without a clear lifecycle policy
 
-- Status: [ ] Pending
+- Status: ✅ Completed - the unused `ARRaycastManager` is now disabled at startup in `Globals` (no code performs AR raycasts; only `Physics.Raycast` is used). `ARPlaneManager` detection is gated to playback only in `BodyTrackingController.ApplyOcclusionForMode` (its only consumers — floor contact shadow + floor penetration — run during playback), so plane detection no longer runs in idle/record camera mode.
 - Issue: `ARRaycastManager` is wired in `Globals` but no app raycasts were found. `ARPlaneManager` appears present/enabled while detection is off, and `DebugVisualsController` only disables it when clean view hides debug visuals.
 - Why it matters: AR managers can still maintain subsystem state or allocate/update trackables depending on platform and configuration. Unused managers add risk and noise.
 - Proposed fix: Disable unused AR managers by default in the app scene, and enable only for features that actively need them. Keep debug toggles visual-only where possible.
 
 ### P2 - ARKit body tracking and occlusion configuration conflict remains fragile
 
-- Status: [ ] Pending
+- Status: [ ] Partially addressed - `ApplyOcclusionForMode()` now scopes `ARHumanBodyManager` to `WaitingForBody` + `Recording` only (disabled in idle `Ready` and during `Playing`), so live 3D body tracking no longer runs while the user is just framing the shot — the largest idle-camera heat source. The arming loop (`WaitForBodyThenRecord`) absorbs the brief body-detect warm-up. Remaining: explicit guarding of depth CPU-image requests when occlusion is unavailable.
 - Issue: `BodyTrackingController.ApplyOcclusionForMode()` correctly disables `ARHumanBodyManager` during playback to allow occlusion-capable ARKit configurations, but `AROcclusionManager` remains present and may request depth during pose updates. (Note: the former `BlazePoseDepthLift` depth consumer has been removed.)
 - Why it matters: ARKit selects one camera configuration satisfying active feature requests. Body tracking, depth, and occlusion requests can silently downgrade each other or fail, creating inconsistent performance and visuals.
 - Proposed fix: Make mode ownership explicit: body tracking active only for recording/body-wait; occlusion/depth active only for playback or validation modes. Guard depth CPU-image requests when occlusion is unavailable or disabled.
@@ -85,7 +85,7 @@ Severity key: P0 = critical/security/data integrity, P1 = high frame-budget or c
 
 ### P1 - Localization state is polled every frame
 
-- Status: [ ] Pending
+- Status: ✅ Completed - `ImmersalRouteRootProvider.Update()` now evaluates localization state at ~10 Hz (`LocalizationEvalInterval`) via `TickLocalization()`, while an in-progress anchor realign blend is still stepped every frame so corrections stay smooth.
 - Issue: `ImmersalRouteRootProvider.Update()` calls `UpdateLocalizationState()` and reads SDK state every frame, including `ImmersalSDK.Instance`, tracking quality, success counts, pose agreement, and anchor correction logic.
 - Why it matters: The confidence gate is sensible, but per-frame SDK polling and pose math are unnecessary when localization updates arrive slower than the render loop.
 - Proposed fix: Throttle localization evaluation to a short interval, or update on new localization success count. Keep per-frame blend motion only while a realign blend is active.
@@ -106,7 +106,7 @@ Severity key: P0 = critical/security/data integrity, P1 = high frame-budget or c
 
 ### P2 - `IsAvailable` and provider selection can trigger scene searches
 
-- Status: [ ] Pending - ✅ `RouteRootManager` provider resolution is now throttled; Immersal map availability caching remains separate.
+- Status: ✅ Completed - `ImmersalRouteRootProvider.IsAvailable` now caches its `FindObjectsByType<XRMap>` scan and only re-evaluates ~1x/sec, and `RouteRootManager.SelectActiveProvider()` is memoized once per frame (and no longer called twice per `Update`). `ImmersalScanVisualizationDriver` also caches its `XRMapVisualization` list (refreshed on map load/switch) instead of scanning every frame.
 - Issue: Immersal availability and `RouteRootManager` provider selection can fall back to `FindAnyObjectByType` / `FindObjectsByType` when references are missing.
 - Why it matters: Scene-wide searches are expensive if evaluated in frequent UI/status paths or per-frame manager updates.
 - Proposed fix: Cache provider and map references in `Awake`/initialization, invalidate only on map switch, and avoid repeated scene searches in properties.
@@ -122,7 +122,7 @@ Severity key: P0 = critical/security/data integrity, P1 = high frame-budget or c
 
 ### P0 - Video capture conversion and rotation happen on the main thread
 
-- Status: [ ] Pending
+- Status: [ ] Partially addressed - the full-frame rotation (`RotateInto`) is now an `IJobParallelFor` (`RotateJob`) spread across worker threads with the identical pixel mapping (completed before `Texture2D.Apply()`), removing it from the main-thread critical path with no resolution/quality change. The `XRCpuImage.Convert` + `Texture2D.Apply()` cost remains on the main thread; resolution/frame-rate reduction still pending if more headroom is needed.
 - Issue: `VideoRecorder.RecordFrame()` runs from `ARCameraManager.frameReceived`, acquires `XRCpuImage`, converts to RGBA, optionally rotates a full frame buffer, calls `Texture2D.Apply()`, then feeds AVPro.
 - Why it matters: This is heavy per captured frame. At 30 fps and camera resolutions around 1920x1440, it can dominate CPU time and cause dropped AR frames.
 - Proposed fix: Reduce capture resolution/frame rate where acceptable, skip rotation when not needed by the downstream service, and consider Unity jobs/Burst or native plugin support for rotation if capture must stay high resolution. Avoid running other CPU-image consumers at the same time.
@@ -259,7 +259,7 @@ Severity key: P0 = critical/security/data integrity, P1 = high frame-budget or c
 
 ### P1 - Mobile rendering settings need targeted review
 
-- Status: [ ] Pending
+- Status: [ ] Partially addressed - the app now caps the render loop at 30 fps app-wide (`BodyTrackingController.ApplyGlobalFrameCap` + `Start`, with `QualitySettings.vSyncCount = 0` so the cap is authoritative), and the full-screen `CharacterCameraSofteningFeature` pass is gated to playback only via `CharacterCameraMatch.ScreenSofteningActive` (skips two full-screen blits/frame in idle/record camera mode). Remaining: GPU skinning, color space, and duplicate-camera review.
 - Issue: Scene/settings discovery found HDR/MSAA-enabled cameras in some scenes, duplicate active cameras in `TENDOR.unity`, GPU skinning reported off, and Gamma color space.
 - Why it matters: Mobile AR benefits from minimal camera/render passes, GPU skinning for characters, and carefully chosen color/quality settings.
 - Proposed fix: Audit the canonical build scene only before changing serialized settings. Consider enabling GPU skinning, removing unused cameras, and validating Linear color space/quality settings on device.

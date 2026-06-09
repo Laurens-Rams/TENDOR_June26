@@ -17,6 +17,10 @@ namespace BodyTracking.Rendering
         static readonly int MinBlendId = Shader.PropertyToID("_MinBlend");
         static readonly int BlurRadiusId = Shader.PropertyToID("_BlurRadius");
         static readonly int DepthStrengthId = Shader.PropertyToID("_DepthStrength");
+        static readonly int MatchStrengthId = Shader.PropertyToID("_MatchStrength");
+        static readonly int MatchContrastId = Shader.PropertyToID("_MatchContrast");
+        static readonly int MatchSaturationId = Shader.PropertyToID("_MatchSaturation");
+        static readonly int MatchBlackLiftId = Shader.PropertyToID("_MatchBlackLift");
 
         [SerializeField] Shader shader;
         SofteningPass pass;
@@ -40,6 +44,10 @@ namespace BodyTracking.Rendering
         {
             var settings = CharacterCameraMatch.Current;
             if (!settings.enabled || !settings.screenSoftening || material == null)
+                return;
+
+            // Skip the two full-screen blits when no CG character is on screen (idle/record camera mode).
+            if (!CharacterCameraMatch.ScreenSofteningActive)
                 return;
 
             if (renderingData.cameraData.cameraType == CameraType.Preview
@@ -78,6 +86,10 @@ namespace BodyTracking.Rendering
                 mat.SetFloat(MinBlendId, settings.screenMinBlend);
                 mat.SetFloat(BlurRadiusId, settings.screenBlurRadius);
                 mat.SetFloat(DepthStrengthId, settings.screenDepthStrength);
+                mat.SetFloat(MatchStrengthId, settings.matchStrength);
+                mat.SetFloat(MatchContrastId, settings.matchContrast);
+                mat.SetFloat(MatchSaturationId, settings.matchSaturation);
+                mat.SetFloat(MatchBlackLiftId, settings.matchBlackLift);
             }
 
             void ReAllocateScratch(RenderTextureDescriptor desc)

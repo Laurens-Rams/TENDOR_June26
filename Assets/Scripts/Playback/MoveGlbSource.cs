@@ -6,6 +6,7 @@ using System.Threading.Tasks;
 using GLTFast;
 using UnityEngine;
 using BodyTracking.Glb;
+using BodyTracking.Diagnostics;
 using BodyTracking.Playback.PostProcess;
 
 namespace BodyTracking.Playback
@@ -159,6 +160,8 @@ namespace BodyTracking.Playback
         {
             long kb = new FileInfo(glbPath).Length / 1024;
             Debug.Log($"[MoveGlbSource] Loading '{Path.GetFileName(glbPath)}' ({kb} KB)…");
+            float loadStart = Time.realtimeSinceStartup;
+            string fileName = Path.GetFileName(glbPath);
 
             var gltf = new GltfImport();
             Task<bool> loadTask = null;
@@ -185,6 +188,7 @@ namespace BodyTracking.Playback
                 }
                 yield return null;
             }
+            EmitLoadPhase(fileName, "parse", loadStart, kb);
 
             if (loadTask.IsFaulted)
             {
@@ -222,6 +226,7 @@ namespace BodyTracking.Playback
                 yield break;
             }
 
+            float instantiateStart = Time.realtimeSinceStartup;
             float instantiateDeadline = Time.realtimeSinceStartup + 30f;
             while (!instantiateTask.IsCompleted)
             {
@@ -233,6 +238,7 @@ namespace BodyTracking.Playback
                 }
                 yield return null;
             }
+            EmitLoadPhase(fileName, "instantiate", instantiateStart, kb);
 
             if (instantiateTask.IsFaulted)
             {
@@ -250,18 +256,23 @@ namespace BodyTracking.Playback
             Debug.Log("[MoveGlbSource] Instantiated — stripping renderers…");
             yield return null;
 
-            var renderers = root.GetComponentsInChildren<Renderer>(true);
-            for (int i = 0; i < renderers.Length; i++)
+            float stripStart = Time.realtimeSinceStartup;
+            using (PerfSampler.Scope("GLB.StripRenderers"))
             {
-                renderers[i].enabled = false;
-                if ((i & 63) == 63)
-                    yield return null;
-            }
+                var renderers = root.GetComponentsInChildren<Renderer>(true);
+                for (int i = 0; i < renderers.Length; i++)
+                {
+                    renderers[i].enabled = false;
+                    if ((i & 63) == 63)
+                        yield return null;
+                }
 
-            foreach (var legacy in root.GetComponentsInChildren<UnityEngine.Animation>(true))
-                UnityEngine.Object.Destroy(legacy);
-            foreach (var a in root.GetComponentsInChildren<Animator>(true))
-                UnityEngine.Object.Destroy(a);
+                foreach (var legacy in root.GetComponentsInChildren<UnityEngine.Animation>(true))
+                    UnityEngine.Object.Destroy(legacy);
+                foreach (var a in root.GetComponentsInChildren<Animator>(true))
+                    UnityEngine.Object.Destroy(a);
+            }
+            EmitLoadPhase(fileName, "strip-renderers", stripStart, kb);
 
             yield return null;
 
@@ -277,7 +288,11 @@ namespace BodyTracking.Playback
             Debug.Log($"[MoveGlbSource] Clip '{clip.name}' ({clip.length:F2}s) — building humanoid avatar (next frame)…");
             yield return null;
 
-            avatar = HumanoidAvatarFactory.Build(root, out string report, out humanBones);
+            float avatarStart = Time.realtimeSinceStartup;
+            string report;
+            using (PerfSampler.Scope("GLB.BuildAvatar"))
+                avatar = HumanoidAvatarFactory.Build(root, out report, out humanBones);
+            EmitLoadPhase(fileName, "build-avatar", avatarStart, kb);
             if (avatar == null)
             {
                 Error = "Humanoid build failed: " + report;
@@ -291,7 +306,24 @@ namespace BodyTracking.Playback
             Hips = FindHipsTransform(root.transform) ?? root.transform;
 
             Debug.Log($"[MoveGlbSource] Loaded '{Path.GetFileName(glbPath)}' (clip '{clip.name}', {clip.length:F2}s). {report}");
+            EmitLoadPhase(fileName, "total", loadStart, kb);
             IsReady = true;
+        }
+
+        static void EmitLoadPhase(string fileName, string phase, float startTime, long sizeKb)
+        {
+            PerfSampler.Emit(
+                "MoveGlbSource.cs:LoadSpread",
+                "glb-load-phase",
+                new Dictionary<string, object>
+                {
+                    { "file", fileName ?? "" },
+                    { "phase", phase },
+                    { "elapsedMs", (Time.realtimeSinceStartup - startTime) * 1000f },
+                    { "sizeKb", sizeKb }
+                },
+                "GLB_LOAD",
+                null);
         }
 
         public bool SampleHumanPose(float seconds, ref HumanPose pose)

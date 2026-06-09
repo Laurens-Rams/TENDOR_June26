@@ -68,6 +68,11 @@ namespace UnityEngine.XR.Interaction.Toolkit.Samples.ARStarterAssets
 
             mesh.GetVertices(s_Vertices);
 
+            // A boundary update can arrive with an empty/degenerate mesh (e.g. a plane that was just removed or
+            // not yet populated). Without this guard, indexing s_Vertices[-1] below throws ArgumentOutOfRange.
+            if (s_Vertices.Count == 0 || vertexCount == 0)
+                return;
+
             Vector3 centerInPlaneSpace = s_Vertices[s_Vertices.Count - 1];
             Vector3 uv = new Vector3(0, 0, 0);
             float shortestUVMapping = float.MaxValue;

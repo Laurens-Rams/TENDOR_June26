@@ -25,6 +25,7 @@ namespace BodyTracking.Editor
         const string FillName = "Fill Light (Windows)";
         const string SideFillName = "Side Fill (Bounce)";
         const string RimName = "Rim Light (Back)";
+        const string BottomFillName = "Bottom Fill (Floor Bounce Up)";
 
         [MenuItem("TENDOR/Lighting/Setup Climbing Gym Lighting")]
         public static void SetupMenu()
@@ -94,6 +95,16 @@ namespace BodyTracking.Editor
             rim.shadows = LightShadows.None;
             rim.transform.localEulerAngles = new Vector3(55f, 205f, 0f);
 
+            // BOTTOM FILL: warm floor-bounce coming UP from below, so the lower body / undersides (jeans, chin,
+            // under the arms) aren't crushed dark where the overhead key/fill/rim don't reach. Pitched up steeply
+            // (negative X = aiming upward). Keep it gentle so it reads as bounce, not a second key.
+            var bottomFill = EnsureLight(group, BottomFillName, reuseExistingSun: false);
+            bottomFill.type = LightType.Directional;
+            bottomFill.color = new Color(0.98f, 0.95f, 0.90f);
+            bottomFill.intensity = 0.45f;
+            bottomFill.shadows = LightShadows.None;
+            bottomFill.transform.localEulerAngles = new Vector3(-65f, 20f, 0f);
+
             ConfigureEnvironment(key);
 
             EditorSceneManager.MarkSceneDirty(scene);
@@ -156,8 +167,9 @@ namespace BodyTracking.Editor
             // a big diffuse gym ceiling. Sky cool-neutral, ground slightly warm (floor bounce).
             RenderSettings.ambientMode = AmbientMode.Trilight;
             RenderSettings.ambientSkyColor = new Color(0.55f, 0.58f, 0.62f);
-            RenderSettings.ambientEquatorColor = new Color(0.44f, 0.44f, 0.46f);
-            RenderSettings.ambientGroundColor = new Color(0.30f, 0.28f, 0.24f);
+            RenderSettings.ambientEquatorColor = new Color(0.46f, 0.46f, 0.48f);
+            // Lift the ground term so ambient also comes from below (undersides aren't crushed dark).
+            RenderSettings.ambientGroundColor = new Color(0.42f, 0.40f, 0.37f);
             RenderSettings.ambientIntensity = 1.0f;
             RenderSettings.reflectionIntensity = 1.0f;
             RenderSettings.fog = false;

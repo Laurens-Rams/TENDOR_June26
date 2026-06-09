@@ -26,6 +26,11 @@ namespace BodyTracking.LookDev
             public float screenMinBlend;
             public float screenBlurRadius;
             public float screenDepthStrength;
+            // Camera tone match (character-only, masked by depth inside the soften pass).
+            public float matchStrength;
+            public float matchContrast;
+            public float matchSaturation;
+            public float matchBlackLift;
 
             public static Settings Default => new Settings
             {
@@ -41,6 +46,10 @@ namespace BodyTracking.LookDev
                 screenMinBlend = 0.14f,
                 screenBlurRadius = 2.4f,
                 screenDepthStrength = 18f,
+                matchStrength = 1f,
+                matchContrast = 0.95f,
+                matchSaturation = 0.92f,
+                matchBlackLift = 0.006f,
             };
         }
 
@@ -49,6 +58,14 @@ namespace BodyTracking.LookDev
         public static Settings Current => current;
 
         public static void SetSettings(Settings settings) => current = settings;
+
+        /// <summary>
+        /// Runtime gate for the full-screen <c>CharacterCameraSofteningFeature</c> pass. The soften pass only
+        /// matters when the CG character is on screen (playback), so the app turns this off in idle/record
+        /// camera mode to skip two full-screen blits per frame. Defaults to true so look-dev / editor scenes
+        /// that don't run the controller keep the previous behaviour.
+        /// </summary>
+        public static bool ScreenSofteningActive { get; set; } = true;
 
         public static void ApplyToCharacter(Transform root)
         {

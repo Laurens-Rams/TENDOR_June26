@@ -3,6 +3,7 @@ using System.Collections;
 using System.Collections.Generic;
 using UnityEngine;
 using UnityEngine.XR.ARFoundation;
+using UnityEngine.Rendering.Universal;
 using BodyTracking.Data;
 using BodyTracking.Recording;
 using BodyTracking.Playback;
@@ -10,6 +11,8 @@ using BodyTracking.Storage;
 using BodyTracking.AR;
 using BodyTracking.Spatial;
 using BodyTracking.MoveAI;
+using BodyTracking.Animation;
+using BodyTracking.Diagnostics;
 
 namespace BodyTracking
 {
@@ -42,6 +45,10 @@ namespace BodyTracking
         [Tooltip("Record mp4 whenever Video Recorder is assigned (does not require Move AI coordinator).")]
         public bool captureVideoWithRecording = true;
 
+        [Header("Recording review")]
+        [Tooltip("After stopping a recording, replay the captured skeleton for review and wait for an explicit Confirm before sending it to Move AI. Reject discards the recording (and its paired video).")]
+        public bool requireReviewBeforeSubmit = true;
+
         [Header("Recording start")]
         [Tooltip("When recording, wait until ARKit detects a body before capture begins, so the joint recording and the paired video both start with the climber already in frame.")]
         public bool waitForBodyBeforeRecording = true;
@@ -67,6 +74,25 @@ namespace BodyTracking
         [Tooltip("Occlusion is off while idle/recording (ARKit body tracking) and on during playback only.")]
         public ARCharacterOcclusion characterOcclusion;
 
+        [Tooltip("AR plane detection is only consumed during playback (floor contact shadow + penetration floor). " +
+                 "Gated on for playback and off otherwise so idle/record camera mode doesn't run continuous plane " +
+                 "detection. Auto-found if left empty.")]
+        public ARPlaneManager planeManager;
+
+        [Header("Idle render / CV cost")]
+        [Tooltip("Run full-screen post-processing (incl. SMAA) on the AR camera only during playback. Idle/record " +
+                 "show just the camera feed + UI, where antialiasing/grading does nothing, so this skips several " +
+                 "full-screen passes per frame. Auto-finds the AR camera's URP data.")]
+        public bool postProcessingDuringPlaybackOnly = true;
+        [Tooltip("AR camera's URP additional-camera data. Auto-found from the AR camera if left empty.")]
+        public UniversalAdditionalCameraData cameraData;
+        [Tooltip("Disable ARTrackedImageManager once Immersal has locked its room anchor (and we're not playing " +
+                 "back a marker/legacy recording). With the default Immersal route-frame policy the marker is never " +
+                 "the frame, so image tracking is redundant CV/heat once localized. Off = always track the marker.")]
+        public bool gateImageTrackingWhenImmersalLocked = true;
+        [Tooltip("ARTrackedImageManager driving marker detection. Auto-found (via Globals) if left empty.")]
+        public ARTrackedImageManager trackedImageManager;
+
         [Header("UI")]
         public TMPro.TextMeshProUGUI statusText;
         
@@ -77,12 +103,34 @@ namespace BodyTracking
         private HipRecording lastRecording;
         private string lastRecordingFileName;
         private Coroutine armingCoroutine;
+
+        // Recording review state: a just-finished recording is held here until the user confirms (submit to
+        // Move AI) or rejects (discard). The paired video may still be encoding when review opens, so we track
+        // its readiness and submit as soon as it's available once confirmed.
+        private bool isAwaitingReview;
+        private HipRecording reviewRecording;
+        private string reviewFileName;
+        private string reviewVideoPath;
+        private bool reviewVideoReady;
+        private bool reviewVideoExpected;
+        private bool confirmPendingAfterVideo;
+        private bool rejectPendingAfterVideo;
+
+        // Multi-recording overlap engine: drives one extra character per additional enabled recording, locked
+        // to this controller's primary playhead. Created on demand so scenes don't need manual wiring.
+        private MultiRecordingPlayback multiPlayback;
+        private CharacterSwitcher characterSwitcher;
         
         // Events
         public event System.Action<OperationMode> OnModeChanged;
         public event System.Action<HipRecording> OnRecordingComplete;
         public event System.Action OnPlaybackStarted;
         public event System.Action OnPlaybackStopped;
+
+        /// <summary>Fired when a finished recording enters review (awaiting confirm/reject).</summary>
+        public event System.Action OnReviewStarted;
+        /// <summary>Fired when a review is resolved (confirmed or rejected).</summary>
+        public event System.Action OnReviewResolved;
         
         // Public Properties
         public bool IsInitialized => isInitialized;
@@ -95,6 +143,8 @@ namespace BodyTracking
         public bool IsPaused => currentMode == OperationMode.Playing && isPaused;
         /// <summary>True after Record is tapped while waiting for ARKit to detect a body (capture not started yet).</summary>
         public bool IsWaitingForBody => currentMode == OperationMode.WaitingForBody;
+        /// <summary>True while a finished recording is being reviewed (awaiting Confirm or Reject).</summary>
+        public bool IsAwaitingReview => isAwaitingReview;
         public string LastRecordingFileName => lastRecordingFileName;
         public string WorldMapStatus => worldMapPersistence != null ? worldMapPersistence.LastStatusMessage : "WorldMap service unavailable";
 
@@ -148,8 +198,41 @@ namespace BodyTracking
 
         public event Action<string> OnFusionStatusChanged;
 
+        // Idle/playback render cap (fps). An AR passthrough + character app gains little from higher rates while
+        // paying a large heat/battery cost, so we cap to this WHEN body tracking isn't active.
+        // vSyncCount must be 0 or it overrides targetFrameRate (vSync is ignored on mobile, but this keeps the
+        // editor and any desktop builds consistent).
+        const int IdleFrameRate = 30;
+        // Frame cap while ARKit body tracking is live (WaitingForBody/Recording). The 30 fps cap was throttling
+        // how often we sample ARKit body poses and made tracking feel laggy/dropped, so we lift it during capture.
+        // -1 = uncapped (run as fast as the device/AR session allows) for the most responsive body tracking.
+        const int BodyTrackingFrameRate = -1;
+
+        [RuntimeInitializeOnLoadMethod(RuntimeInitializeLoadType.BeforeSceneLoad)]
+        static void ApplyGlobalFrameCap()
+        {
+            QualitySettings.vSyncCount = 0;
+            Application.targetFrameRate = IdleFrameRate;
+        }
+
+        /// <summary>
+        /// Body tracking samples ARKit poses once per render frame, so the global 30 fps cap also throttled
+        /// tracking. Lift the cap while a body is being tracked (arming/recording) and restore the idle cap
+        /// otherwise so heat/battery stay low when tracking isn't running.
+        /// </summary>
+        private void ApplyFrameCapForMode(OperationMode mode)
+        {
+            bool bodyTracking = mode == OperationMode.WaitingForBody || mode == OperationMode.Recording;
+            QualitySettings.vSyncCount = 0;
+            Application.targetFrameRate = bodyTracking ? BodyTrackingFrameRate : IdleFrameRate;
+        }
+
         void Start()
         {
+            // Re-assert in case something (e.g. AVPro capture teardown) changed it after launch.
+            QualitySettings.vSyncCount = 0;
+            Application.targetFrameRate = IdleFrameRate;
+
             if (autoInitialize)
             {
                 Initialize();
@@ -472,11 +555,202 @@ namespace BodyTracking
 
                 OnRecordingComplete?.Invoke(lastRecording);
 
+                // Hold the recording for review (replay the skeleton, then Confirm to submit or Reject to discard)
+                // instead of sending it straight to Move AI. Confirm/Reject drive the actual submission/cleanup.
+                if (requireReviewBeforeSubmit)
+                {
+                    SetMode(OperationMode.Ready);
+                    BeginReview(lastRecording);
+                    return lastRecording;
+                }
+
                 StopPairedVideoCapture(lastRecording);
             }
             
             SetMode(OperationMode.Ready);
             return lastRecording;
+        }
+
+        // ============================================================================================
+        // RECORDING REVIEW (confirm / reject before Move AI submission)
+        // ============================================================================================
+
+        /// <summary>
+        /// Enter review for a just-finished recording: stop the paired video (without submitting), force the
+        /// recorded skeleton visible, and auto-replay it so the user can judge quality before confirming.
+        /// </summary>
+        private void BeginReview(HipRecording recording)
+        {
+            isAwaitingReview = true;
+            reviewRecording = recording;
+            reviewFileName = lastRecordingFileName;
+            reviewVideoPath = null;
+            reviewVideoReady = false;
+            confirmPendingAfterVideo = false;
+            rejectPendingAfterVideo = false;
+            reviewVideoExpected = videoRecorder != null && videoRecorder.IsRecording;
+
+            if (videoRecorder != null && videoRecorder.IsRecording)
+            {
+                UpdateStatus("Finalizing video… review the skeleton, then confirm or reject");
+                if (MoveAIEnabled)
+                    SetFusionStatus("Encoding video… review then confirm");
+                videoRecorder.StopRecording(OnReviewVideoReady);
+            }
+            else
+            {
+                reviewVideoPath = videoRecorder != null ? VideoRecorder.NormalizeLocalPath(videoRecorder.LastFilePath) : null;
+                reviewVideoReady = true;
+                if (MoveAIEnabled)
+                    SetFusionStatus("Review the skeleton, then confirm to send to Move AI");
+            }
+
+            OnReviewStarted?.Invoke();
+            StartReviewPlayback();
+        }
+
+        /// <summary>Force the recorded dot/line skeleton visible and replay the recording in a loop for review.</summary>
+        public void StartReviewPlayback()
+        {
+            if (!isAwaitingReview || reviewRecording == null)
+                return;
+
+            if (player != null)
+                player.SetSkeletonVisible(true);
+
+            if (!IsPlaying)
+                StartPlayback(reviewRecording);
+        }
+
+        private void OnReviewVideoReady(string videoPath)
+        {
+            reviewVideoPath = VideoRecorder.NormalizeLocalPath(videoPath);
+            reviewVideoReady = true;
+
+            // The user may have already resolved the review while the mp4 was still encoding.
+            if (confirmPendingAfterVideo)
+            {
+                confirmPendingAfterVideo = false;
+                SubmitReviewedRecording();
+            }
+            else if (rejectPendingAfterVideo)
+            {
+                rejectPendingAfterVideo = false;
+                TryDeleteVideoFile(reviewVideoPath);
+                reviewVideoPath = null;
+            }
+        }
+
+        /// <summary>Keep the reviewed recording: send it (and its paired video) to Move AI, then exit review.</summary>
+        public void ConfirmRecording()
+        {
+            if (!isAwaitingReview)
+                return;
+
+            if (IsPlaying)
+                StopPlayback();
+
+            isAwaitingReview = false;
+            RestoreSkeletonVisibilityAfterReview();
+
+            if (!reviewVideoReady && reviewVideoExpected)
+            {
+                // mp4 still encoding — submit automatically once OnReviewVideoReady fires.
+                confirmPendingAfterVideo = true;
+                if (MoveAIEnabled)
+                    SetFusionStatus("Finishing video, will send to Move AI…");
+            }
+            else
+            {
+                SubmitReviewedRecording();
+            }
+
+            OnReviewResolved?.Invoke();
+        }
+
+        private void SubmitReviewedRecording()
+        {
+            if (reviewRecording == null || string.IsNullOrEmpty(reviewFileName))
+                return;
+
+            lastRecording = reviewRecording;
+            lastRecordingFileName = reviewFileName;
+            pairedVideoFilePath = reviewVideoPath;
+
+            if (!string.IsNullOrEmpty(lastRecordingFileName))
+                TrySubmitMoveFusion(lastRecording);
+        }
+
+        /// <summary>Discard the reviewed recording: delete its JSON + paired video and reload the previous clip.</summary>
+        public void RejectRecording()
+        {
+            if (!isAwaitingReview)
+                return;
+
+            if (IsPlaying)
+                StopPlayback();
+
+            isAwaitingReview = false;
+            confirmPendingAfterVideo = false;
+            RestoreSkeletonVisibilityAfterReview();
+
+            // Discard the paired video. It may still be encoding (BeginReview already requested the stop with the
+            // OnReviewVideoReady callback) — in that case defer the delete until the file is written.
+            if (videoRecorder != null && videoRecorder.IsRecording)
+                videoRecorder.StopRecording(p => TryDeleteVideoFile(VideoRecorder.NormalizeLocalPath(p)));
+            else if (reviewVideoReady && !string.IsNullOrEmpty(reviewVideoPath))
+                TryDeleteVideoFile(reviewVideoPath);
+            else if (reviewVideoExpected)
+                rejectPendingAfterVideo = true;
+
+            // Discard the saved hip recording JSON.
+            if (!string.IsNullOrEmpty(reviewFileName))
+                RecordingStorage.DeleteRecording(reviewFileName);
+
+            reviewRecording = null;
+            reviewFileName = null;
+            reviewVideoPath = null;
+            pairedVideoFilePath = null;
+            lastRecording = null;
+            lastRecordingFileName = null;
+
+            // Fall back to the previous newest recording (if any) so playback still has something to show.
+            TryAutoLoadLatestRecording();
+
+            UpdateStatus("Recording discarded");
+            if (MoveAIEnabled)
+                SetFusionStatus("Recording discarded");
+
+            OnRecordingComplete?.Invoke(lastRecording);
+            OnReviewResolved?.Invoke();
+        }
+
+        private void RestoreSkeletonVisibilityAfterReview()
+        {
+            if (player == null)
+                return;
+
+            var debugVisuals = FindFirstObjectByType<BodyTracking.UI.DebugVisualsController>(FindObjectsInactive.Include);
+            player.SetSkeletonVisible(debugVisuals != null && debugVisuals.VisualsVisible);
+        }
+
+        private static void TryDeleteVideoFile(string path)
+        {
+            if (string.IsNullOrEmpty(path))
+                return;
+            try
+            {
+                path = VideoRecorder.NormalizeLocalPath(path);
+                if (System.IO.File.Exists(path))
+                {
+                    System.IO.File.Delete(path);
+                    Debug.Log($"[BodyTrackingController] Deleted discarded paired video: {path}");
+                }
+            }
+            catch (System.Exception e)
+            {
+                Debug.LogWarning($"[BodyTrackingController] Failed to delete discarded video '{path}': {e.Message}");
+            }
         }
 
         /// <summary>
@@ -527,6 +801,7 @@ namespace BodyTracking
                 Debug.Log("[BodyTrackingController] Started fused Move AI playback");
                 ApplyPlaybackSpeed();
                 ApplyPlaybackLoopSettings();
+                SyncOverlaysFromSelection();
                 return true;
             }
 
@@ -539,6 +814,7 @@ namespace BodyTracking
                 Debug.Log("[BodyTrackingController] Started hip playback");
                 ApplyPlaybackSpeed();
                 ApplyPlaybackLoopSettings();
+                SyncOverlaysFromSelection();
                 return true;
             }
             
@@ -558,6 +834,7 @@ namespace BodyTracking
             
             player.StopPlayback();
             if (fusionCoordinator != null) fusionCoordinator.StopFusedPlayback();
+            if (multiPlayback != null) multiPlayback.ClearOverlays();
             isPaused = false;
             SetMode(OperationMode.Ready);
             UpdateStatus("Hip playback stopped");
@@ -797,15 +1074,37 @@ namespace BodyTracking
         }
 
         /// <summary>
-        /// Reload the most recent recording from storage so playback always uses the latest clip.
+        /// Reload the recording playback should use: the Recordings menu selection's primary when one is
+        /// enabled, otherwise the most recent clip for the active map.
         /// </summary>
-        public void LoadLatestRecording() => TryAutoLoadLatestRecording();
+        public void LoadLatestRecording()
+        {
+            var sel = RecordingSelection.Instance;
+            string primary = sel != null ? sel.PrimaryFileName : null;
+            if (!string.IsNullOrEmpty(primary))
+            {
+                if (primary != lastRecordingFileName)
+                    LoadRecording(primary, loadAssociatedWorldMap: false);
+                return;
+            }
+            TryAutoLoadLatestRecording();
+        }
 
         /// <summary>
         /// Load a recording from storage
         /// </summary>
         public bool LoadRecording(string fileName, bool loadAssociatedWorldMap = true)
         {
+            using var _ = PerfSampler.Scope("Controller.LoadRecording");
+            if (!string.IsNullOrEmpty(fileName) &&
+                fileName == lastRecordingFileName &&
+                lastRecording != null &&
+                lastRecording.IsValid)
+            {
+                Debug.Log($"[BodyTrackingController] Reusing already loaded recording '{fileName}'");
+                return true;
+            }
+
             var recording = RecordingStorage.LoadRecording(fileName);
             if (recording != null && recording.IsValid)
             {
@@ -849,6 +1148,144 @@ namespace BodyTracking
         public string GetActiveMapId()
         {
             return routeRootManager != null ? routeRootManager.MapId : "";
+        }
+
+        // ============================================================================================
+        // MULTI-RECORDING SELECTION + OVERLAP
+        // ============================================================================================
+
+        /// <summary>Number of overlaid (non-primary) recordings currently rendered.</summary>
+        public int OverlayRecordingCount => multiPlayback != null ? multiPlayback.OverlayCount : 0;
+
+        /// <summary>
+        /// Re-sync every overlaid character to the primary's current correction/look settings. Call this after
+        /// live tuning edits so all characters playing at once share one consistent set of settings.
+        /// </summary>
+        public void ApplyTuningToOverlays()
+        {
+            if (multiPlayback != null)
+                multiPlayback.ApplyPrimarySettingsToOverlays();
+        }
+
+        private MultiRecordingPlayback EnsureMultiPlayback()
+        {
+            if (multiPlayback == null)
+            {
+                multiPlayback = FindFirstObjectByType<MultiRecordingPlayback>(FindObjectsInactive.Include);
+                if (multiPlayback == null)
+                    multiPlayback = gameObject.AddComponent<MultiRecordingPlayback>();
+                multiPlayback.Configure(this, fusionCoordinator, CharacterSwitcherRef());
+            }
+            return multiPlayback;
+        }
+
+        private CharacterSwitcher CharacterSwitcherRef()
+        {
+            if (characterSwitcher == null)
+                characterSwitcher = FindFirstObjectByType<CharacterSwitcher>(FindObjectsInactive.Include);
+            return characterSwitcher;
+        }
+
+        /// <summary>
+        /// Apply the primary recording's chosen GLB character to the main <see cref="CharacterSwitcher"/> (which
+        /// drives the primary fused player). No-op when the recording uses the default (-1).
+        /// </summary>
+        private void ApplyPrimaryCharacter()
+        {
+            var sel = RecordingSelection.Instance;
+            string primary = sel.PrimaryFileName;
+            if (string.IsNullOrEmpty(primary)) return;
+
+            int index = sel.GetCharacterIndex(primary);
+            if (index < 0) return;
+
+            var switcher = CharacterSwitcherRef();
+            if (switcher != null && switcher.CurrentIndex != index)
+                switcher.SelectCharacter(index);
+        }
+
+        /// <summary>
+        /// Rebuild overlay characters from the <see cref="RecordingSelection"/> model. Overlays are only shown
+        /// when the selection's primary recording is the one currently loaded/playing.
+        /// </summary>
+        private void SyncOverlaysFromSelection()
+        {
+            var engine = EnsureMultiPlayback();
+            var sel = RecordingSelection.Instance;
+            string primary = sel.PrimaryFileName;
+
+            ApplyPrimaryCharacter();
+
+            if (string.IsNullOrEmpty(primary) || primary != lastRecordingFileName)
+                engine.ClearOverlays();
+            else
+                engine.SyncOverlays(sel.OverlayFileNames, routeRootManager);
+        }
+
+        /// <summary>
+        /// Apply the current <see cref="RecordingSelection"/> to playback: load the primary recording, restart
+        /// the primary path when it changed, (re)build overlay characters, and optionally seek to a timestamp
+        /// (clamped to each clip's last frame). Called by the Recordings menu and the cycle button.
+        /// </summary>
+        public void ApplyRecordingSelection(float seekTime = -1f)
+        {
+            using var _ = PerfSampler.Scope("Controller.ApplySelection");
+            EnsureMultiPlayback();
+            var sel = RecordingSelection.Instance;
+            string primary = sel.PrimaryFileName;
+
+            if (string.IsNullOrEmpty(primary))
+            {
+                multiPlayback.ClearOverlays();
+                return;
+            }
+
+            bool wasPlaying = IsPlaying;
+            float resume = seekTime >= 0f ? seekTime : (wasPlaying ? PlaybackCurrentTime : -1f);
+            bool primaryChanged = primary != lastRecordingFileName;
+
+            if (primaryChanged)
+                LoadRecording(primary, loadAssociatedWorldMap: false);
+
+            if (wasPlaying)
+            {
+                if (primaryChanged)
+                {
+                    // Rebind the primary path to the new recording, then overlays rebuild via StartPlayback.
+                    StopPlayback();
+                    StartPlayback();
+                }
+                else
+                {
+                    SyncOverlaysFromSelection();
+                }
+
+                if (resume >= 0f)
+                    SeekPlaybackTime(resume);
+            }
+            // When idle the primary is now loaded; overlays build once playback starts.
+        }
+
+        /// <summary>
+        /// Cycle the single active recording to the next one for this map (turning all others off) and seek it
+        /// to the current playhead. If the new clip is shorter, it holds on its last frame.
+        /// </summary>
+        public void CycleRecording()
+        {
+            var sel = RecordingSelection.Instance;
+            if (sel.Entries.Count == 0)
+                sel.Refresh(GetActiveMapId());
+
+            float t = IsPlaying ? PlaybackCurrentTime : 0f;
+            string next = sel.CycleSingle();
+            if (string.IsNullOrEmpty(next))
+            {
+                UpdateStatus("No recordings to cycle for this map");
+                return;
+            }
+
+            ApplyRecordingSelection(t);
+            UpdateStatus($"Recording: {next}");
         }
 
         /// <summary>
@@ -1062,6 +1499,10 @@ namespace BodyTracking
             player.OnPlaybackStopped += OnPlayerStopped;
             player.OnPlaybackProgress += OnPlayerProgress;
 
+            // Re-evaluate redundant image tracking the moment Immersal localization state changes (e.g. locks).
+            if (routeRootManager != null)
+                routeRootManager.OnLocalizationChanged += OnRouteLocalizationChanged;
+
             if (fusionCoordinator != null)
             {
                 fusionCoordinator.OnStatusChanged += HandleFusionCoordinatorStatus;
@@ -1180,6 +1621,7 @@ namespace BodyTracking
                 currentMode = newMode;
                 ApplyRealignSuppression();
                 ApplyOcclusionForMode(currentMode);
+                ApplyFrameCapForMode(currentMode);
                 OnModeChanged?.Invoke(currentMode);
             }
         }
@@ -1197,22 +1639,96 @@ namespace BodyTracking
         /// </summary>
         void ApplyOcclusionForMode(OperationMode mode)
         {
-            bool enable = mode == OperationMode.Playing;
+            bool enableOcclusion = mode == OperationMode.Playing;
 
-            // Free ARKit to choose an occlusion-capable configuration by dropping 3D body tracking during playback.
-            if (humanBodyManager != null && humanBodyManager.enabled == enable)
+            // The full-screen character-softening pass only matters while the CG character is composited into the
+            // scene (playback). Gate it off otherwise so idle/record camera mode skips two full-screen blits/frame.
+            BodyTracking.LookDev.CharacterCameraMatch.ScreenSofteningActive = mode == OperationMode.Playing;
+
+            // 3D body tracking is the heaviest live-AR path and runs continuously while the manager is enabled —
+            // it does NOT need to be on while the user is just framing the shot (Ready). Enable it only while
+            // arming (WaitingForBody) and Recording; the WaitForBodyThenRecord arming loop already tolerates the
+            // brief warm-up before ARKit reports a tracked body. Keep it off in Ready (idle camera = much cooler)
+            // and in Playing (so ARKit is free to pick an occlusion-capable configuration).
+            bool enableBodyTracking = mode == OperationMode.WaitingForBody || mode == OperationMode.Recording;
+            if (humanBodyManager != null && humanBodyManager.enabled != enableBodyTracking)
             {
-                humanBodyManager.enabled = !enable;
-                Debug.Log($"[BodyTrackingController] ARHumanBodyManager.enabled={humanBodyManager.enabled} for mode {mode} (occlusion needs body tracking off).");
+                humanBodyManager.enabled = enableBodyTracking;
+                Debug.Log($"[BodyTrackingController] ARHumanBodyManager.enabled={humanBodyManager.enabled} for mode {mode}.");
             }
+
+            // Plane detection is only used by playback features (floor contact shadow + floor penetration), so run
+            // it only during playback. This stops continuous plane detection in idle/record camera mode.
+            if (planeManager == null)
+                planeManager = FindFirstObjectByType<ARPlaneManager>();
+            if (planeManager != null && planeManager.enabled != enableOcclusion)
+                planeManager.enabled = enableOcclusion;
+
+            // Post-processing (incl. SMAA) and image tracking are only worthwhile during playback / before lock.
+            ApplyRenderCostForMode(mode);
+            ApplyImageTrackingForState();
 
             if (characterOcclusion == null)
                 characterOcclusion = FindFirstObjectByType<ARCharacterOcclusion>();
             if (characterOcclusion == null)
                 return;
 
-            if (characterOcclusion.OcclusionEnabled != enable)
-                characterOcclusion.SetOcclusionEnabled(enable);
+            if (characterOcclusion.OcclusionEnabled != enableOcclusion)
+                characterOcclusion.SetOcclusionEnabled(enableOcclusion);
+        }
+
+        /// <summary>
+        /// Run the URP post-processing stack (SMAA + uber/final blit) on the AR camera only during playback,
+        /// where a CG character is composited into the scene. Idle/record render just the camera feed + UI, so
+        /// post-processing there is several wasted full-screen passes per frame (heat with no visual benefit).
+        /// </summary>
+        void ApplyRenderCostForMode(OperationMode mode)
+        {
+            if (!postProcessingDuringPlaybackOnly)
+                return;
+
+            if (cameraData == null)
+            {
+                var cam = Globals.CameraManager != null ? Globals.CameraManager.GetComponent<Camera>() : Camera.main;
+                if (cam != null)
+                    cameraData = cam.GetComponent<UniversalAdditionalCameraData>();
+            }
+
+            if (cameraData != null)
+                cameraData.renderPostProcessing = mode == OperationMode.Playing;
+        }
+
+        /// <summary>
+        /// Image marker tracking is needed during playback (legacy/marker recordings replay against the marker or
+        /// a world-map anchor) and until Immersal has locked its room anchor (pre-lock fallback + scanning). Once
+        /// Immersal is frozen and we're idle/recording, the marker is never the route frame, so continuous image
+        /// tracking is redundant computer-vision cost. Re-evaluated on mode changes and on localization changes.
+        /// </summary>
+        void ApplyImageTrackingForState()
+        {
+            if (!gateImageTrackingWhenImmersalLocked)
+                return;
+
+            if (trackedImageManager == null)
+                trackedImageManager = Globals.TrackedImageManager != null
+                    ? Globals.TrackedImageManager
+                    : FindFirstObjectByType<ARTrackedImageManager>();
+            if (trackedImageManager == null)
+                return;
+
+            bool immersalLocked = routeRootManager != null &&
+                routeRootManager.ImmersalProvider != null &&
+                routeRootManager.ImmersalProvider.IsAnchorFrozen;
+
+            bool needImageTracking = currentMode == OperationMode.Playing || !immersalLocked;
+            if (trackedImageManager.enabled != needImageTracking)
+                trackedImageManager.enabled = needImageTracking;
+        }
+
+        private void OnRouteLocalizationChanged(bool _)
+        {
+            // Immersal locking flips IsLocalized; re-evaluate whether the redundant marker tracking can stop.
+            ApplyImageTrackingForState();
         }
 
         /// <summary>
@@ -1300,6 +1816,10 @@ namespace BodyTracking
                 SetFusionStatus("No paired video — Move AI skipped");
                 return;
             }
+
+            // Persist the paired-video metadata onto the saved recording so the on-disk JSON is complete before
+            // the (background, queued) Move AI upload begins. The queue itself owns job-id/state persistence.
+            RecordingStorage.SaveRecording(recording, lastRecordingFileName);
 
             fusionCoordinator.SubmitForFusion(recording, lastRecordingFileName, pairedVideoFilePath);
         }
@@ -1488,6 +2008,9 @@ namespace BodyTracking
                 worldMapPersistence.OnStatusChanged -= OnWorldMapStatusChanged;
                 worldMapPersistence.OnWorldMapLoaded -= OnWorldMapLoadedForPlaybackAnchor;
             }
+
+            if (routeRootManager != null)
+                routeRootManager.OnLocalizationChanged -= OnRouteLocalizationChanged;
         }
     }
 

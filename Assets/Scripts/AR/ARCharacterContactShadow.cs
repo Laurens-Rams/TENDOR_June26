@@ -58,10 +58,15 @@ namespace BodyTracking.AR
         [SerializeField] private float wallSurfacePadding = 0.01f;
 
         [Header("Look")]
-        [Range(0f, 1f)] [SerializeField] private float shadowAlpha = 0.38f;
-        [SerializeField] private Color shadowColor = Color.black;
+        [Tooltip("Peak opacity of the contact blob. Lower = softer, more balanced grounding.")]
+        [Range(0f, 1f)] [SerializeField] private float shadowAlpha = 0.22f;
+        [Tooltip("Slightly tinted dark grey reads softer than pure black against the camera feed.")]
+        [SerializeField] private Color shadowColor = new Color(0.05f, 0.05f, 0.06f, 1f);
 
         [Header("Behaviour")]
+        [Tooltip("Master switch for the whole contact-shadow feature (floor + wall blobs). Disabled by product " +
+                 "decision — no plane shadow is drawn. Turn back on to restore the grounding blob shadows.")]
+        [SerializeField] private bool enableContactShadows = false;
         [Tooltip("Only show during BodyTrackingController playback (same window as AR occlusion).")]
         [SerializeField] private bool onlyDuringPlayback = true;
         [Tooltip("Re-scan AR planes at this interval instead of every frame.")]
@@ -93,6 +98,10 @@ namespace BodyTracking.AR
 
         private void OnEnable()
         {
+            // Feature disabled: don't create shadow quads or resolve wiring. LateUpdate is a no-op too.
+            if (!enableContactShadows)
+                return;
+
             ResolveSceneWiring();
             EnsureShadowObjects();
             planeScanTimer = 0f;
@@ -168,6 +177,12 @@ namespace BodyTracking.AR
 
         private void LateUpdate()
         {
+            if (!enableContactShadows)
+            {
+                SetShadowsVisible(false);
+                return;
+            }
+
             if (!explicitEnabled)
             {
                 SetShadowsVisible(false);
@@ -432,8 +447,11 @@ namespace BodyTracking.AR
                 {
                     float dx = (x - half) / half;
                     float dy = (y - half) / half;
-                    float r = Mathf.Sqrt(dx * dx + dy * dy);
-                    float a = 1f - Mathf.SmoothStep(0.25f, 1f, r);
+                    float r = Mathf.Clamp01(Mathf.Sqrt(dx * dx + dy * dy));
+                    // Feathered falloff with no hard opaque core: density peaks gently at centre and eases out,
+                    // so the blob grounds the character without a hard dark disc.
+                    float a = 1f - Mathf.SmoothStep(0f, 1f, r);
+                    a *= a;
                     tex.SetPixel(x, y, new Color(1f, 1f, 1f, a));
                 }
             }

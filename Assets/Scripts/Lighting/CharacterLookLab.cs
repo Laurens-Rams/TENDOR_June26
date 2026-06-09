@@ -40,8 +40,13 @@ namespace BodyTracking.LookDev
         [Range(0f, 3f)] public float fillIntensity = 0.40f;
         [Range(0f, 3f)] public float sideFillIntensity = 0.25f;
         [Range(0f, 3f)] public float rimIntensity = 0.55f;
+        [Tooltip("Up-light / floor bounce coming from BELOW so the lower body and undersides aren't crushed dark " +
+                 "where the overhead key/fill/rim don't reach. Creates the light if the rig doesn't have one yet.")]
+        [Range(0f, 3f)] public float bottomFillIntensity = 0.45f;
         [Tooltip("Overall ambient lift (Trilight gradient when not using an HDRI).")]
         [Range(0f, 3f)] public float ambientIntensity = 1.0f;
+        [Tooltip("Extra lift on the ground (downward) ambient term so light also comes from below.")]
+        [Range(1f, 3f)] public float ambientGroundLift = 1.4f;
 
         [Header("Indoor HDRI (optional, realistic IBL)")]
         [Tooltip("Assign an indoor HDRI cubemap for image-based lighting. When set and enabled, it drives the " +
@@ -63,6 +68,17 @@ namespace BodyTracking.LookDev
         [Range(0f, 0.35f)] public float screenMinBlend = 0.14f;
         [Range(0.5f, 5f)] public float screenBlurRadius = 2.4f;
         [Range(0f, 40f)] public float screenDepthStrength = 18f;
+        [Tooltip("Tone-match the character to the soft AR feed (contrast/saturation/black-lift). Masked to CG " +
+                 "geometry by depth, so the camera feed is untouched. Runs inside the existing soften pass (free).")]
+        public bool toneMatch = true;
+        [Tooltip("0 = no grade, 1 = full grade.")]
+        [Range(0f, 1f)] public float toneMatchStrength = 1f;
+        [Tooltip("<1 lowers the character's contrast toward mid-grey.")]
+        [Range(0.5f, 1f)] public float toneMatchContrast = 0.95f;
+        [Tooltip("<1 desaturates the character toward the duller camera look.")]
+        [Range(0.5f, 1f)] public float toneMatchSaturation = 0.92f;
+        [Tooltip("Lifts crushed CG blacks to match the camera's black floor.")]
+        [Range(0f, 0.1f)] public float toneMatchBlackLift = 0.006f;
         [Tooltip("Reduce normal-map strength so skin/cloth shading is less crisp.")]
         public bool materialSoftening = true;
         [Range(0f, 1f)] public float materialNormalScale = 0.45f;
@@ -79,6 +95,7 @@ namespace BodyTracking.LookDev
         const string FillName = "Fill Light (Windows)";
         const string SideFillName = "Side Fill (Bounce)";
         const string RimName = "Rim Light (Back)";
+        const string BottomFillName = "Bottom Fill (Floor Bounce Up)";
 
         Material hdriSkybox; // runtime skybox material built from the HDRI
 
@@ -233,6 +250,10 @@ namespace BodyTracking.LookDev
                 materialNormalScale = materialNormalScale,
                 textureMipBias = textureMipBias,
                 textureAnisoLevel = textureAnisoLevel,
+                matchStrength = toneMatch ? toneMatchStrength : 0f,
+                matchContrast = toneMatchContrast,
+                matchSaturation = toneMatchSaturation,
+                matchBlackLift = toneMatchBlackLift,
             });
         }
 
@@ -272,6 +293,7 @@ namespace BodyTracking.LookDev
             SetLight(FillName, fillIntensity);
             SetLight(SideFillName, sideFillIntensity);
             SetLight(RimName, rimIntensity);
+            SetBottomFill(bottomFillIntensity);
         }
 
         void SetLight(string name, float intensity)
@@ -279,6 +301,32 @@ namespace BodyTracking.LookDev
             var group = GameObject.Find(GroupName);
             Transform t = group != null ? group.transform.Find(name) : null;
             if (t == null) return;
+            var light = t.GetComponent<Light>();
+            if (light != null) light.intensity = intensity;
+        }
+
+        /// <summary>
+        /// Drive the floor-bounce up-light, creating it under the TendorLighting group if the rig predates it
+        /// (so the lab works without re-running the editor setup). Aims upward from below to lift the undersides.
+        /// </summary>
+        void SetBottomFill(float intensity)
+        {
+            var group = GameObject.Find(GroupName);
+            if (group == null) return;
+
+            Transform t = group.transform.Find(BottomFillName);
+            if (t == null)
+            {
+                var go = new GameObject(BottomFillName);
+                go.transform.SetParent(group.transform, false);
+                t = go.transform;
+                var created = go.AddComponent<Light>();
+                created.type = LightType.Directional;
+                created.color = new Color(0.98f, 0.95f, 0.90f);
+                created.shadows = LightShadows.None;
+                t.localEulerAngles = new Vector3(-65f, 20f, 0f);
+            }
+
             var light = t.GetComponent<Light>();
             if (light != null) light.intensity = intensity;
         }
@@ -295,10 +343,14 @@ namespace BodyTracking.LookDev
             else
             {
                 // Fall back to the flat gym gradient ambient (matches GymLightingSetup).
+                // NOTE: Unity only honours RenderSettings.ambientIntensity in Skybox ambient mode; in Trilight
+                // (gradient) mode it's ignored, so the slider must scale the gradient colours directly.
                 RenderSettings.ambientMode = AmbientMode.Trilight;
-                RenderSettings.ambientSkyColor = new Color(0.55f, 0.58f, 0.62f);
-                RenderSettings.ambientEquatorColor = new Color(0.44f, 0.44f, 0.46f);
-                RenderSettings.ambientGroundColor = new Color(0.30f, 0.28f, 0.24f);
+                float k = ambientIntensity;
+                RenderSettings.ambientSkyColor = new Color(0.55f, 0.58f, 0.62f) * k;
+                RenderSettings.ambientEquatorColor = new Color(0.46f, 0.46f, 0.48f) * k;
+                // Ground term lifted (and scaled by ambientGroundLift) so ambient also comes from below.
+                RenderSettings.ambientGroundColor = new Color(0.42f, 0.40f, 0.37f) * (k * ambientGroundLift);
                 RenderSettings.ambientIntensity = ambientIntensity;
             }
             RenderSettings.reflectionIntensity = 1f;

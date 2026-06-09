@@ -40,7 +40,12 @@ namespace BodyTracking.UI
         private GameObject pauseIcon;
         private Button backToRecordButton;
         private Button tuneButton;
+        private Button recordingsButton;
         private Button characterCycleButton;
+        private Button recordingCycleButton;
+        private Button debugToggleButton;
+        private RectTransform debugToggleIcon;
+        private DebugVisualsController debugVisuals;
         private CharacterSwitcher characterSwitcher;
         private Button finishButton;
         private Image finishCircle;
@@ -176,6 +181,37 @@ namespace BodyTracking.UI
             UIFactory.AddSwitchIcon(cycleRect, CharacterCycleButtonSize * 0.46f, UITokens.OnSurface);
             characterSwitcher = Object.FindFirstObjectByType<CharacterSwitcher>();
             characterCycleButton.onClick.AddListener(OnCycleCharacterClicked);
+
+            // Cycle-recordings button: steps the single active recording through all clips for this map,
+            // re-syncing each to the current playhead. Sits just left of the character-switch button.
+            recordingCycleButton = UIFactory.CreateCircleButton(
+                "RecordingCycle", root, CharacterCycleButtonSize, UITokens.PlaybackTransportBtn);
+            var recCycleRect = (RectTransform)recordingCycleButton.transform;
+            recCycleRect.anchorMin = new Vector2(1f, TimelineHeightFraction);
+            recCycleRect.anchorMax = new Vector2(1f, TimelineHeightFraction);
+            recCycleRect.pivot = new Vector2(0.5f, 0f);
+            recCycleRect.anchoredPosition = new Vector2(
+                timelineCenterX - (CharacterCycleButtonSize + UITokens.Space8), switchTimelineGap);
+            UIFactory.AddClimberIcon(recCycleRect, CharacterCycleButtonSize * 0.5f, UITokens.OnSurface);
+            recordingCycleButton.onClick.AddListener(OnCycleRecordingClicked);
+
+            // Skeleton / debug-visuals toggle: sits just left of the recording-switch button. Shows or hides
+            // the AR debug overlays (skeletons, Immersal/AR-plane dots, compare skeletons). Moved here from the
+            // record screen so all visualization controls live alongside the character/recording switches.
+            debugToggleButton = UIFactory.CreateCircleButton(
+                "DebugToggle", root, CharacterCycleButtonSize, UITokens.PlaybackTransportBtn);
+            var dbgRect = (RectTransform)debugToggleButton.transform;
+            dbgRect.anchorMin = new Vector2(1f, TimelineHeightFraction);
+            dbgRect.anchorMax = new Vector2(1f, TimelineHeightFraction);
+            dbgRect.pivot = new Vector2(0.5f, 0f);
+            dbgRect.anchoredPosition = new Vector2(
+                timelineCenterX - 2f * (CharacterCycleButtonSize + UITokens.Space8), switchTimelineGap);
+            debugToggleIcon = (RectTransform)UIFactory.AddPlayIcon(dbgRect, CharacterCycleButtonSize * 0.28f, UITokens.OnSurface).transform;
+            debugVisuals = Object.FindFirstObjectByType<DebugVisualsController>();
+            if (debugVisuals == null)
+                debugVisuals = gameObject.AddComponent<DebugVisualsController>();
+            debugToggleButton.onClick.AddListener(OnToggleDebugVisualsClicked);
+            UpdateDebugToggleIcon();
 
             trackArea = UIFactory.CreateRect("TrackArea", column);
             trackArea.anchorMin = Vector2.zero;
@@ -470,10 +506,45 @@ namespace BodyTracking.UI
         {
             if (characterSwitcher == null)
                 characterSwitcher = Object.FindFirstObjectByType<CharacterSwitcher>();
-            if (characterSwitcher != null)
-                characterSwitcher.CycleCharacter();
-            else
+            if (characterSwitcher == null)
+            {
                 UnityEngine.Debug.LogWarning("[PlaybackScreenUI] No CharacterSwitcher found — cannot cycle characters.");
+                return;
+            }
+
+            characterSwitcher.CycleCharacter();
+
+            // Keep the Recordings list in sync: the global switch drives the primary (timeline) recording, so
+            // record its new character on that recording's entry.
+            var sel = RecordingSelection.Instance;
+            string primary = sel != null ? sel.PrimaryFileName : null;
+            if (!string.IsNullOrEmpty(primary))
+                sel.SetCharacterIndex(primary, characterSwitcher.CurrentIndex);
+        }
+
+        private void OnCycleRecordingClicked()
+        {
+            if (controller != null)
+                controller.CycleRecording();
+            RefreshAll();
+        }
+
+        private void OnToggleDebugVisualsClicked()
+        {
+            if (debugVisuals == null)
+                debugVisuals = Object.FindFirstObjectByType<DebugVisualsController>();
+            if (debugVisuals != null)
+                debugVisuals.Toggle();
+            UpdateDebugToggleIcon();
+        }
+
+        private void UpdateDebugToggleIcon()
+        {
+            if (debugToggleIcon == null)
+                return;
+            bool showing = debugVisuals != null && debugVisuals.VisualsVisible;
+            // Point the chevron down while debug visuals are shown (tap to hide), up once hidden.
+            debugToggleIcon.localRotation = Quaternion.Euler(0f, 0f, showing ? -90f : 90f);
         }
 
         // ============================================================================================
@@ -497,10 +568,20 @@ namespace BodyTracking.UI
             trect.anchorMax = new Vector2(0f, 1f);
             trect.pivot = new Vector2(0f, 1f);
             trect.anchoredPosition = new Vector2(UITokens.Space12 + 96f + UITokens.Space8, -UITokens.Space8);
+
+            recordingsButton = UIFactory.CreatePillButton("OpenRecordings", root, "Recordings", ghost: true);
+            var rrect = (RectTransform)recordingsButton.transform;
+            rrect.sizeDelta = new Vector2(120f, 34f);
+            rrect.anchorMin = new Vector2(0f, 1f);
+            rrect.anchorMax = new Vector2(0f, 1f);
+            rrect.pivot = new Vector2(0f, 1f);
+            rrect.anchoredPosition = new Vector2(
+                UITokens.Space12 + 96f + UITokens.Space8 + 84f + UITokens.Space8, -UITokens.Space8);
         }
 
         public Button BackToRecordButton => backToRecordButton;
         public Button TuneButton => tuneButton;
+        public Button RecordingsButton => recordingsButton;
 
         // ============================================================================================
         // SHARED CANVAS / EVENT SYSTEM

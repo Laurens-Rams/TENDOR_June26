@@ -49,6 +49,7 @@ namespace BodyTracking.Spatial
         private bool lastLocalizedState;
         private float nextProviderResolveTime;
         private const float ProviderResolveRetrySeconds = 1f;
+        private int lastSelectFrame = -1;
 
         public event Action<bool> OnLocalizationChanged;
 
@@ -150,7 +151,7 @@ namespace BodyTracking.Spatial
 
         void Update()
         {
-            SelectActiveProvider();
+            // IsLocalized already runs SelectActiveProvider() (memoized per frame), so don't call it twice.
             bool now = IsLocalized;
             if (now != lastLocalizedState)
             {
@@ -167,6 +168,13 @@ namespace BodyTracking.Spatial
         /// </summary>
         private void SelectActiveProvider()
         {
+            // Memoize per frame: many property getters (RouteRoot, IsLocalized, IsAvailable, Source, ...) each call
+            // this, so without a frame guard a single frame can re-run selection (and provider availability checks)
+            // several times. Re-evaluating once per frame preserves the original per-Update behaviour.
+            if (Application.isPlaying && Time.frameCount == lastSelectFrame)
+                return;
+            lastSelectFrame = Time.frameCount;
+
             ResolveMissingProviders();
 
             // Once locked to a provider for the session, never switch away from it.

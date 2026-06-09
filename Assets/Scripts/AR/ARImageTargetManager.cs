@@ -47,8 +47,6 @@ namespace BodyTracking.AR
         
         private ARTrackedImage currentTrackedImage;
         private bool isImageDetected = false;
-        private bool contentAttachedToTarget = false;
-        private bool loggedMissingContentForTarget = false;
         private bool hasStablePose = false;
         private bool loggedOverlayAspectWarning = false;
         private float lastDetectionVisualTime = -999f;
@@ -102,7 +100,7 @@ namespace BodyTracking.AR
             
             if (trackedImageManager != null)
             {
-                trackedImageManager.trackedImagesChanged += OnTrackedImagesChanged;
+                trackedImageManager.trackablesChanged.AddListener(OnTrackedImagesChanged);
             }
             else
             {
@@ -114,11 +112,11 @@ namespace BodyTracking.AR
         {
             if (trackedImageManager != null)
             {
-                trackedImageManager.trackedImagesChanged -= OnTrackedImagesChanged;
+                trackedImageManager.trackablesChanged.RemoveListener(OnTrackedImagesChanged);
             }
         }
 
-        private void OnTrackedImagesChanged(ARTrackedImagesChangedEventArgs eventArgs)
+        private void OnTrackedImagesChanged(ARTrackablesChangedEventArgs<ARTrackedImage> eventArgs)
         {
             foreach (var trackedImage in eventArgs.added)
             {
@@ -144,8 +142,8 @@ namespace BodyTracking.AR
                 }
             }
             
-            foreach (var trackedImage in eventArgs.removed)
-                HandleImageRemoved(trackedImage);
+            foreach (var removed in eventArgs.removed)
+                HandleImageRemoved(removed.Value);
         }
 
         private bool TryTrackTarget(ARTrackedImage trackedImage)
@@ -191,8 +189,6 @@ namespace BodyTracking.AR
             
             currentTrackedImage = null;
             isImageDetected = false;
-            contentAttachedToTarget = false;
-            loggedMissingContentForTarget = false;
             hasStablePose = false;
             
             // Deactivate and detach content
@@ -229,8 +225,10 @@ namespace BodyTracking.AR
             }
 
             UpdateReferenceImageOverlay(currentTrackedImage);
-            // Fire even when there is no named child content — tracking still uses the AR marker transform.
-            OnImageTargetUpdated?.Invoke(currentTrackedImage.transform);
+            // Note: we intentionally do NOT fire OnImageTargetUpdated here every frame. The only subscriber
+            // (ImageTargetRouteRootProvider) already follows the live marker transform in its own Update, so a
+            // per-frame event just duplicated that RouteRoot write. The event still fires on real track changes
+            // (TryTrackTarget) for detect/re-acquire transitions.
         }
 
         private void UpdateSmoothedTargetPose(ARTrackedImage trackedImage, bool snap)
@@ -281,8 +279,13 @@ namespace BodyTracking.AR
                 ? ComputeOverlayLocalRotation(trackedImage)
                 : Quaternion.Euler(overlayPlaneLocalEulerAngles);
 
-            referenceImageOverlay.transform.SetParent(trackedImage.transform, false);
-            referenceImageOverlay.transform.localPosition = Vector3.zero;
+            // Only re-parent when the parent actually changed; SetParent every frame forces a transform
+            // hierarchy rebuild. Once parented, localPosition stays zero and the overlay follows automatically.
+            if (referenceImageOverlay.transform.parent != trackedImage.transform)
+            {
+                referenceImageOverlay.transform.SetParent(trackedImage.transform, false);
+                referenceImageOverlay.transform.localPosition = Vector3.zero;
+            }
             referenceImageOverlay.transform.localRotation = overlayLocalRotation;
             referenceImageOverlay.transform.localScale = new Vector3(w / 10f * overlayScaleMultiplier, 1f, h / 10f * overlayScaleMultiplier);
             referenceImageOverlay.SetActive(true);
@@ -295,10 +298,13 @@ namespace BodyTracking.AR
 
             if (detectionBoundsLine != null)
             {
-                detectionBoundsLine.transform.SetParent(trackedImage.transform, false);
-                detectionBoundsLine.transform.localPosition = Vector3.zero;
+                if (detectionBoundsLine.transform.parent != trackedImage.transform)
+                {
+                    detectionBoundsLine.transform.SetParent(trackedImage.transform, false);
+                    detectionBoundsLine.transform.localPosition = Vector3.zero;
+                    detectionBoundsLine.transform.localScale = Vector3.one;
+                }
                 detectionBoundsLine.transform.localRotation = overlayLocalRotation;
-                detectionBoundsLine.transform.localScale = Vector3.one;
                 detectionBoundsLine.gameObject.SetActive(true);
                 UpdateDetectionBounds(new Vector2(w, h));
             }

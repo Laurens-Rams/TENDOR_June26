@@ -19,8 +19,6 @@ namespace BodyTracking.Animation
         [SerializeField] private bool autoFindHipBone = true;
         [SerializeField] private string[] hipBoneNames = { "Hips Node", "Hips", "Hip", "Pelvis", "mixamorig:Hips", "Root" };
         [SerializeField] private bool showDebugSphere = false;
-        [SerializeField] private bool adjustCharacterHeight = true;
-        [SerializeField] private float groundOffset = 0.0f; // How much above ground to place character
         [Tooltip("Uniform scale for the character root so the overlay matches real-world body size (1 = model default, lower = smaller vs AR).")]
         [SerializeField] private float characterWorldScale = 0.82f;
         

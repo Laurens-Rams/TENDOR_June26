@@ -36,12 +36,12 @@ namespace TENDOR.AR
             m_Material = new Material(shader) { hideFlags = HideFlags.HideAndDontSave };
             m_Material.color = quadColor;
 
-            m_ImageManager.trackedImagesChanged += OnTrackedImagesChanged;
+            m_ImageManager.trackablesChanged.AddListener(OnTrackedImagesChanged);
         }
 
         void OnDisable()
         {
-            m_ImageManager.trackedImagesChanged -= OnTrackedImagesChanged;
+            m_ImageManager.trackablesChanged.RemoveListener(OnTrackedImagesChanged);
             foreach (var kv in m_Quads)
                 Destroy(kv.Value);
             m_Quads.Clear();
@@ -50,10 +50,10 @@ namespace TENDOR.AR
                 Destroy(m_Material);
         }
 
-        void OnTrackedImagesChanged(ARTrackedImagesChangedEventArgs args)
+        void OnTrackedImagesChanged(ARTrackablesChangedEventArgs<ARTrackedImage> args)
         {
             foreach (var removed in args.removed)
-                RemoveQuad(removed.trackableId);
+                RemoveQuad(removed.Key);
 
             foreach (var added in args.added)
                 UpdateOrCreateQuad(added);

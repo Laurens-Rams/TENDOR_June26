@@ -10,6 +10,7 @@ using BodyTracking.Spatial;
 using BodyTracking.MoveAI;
 using BodyTracking.AR;
 using BodyTracking.Playback.PostProcess;
+using BodyTracking.Diagnostics;
 
 namespace BodyTracking.Playback
 {
@@ -49,8 +50,8 @@ namespace BodyTracking.Playback
             // Fit the foot->head BONE-CHAIN (joint to joint) to the skeleton. Lands the character's joints on the
             // orange joints, but lets the mesh crown/soles stick out past the skeleton (character looks taller).
             BoneChain,
-            // Match the character's mapped head and foot bones to the orange skeleton's Head and toe/ankle joints
-            // (measured from the pelvis). Default for GLB replay so shoes and head land on the skeleton.
+            // Scale to the orange skeleton's head-to-foot span and pin feet each frame (not hips) so fit-scale
+            // tweaks height without making the feet float.
             SkeletonJoints,
         }
 
@@ -82,13 +83,16 @@ namespace BodyTracking.Playback
             followSeconds = 0.1f,
             correctXZOnly = false,
             moveDrivenFacing = true,
-            facingCorrectionSeconds = 2f,
+            facingCorrectionSeconds = 1.141143f,
+            moveAutoRealign = true,
+            moveRealignDriftThreshold = 0.2f,
+            moveRealignEaseSeconds = 0.4f,
         };
 
-        [Tooltip("World position source during PLAYBACK. FollowArkit = recorded ARKit pelvis every frame (original). " +
-                 "FollowBakedRoot = the baked Move+ARKit fused trajectory (absolute, drift-free; travels the full path " +
-                 "and stays put when still). MoveAIDriftCorrected is intended for live AR, not playback.")]
-        [SerializeField] private FusedPoseSolver.AnchorMode playbackAnchorMode = FusedPoseSolver.AnchorMode.FollowBakedRoot;
+        [Tooltip("World position source during PLAYBACK. FollowMoveGlbRoot = Move GLB root motion (aligned once to ARKit, " +
+                 "auto re-align on drift; default). FollowBakedRoot = baked Move+ARKit fused trajectory. FollowArkit = " +
+                 "recorded ARKit pelvis every frame (original).")]
+        [SerializeField] private FusedPoseSolver.AnchorMode playbackAnchorMode = FusedPoseSolver.AnchorMode.FollowMoveGlbRoot;
 
         /// <summary>Live-tunable anchoring settings (also handed to the compare overlay so it matches).</summary>
         public FusedPoseSolver.AnchorSettings AnchorSettings => anchorSettings;
@@ -133,6 +137,10 @@ namespace BodyTracking.Playback
                       || playbackAnchorMode == FusedPoseSolver.AnchorMode.FollowMoveGlbRoot)
                 ? playbackAnchorMode
                 : FusedPoseSolver.AnchorMode.FollowArkit;
+            // Guard against zero values deserialized on objects saved before these fields existed (would cause a
+            // divide-by-zero ease or a re-align every frame). Fall back to the sane defaults.
+            if (s.moveRealignDriftThreshold <= 0f) s.moveRealignDriftThreshold = 0.2f;
+            if (s.moveRealignEaseSeconds <= 0f) s.moveRealignEaseSeconds = 0.4f;
             return s;
         }
 
@@ -144,21 +152,22 @@ namespace BodyTracking.Playback
         [SerializeField] private bool enablePoseSmoothing = true;
         [SerializeField] private PosePostProcessSettings postProcessSettings = new PosePostProcessSettings
         {
-            enableGlitchGuard = true,
+            enableGlitchGuard = false,
             maxJointSpeed = 6f,
             boneLengthTolerance = 0.25f,
             enableSmoothing = true,
             minCutoff = 0.35f,
-            beta = 0.08f,
+            beta = 0.1143093f,
             smoothRootTranslation = false,
             jumpVelocityThreshold = 1.5f,
             jumpBetaScale = 8f,
         };
-        [Tooltip("Master switch for wall/floor penetration correction + closest-hand IK (Step 4).")]
-        [SerializeField] private bool enablePenetrationFix = false;
+        [Tooltip("Master switch for wall/floor penetration correction + closest-hand IK (Step 4). On by default with " +
+                 "feet-on-floor only (wall IK stays off) to complement Move GLB root motion.")]
+        [SerializeField] private bool enablePenetrationFix = true;
         [SerializeField] private PenetrationSettings penetrationSettings = new PenetrationSettings
         {
-            enableFloorFix = false,
+            enableFloorFix = true,
             floorContactBand = 0.12f,
             enableWallHandIK = false,
             enableWallFootIK = false,
@@ -166,9 +175,9 @@ namespace BodyTracking.Playback
             penetrationForFullWeight = 0.08f,
             enableWholeBodyPush = false,
             minWholeBodyPenetration = 0.04f,
-            wholeBodyPenetrationFraction = 0.75f,
+            wholeBodyPenetrationFraction = 0.9188983f,
             maxWholeBodyPushMeters = 0.12f,
-            skipDuringJump = true,
+            skipDuringJump = false,
             debugDraw = false,
         };
         [Tooltip("AR surface probe used by the penetration fix. Auto-found if left empty.")]
@@ -187,7 +196,7 @@ namespace BodyTracking.Playback
         [SerializeField] private HeightFitMode heightFitMode = HeightFitMode.SkeletonJoints;
         [Tooltip("Optional fine-tune multiplier on the auto-computed height scale. Leave at 1 for an exact fit; " +
                  "nudge down/up if the mesh still reads slightly large/small. Live-adjustable in play mode.")]
-        [SerializeField, Range(0.5f, 1.5f)] private float skeletonFitScale = 0.9333801f;
+        [SerializeField, Range(0.5f, 1.5f)] private float skeletonFitScale = 0.88f;
         private float lastAppliedFitScale = float.NaN;
 
         [Header("Dev")]
@@ -209,6 +218,7 @@ namespace BodyTracking.Playback
         private float segmentLoopEnd;
         private bool readyToApply; // set in Update, consumed in LateUpdate so we win over the rig Animator
         private bool loggedPlacement; // one-shot placement diagnostic per playback
+        private bool pendingPosedHeightRefit; // re-measure head-foot span after first GLB pose is applied
         private Animator characterAnimator; // disabled while we drive bones procedurally
         private FusedPoseSolver.AnchorState anchorState; // last-good ARKit anchor/facing through dropouts
 
@@ -702,6 +712,7 @@ namespace BodyTracking.Playback
             postProcessor.Reset();
             RefreshGlbPostProcess();
             glbSource?.ResetSmoothing();
+            pendingPosedHeightRefit = glbActive;
             hasLastGoodBodyBasis = false;
             waitingForLocalization = !routeRootProvider.IsLocalized;
             SetCharacterVisible(characterRoot != null && !waitingForLocalization);
@@ -824,18 +835,39 @@ namespace BodyTracking.Playback
         void ApplyFrame(float t)
         {
             if (characterRoot == null) return;
+            // #region agent log
+            PerfSampler.Begin("Frame.ApplyFrame");
+            // #endregion
 
             // Positions-based retarget: drive the rig from Move's reliable joint POSITIONS rather than its
             // source local rotations. Each bone aims at its Move child and uses a captured bind-pose up axis
             // to keep elbows, knees, hands, and feet from twisting/flipping around the segment direction.
             var effAnchorSettings = EffectivePlaybackAnchorSettings();
             useMoveDrivenFacing = effAnchorSettings.moveDrivenFacing;
+            // #region agent log
+            PerfSampler.Begin("Solve.ComputeLocal");
+            // #endregion
             Vector3[] local = FusedPoseSolver.ComputeLocalJoints(asset, recording, t, ref anchorState, out Quaternion effectiveFacingLocal, invertFacing, effAnchorSettings, ActiveGlbSource);
-            if (local == null) return;
+            // #region agent log
+            PerfSampler.End("Solve.ComputeLocal");
+            // #endregion
+            if (local == null)
+            {
+                // #region agent log
+                PerfSampler.End("Frame.ApplyFrame");
+                // #endregion
+                return;
+            }
 
             // Step 2/3: joint-array cleanup for the procedural path. GLB replay handles muscles in MoveGlbSource.
+            // #region agent log
+            PerfSampler.Begin("PostProcess");
+            // #endregion
             if (!glbActive && (enablePoseSmoothing || postProcessSettings.enableGlitchGuard))
                 postProcessor.Process(local, rootJointIndex, Time.deltaTime, postProcessSettings);
+            // #region agent log
+            PerfSampler.End("PostProcess");
+            // #endregion
             bool jumping = postProcessor.LastJumping;
 
             int n = local.Length;
@@ -847,16 +879,27 @@ namespace BodyTracking.Playback
             // hips are pinned, so both the procedural and GLB paths inherit the correction.
             if (enablePenetrationFix && surfaceProbe != null)
             {
+                // #region agent log
+                PerfSampler.Begin("Penetration.BodyFloor");
+                // #endregion
                 if (routeRootProvider != null && routeRootProvider.RouteRoot != null)
                     surfaceProbe.SetRouteRoot(routeRootProvider.RouteRoot);
                 penetrationResolver.ResolveBodyAndFloor(world, rootJointIndex, footWorldIndices, wallContactWorldIndices,
                     jumping, penetrationSettings);
+                // #region agent log
+                PerfSampler.End("Penetration.BodyFloor");
+                // #endregion
             }
 
             // GLB articulation path: body + fingers come from the Move GLB (muscle space); positioning + facing
             // still come from the fused world joints above. Returns early so the procedural bone solver is skipped.
             if (glbActive && ApplyGlbFrame(t, world, effectiveFacingLocal))
+            {
+                // #region agent log
+                PerfSampler.End("Frame.ApplyFrame");
+                // #endregion
                 return;
+            }
 
             // Reset every bound bone to its bind pose so this frame's swing is computed fresh (no roll drift).
             foreach (var kv in boneByJoint)
@@ -891,7 +934,18 @@ namespace BodyTracking.Playback
 
             // Step 4 (bone phase): pin any hand/foot that sank through the wall back onto the surface (climbing).
             if (enablePenetrationFix && surfaceProbe != null)
+            {
+                // #region agent log
+                PerfSampler.Begin("Penetration.Limbs");
+                // #endregion
                 penetrationResolver.ResolveLimbs(characterAnimator, jumping, penetrationSettings);
+                // #region agent log
+                PerfSampler.End("Penetration.Limbs");
+                // #endregion
+            }
+            // #region agent log
+            PerfSampler.End("Frame.ApplyFrame");
+            // #endregion
         }
 
         /// <summary>
@@ -904,7 +958,14 @@ namespace BodyTracking.Playback
         {
             if (targetPoseHandler == null || glbSource == null || poseRoot == null)
                 return false;
-            if (!glbSource.SampleHumanPose(t, ref glbPose))
+            // #region agent log
+            PerfSampler.Begin("Glb.Sample");
+            // #endregion
+            bool sampled = glbSource.SampleHumanPose(t, ref glbPose);
+            // #region agent log
+            PerfSampler.End("Glb.Sample");
+            // #endregion
+            if (!sampled)
                 return false;
 
             // Strip GLB root motion — the fused trajectory owns world placement and facing. Keeping the Move
@@ -915,11 +976,25 @@ namespace BodyTracking.Playback
 
             targetPoseHandler.SetHumanPose(ref glbPose);
 
+            if (pendingPosedHeightRefit)
+            {
+                pendingPosedHeightRefit = false;
+                ApplyRecordingHeightScale();
+            }
+
             // Same root placement + per-frame facing as the procedural path (characterRoot, not poseRoot alone).
             OrientAndPlaceRoot(world, effectiveFacingLocal);
 
             if (enablePenetrationFix && surfaceProbe != null)
+            {
+                // #region agent log
+                PerfSampler.Begin("Penetration.Limbs");
+                // #endregion
                 penetrationResolver.ResolveLimbs(characterAnimator, postProcessor.LastJumping, penetrationSettings);
+                // #region agent log
+                PerfSampler.End("Penetration.Limbs");
+                // #endregion
+            }
 
             if (!loggedPlacement)
             {
@@ -932,7 +1007,7 @@ namespace BodyTracking.Playback
             return true;
         }
 
-        /// <summary>Position the character so its hips sit on the Move pelvis, facing the Move body basis.</summary>
+        /// <summary>Position the character: rotate to face, then pin feet (skeleton-joint fit) or hips (legacy).</summary>
         void OrientAndPlaceRoot(Vector3[] world, Quaternion effectiveFacingLocal)
         {
             Vector3 hipsW = world[rootJointIndex];
@@ -965,19 +1040,54 @@ namespace BodyTracking.Playback
 
             Quaternion targetAnatomical = Quaternion.LookRotation(forward, Vector3.up);
             if (hasRigBindAnatomical)
-            {
                 characterRoot.rotation = targetAnatomical * Quaternion.Inverse(rigBindLocalAnatomical);
-            }
             else
-            {
                 characterRoot.rotation = targetAnatomical;
+
+            // Foot-anchored placement: scale is head-to-foot, so pin feet to the orange skeleton — not hips.
+            // Hip-only pinning made the feet look right but the head too high; shrinking fit-scale then floated the feet.
+            if (heightFitMode == HeightFitMode.SkeletonJoints && TryComputeFootPlacementCorrection(world, out Vector3 footCorrection))
+            {
+                characterRoot.position += footCorrection;
+                return;
             }
 
-            // After rotating, shift so the actual hips bone lands on the Move pelvis.
             if (boneByJoint.TryGetValue(rootJointIndex, out var hipsBone) && hipsBone != null)
                 characterRoot.position += hipsW - hipsBone.position;
             else
                 characterRoot.position = hipsW;
+        }
+
+        /// <summary>Average left/right foot error so both land on the orange skeleton after uniform scale.</summary>
+        bool TryComputeFootPlacementCorrection(Vector3[] world, out Vector3 correction)
+        {
+            correction = Vector3.zero;
+            if (asset?.pose == null || world == null) return false;
+
+            int count = 0;
+            foreach (int idx in GetPlacementFootJointIndices())
+            {
+                if (idx < 0 || idx >= world.Length) continue;
+                if (!boneByJoint.TryGetValue(idx, out var bone) || bone == null) continue;
+                correction += world[idx] - bone.position;
+                count++;
+            }
+
+            if (count == 0) return false;
+            correction /= count;
+            return true;
+        }
+
+        /// <summary>Left/right ankle (or toe) indices used for foot pinning.</summary>
+        IEnumerable<int> GetPlacementFootJointIndices()
+        {
+            var pose = asset.pose;
+            int left = pose.IndexOfJoint("Left_ankle");
+            if (left < 0) left = pose.IndexOfJoint("Left_toe");
+            int right = pose.IndexOfJoint("Right_ankle");
+            if (right < 0) right = pose.IndexOfJoint("Right_toe");
+            if (left >= 0) yield return left;
+            if (right >= 0) yield return right;
         }
 
         struct BodyBasis
@@ -1104,7 +1214,7 @@ namespace BodyTracking.Playback
             if (heightFitMode == HeightFitMode.SkeletonJoints && TryComputeSkeletonJointScale(currentScale, fit, out float jointScale))
             {
                 characterRoot.localScale = Vector3.one * jointScale;
-                Debug.Log($"[FusedCharacterPlayer] Character skeleton-joint fit scale={jointScale:F3} (head+feet → orange joints, fit={fit:F2})");
+                Debug.Log($"[FusedCharacterPlayer] Character skeleton-joint fit scale={jointScale:F3} (head→foot span, feet pinned, fit={fit:F2})");
                 return;
             }
 
@@ -1173,10 +1283,9 @@ namespace BodyTracking.Playback
         static readonly string[] FootJointCandidates = { "Left_toe", "Right_toe", "Left_ankle", "Right_ankle" };
 
         /// <summary>
-        /// Uniform scale so the character's mapped head and foot land on the orange skeleton's Head and foot joints
-        /// when the pelvis is pinned. Uses the same <see cref="MoveAIFusionAsset.scale"/> as
-        /// <see cref="FusedPoseSolver.ComputeLocalJoints"/>. Averages hip→head and hip→foot ratios so both extremities
-        /// match as closely as a single scale allows.
+        /// Uniform scale from the orange skeleton's head-to-foot span (same <see cref="MoveAIFusionAsset.scale"/> as
+        /// the overlay). Feet are pinned each frame in <see cref="OrientAndPlaceRoot"/>, so <see cref="skeletonFitScale"/>
+        /// can nudge height without floating the feet.
         /// </summary>
         bool TryComputeSkeletonJointScale(float currentUniformScale, float fitMultiplier, out float scale)
         {
@@ -1189,27 +1298,21 @@ namespace BodyTracking.Playback
             if (headIdx < 0) headIdx = pose.IndexOfJoint("Neck");
             int footIdx = FindMappedExtremityJoint(pose, rootJointIndex, FootJointCandidates);
             if (headIdx < 0 || footIdx < 0) return false;
-            if (!boneByJoint.TryGetValue(rootJointIndex, out var hipsBone) || hipsBone == null) return false;
             if (!boneByJoint.TryGetValue(headIdx, out var headBone) || headBone == null) return false;
             if (!boneByJoint.TryGetValue(footIdx, out var footBone) || footBone == null) return false;
 
             var fk = pose.ForwardKinematics(pose.frames[0]);
-            if (fk == null || headIdx >= fk.Length || footIdx >= fk.Length || rootJointIndex >= fk.Length)
+            if (fk == null || headIdx >= fk.Length || footIdx >= fk.Length)
                 return false;
 
             float poseScale = Mathf.Max(0.01f, asset.scale);
-            float moveHeadDist = Vector3.Distance(fk[headIdx], fk[rootJointIndex]);
-            float moveFootDist = Vector3.Distance(fk[footIdx], fk[rootJointIndex]);
-            if (moveHeadDist < 0.05f || moveFootDist < 0.05f) return false;
+            float moveSpan = Vector3.Distance(fk[headIdx], fk[footIdx]) * poseScale;
+            if (moveSpan < 0.1f) return false;
 
-            // Normalize out the current root scale so re-applying the fit slider stays stable, not cumulative.
-            float charHeadDist = Vector3.Distance(headBone.position, hipsBone.position) / currentUniformScale;
-            float charFootDist = Vector3.Distance(footBone.position, hipsBone.position) / currentUniformScale;
-            if (charHeadDist < 0.05f || charFootDist < 0.05f) return false;
+            float charSpan = Vector3.Distance(headBone.position, footBone.position) / currentUniformScale;
+            if (charSpan < 0.1f) return false;
 
-            float headRatio = (moveHeadDist * poseScale) / charHeadDist;
-            float footRatio = (moveFootDist * poseScale) / charFootDist;
-            scale = Mathf.Max(0.01f, 0.5f * (headRatio + footRatio) * fitMultiplier);
+            scale = Mathf.Max(0.01f, moveSpan / charSpan * fitMultiplier);
             return true;
         }
 

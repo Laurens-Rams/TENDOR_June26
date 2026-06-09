@@ -8,7 +8,8 @@ namespace BodyTracking.UI
     {
         Record,
         Playback,
-        Tuning
+        Tuning,
+        Recordings
     }
 
     /// <summary>
@@ -21,6 +22,7 @@ namespace BodyTracking.UI
         public BodyTrackingUI recordScreen;
         public PlaybackScreenUI playbackScreen;
         public TuningScreenUI tuningScreen;
+        public RecordingsMenuUI recordingsScreen;
 
         [Header("State")]
         [SerializeField] private AppScreen activeScreen = AppScreen.Record;
@@ -53,6 +55,12 @@ namespace BodyTracking.UI
         {
             // Reached from Playback; keep playback running so edits are visible on the character.
             ApplyScreen(AppScreen.Tuning, stopPlaybackOnLeave: false);
+        }
+
+        public void ShowRecordings()
+        {
+            // Reached from Playback; keep playback running so toggled recordings overlap live in the scene.
+            ApplyScreen(AppScreen.Recordings, stopPlaybackOnLeave: false);
         }
 
         public void ToggleScreen()
@@ -89,6 +97,15 @@ namespace BodyTracking.UI
                 tuningScreen = Object.FindFirstObjectByType<TuningScreenUI>();
             if (tuningScreen == null)
                 tuningScreen = gameObject.AddComponent<TuningScreenUI>();
+
+            if (recordingsScreen == null)
+                recordingsScreen = GetComponent<RecordingsMenuUI>();
+            if (recordingsScreen == null)
+                recordingsScreen = Object.FindFirstObjectByType<RecordingsMenuUI>();
+            if (recordingsScreen == null)
+                recordingsScreen = gameObject.AddComponent<RecordingsMenuUI>();
+            if (recordingsScreen.controller == null && recordScreen != null)
+                recordingsScreen.controller = recordScreen.controller;
         }
 
         private void WireToggleButtons()
@@ -112,6 +129,18 @@ namespace BodyTracking.UI
             {
                 tuningScreen.BackButton.onClick.RemoveListener(ShowPlayback);
                 tuningScreen.BackButton.onClick.AddListener(ShowPlayback);
+            }
+
+            if (playbackScreen != null && playbackScreen.RecordingsButton != null)
+            {
+                playbackScreen.RecordingsButton.onClick.RemoveListener(ShowRecordings);
+                playbackScreen.RecordingsButton.onClick.AddListener(ShowRecordings);
+            }
+
+            if (recordingsScreen != null && recordingsScreen.BackButton != null)
+            {
+                recordingsScreen.BackButton.onClick.RemoveListener(ShowPlayback);
+                recordingsScreen.BackButton.onClick.AddListener(ShowPlayback);
             }
         }
 
@@ -138,6 +167,9 @@ namespace BodyTracking.UI
 
             if (tuningScreen != null)
                 tuningScreen.SetVisible(screen == AppScreen.Tuning);
+
+            if (recordingsScreen != null)
+                recordingsScreen.SetVisible(screen == AppScreen.Recordings);
 
             if (screen == AppScreen.Playback && playbackScreen != null)
             {

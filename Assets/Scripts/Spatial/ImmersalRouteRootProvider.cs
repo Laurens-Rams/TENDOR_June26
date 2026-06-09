@@ -110,6 +110,37 @@ namespace BodyTracking.Spatial
         [Tooltip("Seconds to smoothly blend the anchor to a corrected pose (0 = instant snap).")]
         [SerializeField] private float realignBlendSeconds = 0.3f;
 
+#if IMMERSAL_SDK_PRESENT
+        [Header("Power / heat")]
+        [Tooltip("Pause the Immersal localization session once the room anchor is locked (frozen). Continuous " +
+                 "on-device localization is the heaviest AR workload and the largest idle heat/battery cost; once " +
+                 "we hold a confident lock we no longer need it until a manual re-align/retarget, which resumes it " +
+                 "automatically. ON by default for mobile thermals; turn OFF for raw continuous Immersal correction.")]
+        [SerializeField] private bool pauseLocalizationWhenFrozen = true;
+        [Tooltip("After a manual re-align (anchor kept), keep localization running this many seconds so a fresh " +
+                 "fix can arrive before it pauses again.")]
+        [SerializeField] private float realignLocalizationWindowSeconds = 5f;
+
+        [Tooltip("Override the Immersal session frequency at runtime. This is the biggest steady-state heat/FPS " +
+                 "lever while the anchor has not locked yet: the SDK default re-localizes every 2s. ON by default " +
+                 "for mobile thermals; turn OFF for SDK-default localization cadence.")]
+        [SerializeField] private bool tuneLocalizationFrequency = true;
+        [Tooltip("Seconds between continuous localizations once running (SDK default 2s). Higher = cooler / smoother, " +
+                 "slower to re-correct drift.")]
+        [SerializeField] private float localizationIntervalSeconds = 5f;
+        [Tooltip("Successful localizations before the heavy every-frame startup burst stops (SDK default 10). We only " +
+                 "need a handful to lock, so a lower value cuts the worst startup heat.")]
+        [SerializeField] private int burstSuccessCount = 4;
+        [Tooltip("Hard time cap for the startup burst in seconds (SDK default 15).")]
+        [SerializeField] private float burstTimeLimitSeconds = 8f;
+
+        [Tooltip("Lower the iOS camera resolution Immersal localizes against. Each localization copies+converts a " +
+                 "full camera image (the dominant GC/heat cost); the SDK default on iOS uses the full ARKit feed " +
+                 "(~1920x1440). HD (1280x720) roughly halves that allocation with negligible localization-accuracy " +
+                 "loss. Turn OFF to restore the SDK default resolution (production / debugging).")]
+        [SerializeField] private bool lowerLocalizationResolution = true;
+#endif
+
         /// <summary>
         /// Set by the controller during recording/playback so an auto re-align never jumps the anchor
         /// mid-clip. Manual re-align still works (it overrides this).
@@ -159,7 +190,7 @@ namespace BodyTracking.Spatial
 
         void Update()
         {
-            UpdateLocalizationState();
+            TickLocalization();
             RaiseLocalizationChangedIfNeeded();
         }
 
@@ -184,25 +215,47 @@ namespace BodyTracking.Spatial
 
         private XRSpace cachedXrSpace;
 
+        // IsAvailable is polled every frame by RouteRootManager. The underlying scene scan only changes
+        // when maps are registered/loaded/switched, so we cache the result and re-evaluate at most ~1 Hz.
+        private bool cachedAvailable;
+        private float nextAvailabilityCheck = float.NegativeInfinity;
+        private const float AvailabilityRecheckInterval = 1f;
+
+        // Immersal localization updates arrive far slower than the render loop, so we evaluate the (relatively
+        // heavy) tracking-quality / success-count / pose-agreement / anchor logic at ~10 Hz instead of every
+        // frame. An in-progress anchor correction blend is still stepped every frame so it stays smooth.
+        private float nextLocalizationEval = float.NegativeInfinity;
+        private const float LocalizationEvalInterval = 0.1f;
+
         public bool IsAvailable
         {
             get
             {
-                var sdk = ImmersalSDK.Instance;
-                if (sdk == null || GetXrSpace() == null)
-                    return false;
-
-                // Require at least one configured XR map with a valid map id. Note: ServerLocalization does
-                // NOT need a local mapFile (it matches against the cloud map by id), so we must not require
-                // mapFile here or cloud-based setups would never be considered available.
-                foreach (var map in UnityEngine.Object.FindObjectsByType<XRMap>(FindObjectsSortMode.None))
+                if (Time.unscaledTime >= nextAvailabilityCheck)
                 {
-                    if (map != null && map.IsConfigured && map.mapId > 0)
-                        return true;
+                    nextAvailabilityCheck = Time.unscaledTime + AvailabilityRecheckInterval;
+                    cachedAvailable = ComputeIsAvailable();
                 }
-
-                return false;
+                return cachedAvailable;
             }
+        }
+
+        private bool ComputeIsAvailable()
+        {
+            var sdk = ImmersalSDK.Instance;
+            if (sdk == null || GetXrSpace() == null)
+                return false;
+
+            // Require at least one configured XR map with a valid map id. Note: ServerLocalization does
+            // NOT need a local mapFile (it matches against the cloud map by id), so we must not require
+            // mapFile here or cloud-based setups would never be considered available.
+            foreach (var map in UnityEngine.Object.FindObjectsByType<XRMap>(FindObjectsSortMode.None))
+            {
+                if (map != null && map.IsConfigured && map.mapId > 0)
+                    return true;
+            }
+
+            return false;
         }
 
         // Hybrid anchor runtime state.
@@ -219,6 +272,13 @@ namespace BodyTracking.Spatial
         private int lastSuccessCount = -1;                       // last seen LocalizationSuccessCount
         private readonly List<Pose> recentFixes = new List<Pose>(); // poses sampled at each new success
 
+        // Localization power gating. localizationActive mirrors our belief of the Immersal session's running
+        // state; resumeLocalizationUntil > 0 keeps it running for a manual-realign window. ApplyDesired
+        // LocalizationState() reconciles the two every frame and only calls Pause/Resume on a real transition.
+        private bool localizationActive = true;
+        private float resumeLocalizationUntil;
+        private bool sessionTuningApplied;
+
         /// <summary>
         /// Localized once the Immersal tracking quality has held at/above <see cref="minTrackingQuality"/>
         /// for <see cref="requiredStableFrames"/> consecutive frames (so we don't anchor on the first, least
@@ -234,7 +294,13 @@ namespace BodyTracking.Spatial
         /// Request a manual re-align: on the next update the anchor is moved to the latest Immersal fix
         /// (blended), ignoring the auto-correction size bands. Use after walking to a new wall/area.
         /// </summary>
-        public void RequestRealign() => manualRealignRequested = true;
+        public void RequestRealign()
+        {
+            manualRealignRequested = true;
+            // Reopen localization briefly so a fresh fix can land; TickLocalization re-pauses after the window.
+            if (anchorFrozen)
+                resumeLocalizationUntil = Time.unscaledTime + Mathf.Max(0.5f, realignLocalizationWindowSeconds);
+        }
 
         /// <summary>Unlock the anchor so the next confident localization re-establishes it from scratch.</summary>
         public void ClearFrozenAnchor()
@@ -245,6 +311,8 @@ namespace BodyTracking.Spatial
             hasAveragedPose = false;
             stableQualityFrames = 0;
             recentFixes.Clear();
+            // Re-establishing from scratch needs continuous localization again (handled by ApplyDesiredLocalizationState).
+            resumeLocalizationUntil = 0f;
             if (roomAnchor != null)
             {
                 if (arAnchorManager != null)
@@ -268,6 +336,113 @@ namespace BodyTracking.Spatial
             if (cachedXrSpace == null)
                 cachedXrSpace = UnityEngine.Object.FindAnyObjectByType<XRSpace>();
             return cachedXrSpace;
+        }
+
+        private void TickLocalization()
+        {
+            // Push our frequency overrides onto the session once it exists (one-time; no-op afterwards).
+            ApplySessionTuning();
+
+            // Reconcile the Immersal session running/paused state with what we currently need (cheap; only
+            // calls into the SDK on an actual transition). This is what stops continuous localization once locked.
+            ApplyDesiredLocalizationState();
+
+            // Keep an in-progress anchor correction blend smooth at full frame rate (cheap: a couple of lerps).
+            if (anchorFrozen && blending)
+                UpdateHybridAnchor();
+
+            if (Time.unscaledTime >= nextLocalizationEval)
+            {
+                nextLocalizationEval = Time.unscaledTime + LocalizationEvalInterval;
+                UpdateLocalizationState();
+            }
+        }
+
+        /// <summary>
+        /// We want localization running until the room anchor is frozen — then it's pure heat for no benefit
+        /// (FreezeOnly ignores new fixes). A manual re-align temporarily reopens the window.
+        /// </summary>
+        private bool WantLocalizationActive()
+        {
+            if (!anchorFrozen)
+                return true;
+            return resumeLocalizationUntil > 0f && Time.unscaledTime < resumeLocalizationUntil;
+        }
+
+        /// <summary>
+        /// Lower the continuous localization frequency (and soften the startup burst) on the live session. The SDK
+        /// default re-localizes every 2s forever, which is the dominant steady-state heat/FPS cost even after the
+        /// indicator reads "localized". Applied once the session is ready; the values persist across pause/resume.
+        /// </summary>
+        private void ApplySessionTuning()
+        {
+            if (sessionTuningApplied)
+                return;
+            if (!tuneLocalizationFrequency && !lowerLocalizationResolution)
+                return;
+
+            var sdk = ImmersalSDK.Instance;
+            var session = sdk != null ? sdk.Session : null;
+            if (session == null || !sdk.IsReady)
+                return; // retry next frame once the session exists
+
+            if (tuneLocalizationFrequency)
+            {
+                // The tuning knobs live on the concrete ImmersalSession (the IImmersalSession interface only exposes
+                // start/stop/localize methods), so cast to reach them.
+                if (session is ImmersalSession concreteSession)
+                {
+                    concreteSession.SessionUpdateInterval = Mathf.Max(0.5f, localizationIntervalSeconds);
+                    concreteSession.BurstSuccessCount = Mathf.Max(1, burstSuccessCount);
+                    concreteSession.BurstTimeLimit = Mathf.Max(1f, burstTimeLimitSeconds);
+                }
+            }
+
+            // The per-localization camera-image copy/convert (ARFoundationSupport.GetCameraData →
+            // ARFImageData.CopyBytes) is the dominant GC/heat source while scanning. Dropping iOS from the full
+            // ARKit feed (~1920x1440) to HD (1280x720) ~halves that allocation with negligible accuracy loss.
+            if (lowerLocalizationResolution)
+            {
+                var platform = UnityEngine.Object.FindAnyObjectByType<ARFoundationSupport>();
+                if (platform != null)
+                    platform.iOSResolution = ARFoundationSupport.CameraResolution.HD;
+            }
+
+            sessionTuningApplied = true;
+        }
+
+        /// <summary>
+        /// Pause/resume the Immersal session so continuous on-device localization only runs when it can change
+        /// the anchor. Idempotent: only transitions when our belief (localizationActive) differs from the need.
+        /// </summary>
+        private void ApplyDesiredLocalizationState()
+        {
+            if (!pauseLocalizationWhenFrozen)
+                return;
+
+            bool want = WantLocalizationActive();
+            if (want == localizationActive)
+                return;
+
+            var sdk = ImmersalSDK.Instance;
+            var session = sdk != null ? sdk.Session : null;
+            if (session == null || !sdk.IsReady)
+                return; // retry next frame once the session exists
+
+            if (want)
+                session.ResumeSession();
+            else
+                session.PauseSession();
+
+            localizationActive = want;
+        }
+
+        // The Immersal session resumes itself on app foreground (its own OnApplicationPause). Mirror that in
+        // our belief so the next ApplyDesiredLocalizationState() re-pauses when the anchor is already locked.
+        private void OnApplicationPause(bool paused)
+        {
+            if (!paused)
+                localizationActive = true;
         }
 
         private void UpdateLocalizationState()
@@ -368,6 +543,8 @@ namespace BodyTracking.Spatial
             EnsureRouteRoot();
             anchorFrozen = true;
             lastRealignTime = Time.time;
+            // Drop any open realign window so localization pauses on the next tick (idle heat/battery win).
+            resumeLocalizationUntil = 0f;
 
             // Detach from XR Space and hold the localized world pose immediately so recording can start now;
             // the ARAnchor (if enabled) is attached asynchronously and adopts this pose when it arrives.
@@ -597,6 +774,7 @@ namespace BodyTracking.Spatial
         public void RequestRealign() { }
         public void ClearFrozenAnchor() { }
 
+        private void TickLocalization() { }
         private void UpdateLocalizationState() { }
 
         private void EnsureRouteRoot()

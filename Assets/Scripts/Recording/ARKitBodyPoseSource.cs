@@ -76,8 +76,11 @@ namespace BodyTracking.Recording
 
             foreach (var humanBody in bodyManager.trackables)
             {
-                // Limited ARKit bodies can drift or lose joints, so recordings only accept stable tracking.
-                if (humanBody == null || humanBody.trackingState != TrackingState.Tracking)
+                // Accept any body ARKit is at least partially tracking (Tracking OR Limited). Limited poses can
+                // be jittery/partial, but dropping them entirely caused too many tracking drop-outs in real
+                // climbing conditions. Move AI + the fused player smooth/cancel the noise downstream anyway, so
+                // we'd rather keep tracking continuously than lose the body. Only fully untracked (None) is skipped.
+                if (humanBody == null || humanBody.trackingState == TrackingState.None)
                     continue;
 
                 var joints = humanBody.joints;

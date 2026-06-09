@@ -1,4 +1,5 @@
 using UnityEngine;
+using BodyTracking.Utils;
 
 #if IMMERSAL_SDK_PRESENT
 using Immersal;
@@ -8,9 +9,10 @@ using Immersal.XR;
 namespace BodyTracking.Spatial
 {
     /// <summary>
-    /// Drives Immersal sparse point-cloud dot colors during localization so scan progress is readable:
-    /// grey (not started) → greener with each successful map match → solid green when locked;
-    /// brief red flash on failed attempts; amber when matches exist but tracking quality is below threshold.
+    /// Drives Immersal localization feedback during scanning:
+    ///   • a single on-screen status sphere (grey → green with progress, red on fail, amber on low quality), and
+    ///   • optionally the sparse point-cloud dot tint (legacy).
+    /// The sphere is hidden once the room anchor is locked so the presentation view stays clean.
     /// </summary>
     [DisallowMultipleComponent]
     public class ImmersalScanVisualizationDriver : MonoBehaviour
@@ -29,6 +31,26 @@ namespace BodyTracking.Spatial
         [SerializeField] private ImmersalRouteRootProvider routeRootProvider;
         [SerializeField] private ImmersalMapSwitcher mapSwitcher;
 
+        [Header("Scan visualization")]
+        [Tooltip("Master switch for scan feedback. Off = no sphere and no point-cloud tint.")]
+        [SerializeField] private bool showScanVisualization = true;
+        [Tooltip("Show the on-screen status sphere while scanning (hidden automatically once the anchor locks). " +
+                 "Off by default — the point-cloud dots are the primary feedback.")]
+        [SerializeField] private bool useStatusSphere = false;
+        [Tooltip("Tint the Immersal point-cloud dots with the scan-progress color (the original visualizer look). " +
+                 "On by default.")]
+        [SerializeField] private bool tintPointCloud = true;
+        [Tooltip("Show the Immersal point-cloud dots spread across the room while scanning/localizing, then hide " +
+                 "them once the room anchor locks. The dots' renderMode defaults to EditorOnly (invisible on " +
+                 "device), so this also forces runtime rendering while scanning.")]
+        [SerializeField] private bool showPointCloudWhileScanning = true;
+
+        [Header("Status sphere placement (camera-relative)")]
+        [Tooltip("Local position of the sphere relative to the AR camera (z is metres in front of the lens).")]
+        [SerializeField] private Vector3 sphereLocalPosition = new Vector3(0f, -0.34f, 1.0f);
+        [Tooltip("Sphere diameter (Unity units) at the configured distance.")]
+        [SerializeField] private float sphereScale = 0.06f;
+
         static readonly Color Grey = new Color(0.55f, 0.57f, 0.60f, 1f);
         static readonly Color LockedGreen = new Color(0.19f, 0.82f, 0.35f, 1f);
         static readonly Color FailRed = new Color(1.00f, 0.27f, 0.23f, 1f);
@@ -41,6 +63,21 @@ namespace BodyTracking.Spatial
         float failFlashUntil;
         float successPulseUntil;
 
+        GameObject statusSphere;
+        Renderer statusSphereRenderer;
+        MaterialPropertyBlock statusSphereProps;
+        Color lastSphereColor = new Color(-1f, -1f, -1f, -1f);
+        static readonly int BaseColorId = Shader.PropertyToID("_BaseColor");
+        static readonly int ColorId = Shader.PropertyToID("_Color");
+
+        XRMapVisualization[] cachedVisualizations = System.Array.Empty<XRMapVisualization>();
+        Color lastAppliedColor = new Color(-1f, -1f, -1f, -1f);
+
+        // Tracks the point-cloud visibility we last drove so we only flip the shared static on state changes
+        // (scanning ↔ locked) and don't fight the debug-visuals toggle once scanning is complete.
+        bool pointCloudShown;
+        bool pointCloudStateKnown;
+
         void Awake()
         {
             if (routeRootProvider == null)
@@ -51,6 +88,7 @@ namespace BodyTracking.Spatial
 
         void OnEnable()
         {
+            RefreshVisualizationCache();
             ResetScanState();
             MapManager.MapRegisteredAndLoaded?.AddListener(OnMapLoaded);
             if (mapSwitcher != null)
@@ -66,24 +104,119 @@ namespace BodyTracking.Spatial
                 mapSwitcher.OnMapSwitched -= OnMapLoadedInt;
             if (routeRootProvider != null)
                 routeRootProvider.OnLocalizationChanged -= OnLocalizationChanged;
+            HideStatusSphere();
+
+            // Don't leave the room covered in dots if this driver is disabled mid-scan.
+            if (showPointCloudWhileScanning && pointCloudShown)
+                ApplyPointCloudVisible(false);
         }
 
         void Update()
         {
+            // Point-cloud visibility is independent of the sphere/tint feedback, so drive it even when the rest
+            // of the scan visualization is disabled.
+            UpdatePointCloudVisibility();
+
+            if (!showScanVisualization)
+            {
+                HideStatusSphere();
+                return;
+            }
+
             UpdateTrackingDeltas();
             Color target = ComputeTargetColor();
             displayedColor = Color.Lerp(displayedColor, target, Time.deltaTime * colorBlendSpeed);
-            ApplyToVisualizations(displayedColor);
+
+            // Keep tinting the point-cloud dots even after lock (original behaviour: they settle on green and
+            // stay visible). Only the optional on-screen status sphere hides once scanning is complete.
+            if (tintPointCloud)
+                ApplyToVisualizations(displayedColor);
+
+            if (useStatusSphere && !IsScanningComplete())
+                UpdateStatusSphere(displayedColor);
+            else
+                HideStatusSphere();
         }
 
         void OnLocalizationChanged(bool _)
         {
+            if (IsScanningComplete())
+            {
+                HideStatusSphere();
+                return;
+            }
+
             if (routeRootProvider != null && routeRootProvider.IsAnchorFrozen)
                 displayedColor = LockedGreen;
         }
 
-        void OnMapLoaded(int _) => ResetScanState();
-        void OnMapLoadedInt(int _) => ResetScanState();
+        void OnMapLoaded(int _)
+        {
+            RefreshVisualizationCache();
+            ResetScanState();
+        }
+
+        void OnMapLoadedInt(int _)
+        {
+            RefreshVisualizationCache();
+            ResetScanState();
+        }
+
+        void RefreshVisualizationCache()
+        {
+            cachedVisualizations = FindObjectsByType<XRMapVisualization>(FindObjectsInactive.Include, FindObjectsSortMode.None);
+            lastAppliedColor = new Color(-1f, -1f, -1f, -1f);
+
+            // A freshly loaded map's visualization defaults to EditorOnly (invisible on device); re-assert the
+            // current scan-state visibility so newly registered dots render immediately while still scanning.
+            pointCloudStateKnown = false;
+            UpdatePointCloudVisibility();
+        }
+
+        /// <summary>
+        /// Show the point-cloud dots while scanning/localizing and hide them once the room anchor is locked.
+        /// Only flips the shared <see cref="XRMapVisualization.pointCloudVisible"/> on scanning↔locked changes so
+        /// it doesn't fight the debug-visuals toggle after lock.
+        /// </summary>
+        void UpdatePointCloudVisibility()
+        {
+            if (!showPointCloudWhileScanning)
+                return;
+
+            bool show = !IsScanningComplete();
+
+            if (show)
+            {
+                // Keep asserting while scanning so it wins over the clean-view default that hides the dots.
+                ApplyPointCloudVisible(true);
+            }
+            else if (!pointCloudStateKnown || pointCloudShown)
+            {
+                // On the transition to locked, hide the dots once and then leave the static alone.
+                ApplyPointCloudVisible(false);
+            }
+
+            pointCloudStateKnown = true;
+        }
+
+        void ApplyPointCloudVisible(bool show)
+        {
+            XRMapVisualization.pointCloudVisible = show;
+
+            if (show && cachedVisualizations != null)
+            {
+                foreach (var vis in cachedVisualizations)
+                {
+                    if (vis == null) continue;
+                    // Default renderMode (EditorOnly) never renders on device; allow runtime rendering so the
+                    // scanning dots actually appear (and remain available for the debug-visuals toggle later).
+                    if (vis.renderMode != XRMapVisualization.RenderMode.EditorAndRuntime)
+                        vis.renderMode = XRMapVisualization.RenderMode.EditorAndRuntime;
+                }
+            }
+
+            pointCloudShown = show;
+        }
 
         void ResetScanState()
         {
@@ -92,7 +225,21 @@ namespace BodyTracking.Spatial
             failFlashUntil = 0f;
             successPulseUntil = 0f;
             displayedColor = Grey;
-            ApplyToVisualizations(Grey);
+            lastSphereColor = new Color(-1f, -1f, -1f, -1f);
+            if (tintPointCloud)
+                ApplyToVisualizations(Grey);
+        }
+
+        /// <summary>Scanning is finished once the room anchor is locked for this session.</summary>
+        bool IsScanningComplete()
+        {
+            return routeRootProvider != null && routeRootProvider.IsAnchorFrozen;
+        }
+
+        void HideStatusSphere()
+        {
+            if (statusSphere != null && statusSphere.activeSelf)
+                statusSphere.SetActive(false);
         }
 
         void UpdateTrackingDeltas()
@@ -171,13 +318,91 @@ namespace BodyTracking.Spatial
             return sdk != null ? sdk.TrackingStatus : null;
         }
 
-        static void ApplyToVisualizations(Color color)
+        void ApplyToVisualizations(Color color)
         {
-            foreach (var vis in FindObjectsByType<XRMapVisualization>(FindObjectsInactive.Include, FindObjectsSortMode.None))
+            if (ColorsApproximatelyEqual(color, lastAppliedColor))
+                return;
+
+            if (cachedVisualizations == null || cachedVisualizations.Length == 0)
+                return;
+
+            foreach (var vis in cachedVisualizations)
             {
                 if (vis == null) continue;
                 vis.pointColor = color;
             }
+
+            lastAppliedColor = color;
+        }
+
+        static bool ColorsApproximatelyEqual(Color a, Color b)
+        {
+            const float eps = 0.004f;
+            return Mathf.Abs(a.r - b.r) < eps
+                && Mathf.Abs(a.g - b.g) < eps
+                && Mathf.Abs(a.b - b.b) < eps
+                && Mathf.Abs(a.a - b.a) < eps;
+        }
+
+        void UpdateStatusSphere(Color color)
+        {
+            if (!useStatusSphere)
+            {
+                HideStatusSphere();
+                return;
+            }
+
+            if (statusSphere == null && !EnsureStatusSphere())
+                return;
+
+            if (!statusSphere.activeSelf)
+                statusSphere.SetActive(true);
+
+            if (ColorsApproximatelyEqual(color, lastSphereColor))
+                return;
+
+            statusSphereRenderer.GetPropertyBlock(statusSphereProps);
+            statusSphereProps.SetColor(BaseColorId, color);
+            statusSphereProps.SetColor(ColorId, color);
+            statusSphereRenderer.SetPropertyBlock(statusSphereProps);
+            lastSphereColor = color;
+        }
+
+        bool EnsureStatusSphere()
+        {
+            Camera cam = ResolveCamera();
+            if (cam == null)
+                return false;
+
+            statusSphere = GameObject.CreatePrimitive(PrimitiveType.Sphere);
+            statusSphere.name = "ImmersalStatusSphere";
+
+            var collider = statusSphere.GetComponent<Collider>();
+            if (collider != null)
+                Destroy(collider);
+
+            var t = statusSphere.transform;
+            t.SetParent(cam.transform, false);
+            t.localPosition = sphereLocalPosition;
+            t.localRotation = Quaternion.identity;
+            t.localScale = Vector3.one * sphereScale;
+
+            statusSphereRenderer = statusSphere.GetComponent<Renderer>();
+            statusSphereRenderer.shadowCastingMode = UnityEngine.Rendering.ShadowCastingMode.Off;
+            statusSphereRenderer.receiveShadows = false;
+            statusSphereRenderer.sharedMaterial = DebugVisualizationMaterials.CreateSolidColorMaterial(Grey);
+
+            statusSphereProps = new MaterialPropertyBlock();
+            lastSphereColor = new Color(-1f, -1f, -1f, -1f);
+            return true;
+        }
+
+        static Camera ResolveCamera()
+        {
+            Camera cam = Camera.main;
+            if (cam == null)
+                cam = FindAnyObjectByType<Camera>();
+            return cam;
         }
 #endif
     }

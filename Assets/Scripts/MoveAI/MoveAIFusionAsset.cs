@@ -1,6 +1,7 @@
 using System.Collections.Generic;
 using System.IO;
 using UnityEngine;
+using BodyTracking.Diagnostics;
 
 namespace BodyTracking.MoveAI
 {
@@ -12,6 +13,15 @@ namespace BodyTracking.MoveAI
     /// </summary>
     public class MoveAIFusionAsset
     {
+        struct CachedAsset
+        {
+            public long Length;
+            public long WriteTicks;
+            public MoveAIFusionAsset Asset;
+        }
+
+        private static readonly Dictionary<string, CachedAsset> cache = new Dictionary<string, CachedAsset>();
+
         public MoveMotion pose;                                   // joint rotations over time
         public List<Vector3> rootPathLocal = new List<Vector3>(); // RouteRoot-local, one per pose frame
         public float frameRate = 30f;
@@ -81,6 +91,7 @@ namespace BodyTracking.MoveAI
             {
                 Directory.CreateDirectory(Path.GetDirectoryName(filePath));
                 File.WriteAllText(filePath, ToJson());
+                cache.Remove(filePath);
                 return true;
             }
             catch (System.Exception e)
@@ -92,10 +103,31 @@ namespace BodyTracking.MoveAI
 
         public static MoveAIFusionAsset Load(string filePath)
         {
+            using var _ = PerfSampler.Scope("FusionAsset.Load");
             try
             {
                 if (!File.Exists(filePath)) return null;
-                return FromJson(File.ReadAllText(filePath));
+                var info = new FileInfo(filePath);
+                if (cache.TryGetValue(filePath, out var cached) &&
+                    cached.Length == info.Length &&
+                    cached.WriteTicks == info.LastWriteTimeUtc.Ticks &&
+                    cached.Asset != null)
+                {
+                    return cached.Asset;
+                }
+
+                using var parse = PerfSampler.Scope("FusionAsset.ParseJson");
+                var asset = FromJson(File.ReadAllText(filePath));
+                if (asset != null)
+                {
+                    cache[filePath] = new CachedAsset
+                    {
+                        Length = info.Length,
+                        WriteTicks = info.LastWriteTimeUtc.Ticks,
+                        Asset = asset
+                    };
+                }
+                return asset;
             }
             catch (System.Exception e)
             {

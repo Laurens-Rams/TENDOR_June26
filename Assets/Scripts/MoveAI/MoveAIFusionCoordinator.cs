@@ -1,11 +1,13 @@
 using System;
 using System.Collections;
+using System.Collections.Generic;
 using System.IO;
 using UnityEngine;
 using BodyTracking.Data;
 using BodyTracking.Playback;
 using BodyTracking.Spatial;
 using BodyTracking.Storage;
+using BodyTracking.Diagnostics;
 
 namespace BodyTracking.MoveAI
 {
@@ -100,10 +102,34 @@ namespace BodyTracking.MoveAI
             };
         }
 
+        // --- Upload queue (disk-backed, serial) ---------------------------------------------------
+        // The queue is the single source of truth for pending fusion jobs. It is persisted on every state
+        // change (and on app pause) so a submitted climb keeps uploading across app sleep and resumes after a
+        // relaunch — and so the user can immediately record + submit another climb without the two jobs
+        // interfering: jobs are processed one at a time (only one mp4 in memory at once), each keyed to its own
+        // recording + video + Move job id.
+        private MoveQueueData queue;
+        private bool processing;
+        private readonly Dictionary<int, string> attachedGlbPathByTarget = new Dictionary<int, string>();
+        private readonly HashSet<string> glbAttachInFlight = new HashSet<string>();
+
+        void EnsureQueueLoaded()
+        {
+            if (queue == null)
+                queue = MoveJobQueueStore.Load();
+        }
+
+        void SaveQueue()
+        {
+            if (queue != null)
+                MoveJobQueueStore.Save(queue);
+        }
+
         /// <summary>
-        /// Kick off the Move AI fusion job for a freshly saved recording. <paramref name="videoFilePath"/> is the
-        /// mp4 captured alongside the recording; if null/missing, fusion is skipped (the recording still replays
-        /// via the existing skeleton player).
+        /// Enqueue the Move AI fusion job for a freshly saved recording and start (or continue) serial
+        /// processing. <paramref name="videoFilePath"/> is the mp4 captured alongside the recording; if
+        /// null/missing, fusion is skipped (the recording still replays via the existing skeleton player).
+        /// Returns immediately — the upload runs in the background so a new recording can begin right away.
         /// </summary>
         public void SubmitForFusion(HipRecording recording, string recordingFileName, string videoFilePath)
         {
@@ -117,107 +143,353 @@ namespace BodyTracking.MoveAI
                 SetStatus("Fusion skipped: Move API not configured");
                 return;
             }
-
-            if (!EnsureFusionHostActive())
-            {
-                SetStatus("Fusion skipped: MoveAIFusion inactive");
-                return;
-            }
             if (string.IsNullOrEmpty(videoFilePath) || !File.Exists(VideoRecorder.NormalizeLocalPath(videoFilePath)))
             {
                 SetStatus("Fusion skipped: no paired video file");
                 return;
             }
 
+            EnsureQueueLoaded();
             videoFilePath = VideoRecorder.NormalizeLocalPath(videoFilePath);
-            // Read the mp4 off the main thread — a multi-second/large file would otherwise freeze the UI right
-            // after the user taps stop. Submission continues on the main thread once the bytes are ready.
-            StartCoroutine(ReadFileThenSubmit(recording, recordingFileName, videoFilePath));
-        }
 
-        IEnumerator ReadFileThenSubmit(HipRecording recording, string recordingFileName, string videoFilePath)
-        {
-            SetStatus("Reading video…");
-
-            byte[] videoBytes = null;
-            string error = null;
-            bool done = false;
-
-            var thread = new System.Threading.Thread(() =>
-            {
-                try { videoBytes = File.ReadAllBytes(videoFilePath); }
-                catch (Exception e) { error = e.Message; }
-                finally { done = true; }
-            }) { IsBackground = true };
-            thread.Start();
-
-            while (!done)
-                yield return null;
-
-            if (error != null || videoBytes == null || videoBytes.Length == 0)
-            {
-                SetStatus($"Fusion skipped: video read failed ({error ?? "empty file"})");
-                yield break;
-            }
-
-            // Surface the uploaded file size + the processing window. If the mp4 is truncated (read before AVPro
-            // finished writing) Move fails ingest with a generic "unable to synchronize" error — this log lets us
-            // confirm the file is complete and that the clip window is sane.
+            // The recording is already trimmed to the in-frame body window; process only that span so the Move
+            // motion matches the saved ARKit recording length.
             float clipEnd = recording.duration > 0f
                 ? recording.videoStartTimeOffset + recording.duration
                 : 0f;
-            Debug.Log($"[MoveAIFusionCoordinator] Uploading video: {videoBytes.Length / 1024}KB, " +
-                      $"recording duration {recording.duration:F2}s, clipWindow end {clipEnd:F2}s");
 
-            SetStatus("Submitting climb to Move AI...");
-            // The recording has already been trimmed to the in-frame body window; process only that span so the
-            // Move motion matches the saved ARKit recording length.
-            moveApiClient.SubmitVideo(videoBytes,
-                onComplete: result => OnMoveJobComplete(recording, recordingFileName, result),
-                onProgress: p => SetStatus($"Move AI: {p.message} ({p.percent:F0}%)"),
-                clipEndSeconds: clipEnd);
+            // De-dupe: if this recording is already queued (and not terminal), refresh its inputs instead of
+            // adding a second job for the same recording.
+            var entry = queue.entries.Find(e => e.recordingFileName == recordingFileName && !e.IsTerminal);
+            if (entry == null)
+            {
+                entry = new MoveQueueEntry { recordingFileName = recordingFileName };
+                queue.entries.Add(entry);
+            }
+            entry.videoFilePath = videoFilePath;
+            entry.clipEndSeconds = clipEnd;
+            entry.jobId = null;
+            entry.attempts = 0;
+            entry.error = null;
+            entry.State = MoveQueueState.Queued;
+            SaveQueue();
+
+            int pending = CountPending();
+            SetStatus(pending > 1 ? $"Move AI: queued ({pending} pending)" : "Move AI: queued");
+
+            KickProcessor();
         }
 
-        void OnMoveJobComplete(HipRecording recording, string recordingFileName, MoveJobResult result)
+        int CountPending()
         {
-            recording.moveJobId = result.jobId;
-            recording.moveJobState = result.success ? "FINISHED" : "FAILED";
+            if (queue == null) return 0;
+            int n = 0;
+            foreach (var e in queue.entries)
+                if (!e.IsTerminal) n++;
+            return n;
+        }
+
+        int CountActionable()
+        {
+            if (queue == null) return 0;
+            int n = 0;
+            foreach (var e in queue.entries)
+            {
+                if (e.IsTerminal) continue;
+                if (HasFusionAsset(e.recordingFileName)) continue;
+                if (e.attempts >= MoveJobQueueStore.MaxRetryAttempts) continue;
+                n++;
+            }
+            return n;
+        }
+
+        int CountFailed()
+        {
+            if (queue == null) return 0;
+            int n = 0;
+            foreach (var e in queue.entries)
+                if (e.State == MoveQueueState.Failed) n++;
+            return n;
+        }
+
+        /// <summary>Start the serial processor if it isn't already running and there is work to do.</summary>
+        void KickProcessor()
+        {
+            if (processing)
+                return;
+            EnsureQueueLoaded();
+            if (CountActionable() == 0)
+                return;
+            if (!EnsureFusionHostActive())
+            {
+                SetStatus("Fusion paused: enable MoveAIFusion to upload");
+                return;
+            }
+            StartCoroutine(ProcessQueue());
+        }
+
+        MoveQueueEntry NextActionable(HashSet<MoveQueueEntry> attempted)
+        {
+            if (queue == null) return null;
+            foreach (var e in queue.entries)
+            {
+                if (e.IsTerminal) continue;
+                if (attempted.Contains(e)) continue;
+                if (e.attempts >= MoveJobQueueStore.MaxRetryAttempts)
+                {
+                    e.State = MoveQueueState.Failed;
+                    if (string.IsNullOrEmpty(e.error)) e.error = "Retry limit reached";
+                    continue;
+                }
+                // Already fused (e.g. baked by another path or a previous run) — close it out.
+                if (HasFusionAsset(e.recordingFileName))
+                {
+                    e.State = MoveQueueState.Done;
+                    continue;
+                }
+                return e;
+            }
+            return null;
+        }
+
+        /// <summary>
+        /// Serial job pump. Each entry is attempted at most once per pass (tracked in <c>attempted</c>) so a
+        /// retryable failure never busy-loops; retryable jobs are retried on the next kick (new submit / app
+        /// resume / relaunch). Only one video is held in memory at a time.
+        /// </summary>
+        IEnumerator ProcessQueue()
+        {
+            processing = true;
+            var attempted = new HashSet<MoveQueueEntry>();
+
+            MoveQueueEntry entry;
+            while ((entry = NextActionable(attempted)) != null)
+            {
+                attempted.Add(entry);
+                entry.attempts++;
+                SaveQueue();
+
+                bool done = false;
+                MoveJobResult result = null;
+                Action<MoveJobResult> onComplete = r => { result = r; done = true; };
+                Action<MoveJobProgress> onProgress = p => SetStatus(FormatProgress(p));
+
+                if (entry.NeedsUpload)
+                {
+                    string videoPath = VideoRecorder.NormalizeLocalPath(entry.videoFilePath);
+                    if (string.IsNullOrEmpty(videoPath) || !File.Exists(videoPath))
+                    {
+                        FailEntry(entry, "paired video file missing");
+                        continue;
+                    }
+
+                    entry.State = MoveQueueState.Uploading;
+                    SaveQueue();
+                    SetStatus(FormatStatus("reading video…"));
+
+                    // Read the mp4 off the main thread — a large file would otherwise freeze the UI.
+                    byte[] videoBytes = null;
+                    string readError = null;
+                    bool readDone = false;
+                    var thread = new System.Threading.Thread(() =>
+                    {
+                        try { videoBytes = File.ReadAllBytes(videoPath); }
+                        catch (Exception ex) { readError = ex.Message; }
+                        finally { readDone = true; }
+                    }) { IsBackground = true };
+                    thread.Start();
+                    while (!readDone)
+                        yield return null;
+
+                    if (readError != null || videoBytes == null || videoBytes.Length == 0)
+                    {
+                        FailEntry(entry, $"video read failed ({readError ?? "empty file"})");
+                        continue;
+                    }
+
+                    Debug.Log($"[MoveAIFusionCoordinator] Uploading '{entry.recordingFileName}': " +
+                              $"{videoBytes.Length / 1024}KB, clipWindow end {entry.clipEndSeconds:F2}s");
+                    SetStatus(FormatStatus("uploading…"));
+
+                    moveApiClient.SubmitVideo(videoBytes,
+                        onComplete: onComplete,
+                        onProgress: onProgress,
+                        clipEndSeconds: entry.clipEndSeconds,
+                        onJobCreated: jobId =>
+                        {
+                            // Persist the job id the moment it exists so a sleep/kill resumes via re-poll
+                            // instead of re-uploading the whole video.
+                            entry.jobId = jobId;
+                            entry.State = MoveQueueState.Processing;
+                            PersistJobStateToRecording(entry.recordingFileName, jobId, "RUNNING");
+                            SaveQueue();
+                        });
+                }
+                else
+                {
+                    // Resume: the job already exists server-side; just re-poll + download (+ GLB).
+                    entry.State = MoveQueueState.Processing;
+                    SaveQueue();
+                    SetStatus(FormatStatus("resuming…"));
+                    moveApiClient.RedownloadMotionData(entry.jobId,
+                        onComplete: onComplete,
+                        onProgress: onProgress);
+                }
+
+                while (!done)
+                    yield return null;
+
+                HandleJobResult(entry, result);
+                SaveQueue();
+            }
+
+            PruneDone();
+            SaveQueue();
+            processing = false;
+
+            if (CountPending() == 0)
+            {
+                int failed = CountFailed();
+                SetStatus(failed > 0 ? $"Move AI: {failed} job(s) failed" : "Move AI: all jobs complete");
+            }
+        }
+
+        void HandleJobResult(MoveQueueEntry entry, MoveJobResult result)
+        {
+            if (result == null)
+            {
+                entry.error = "no result";
+                if (entry.attempts >= MoveJobQueueStore.MaxRetryAttempts)
+                    FailEntry(entry, "no result (retry limit)");
+                return;
+            }
 
             if (!result.success)
             {
-                SetStatus($"Move AI failed: {result.error}");
+                bool serverFailed = !string.IsNullOrEmpty(result.error) &&
+                                    result.error.IndexOf("FAILED", StringComparison.OrdinalIgnoreCase) >= 0;
+                if (serverFailed)
+                {
+                    // Move rejected the job — terminal, re-polling won't help.
+                    FailEntry(entry, result.error);
+                    PersistJobStateToRecording(entry.recordingFileName, entry.jobId, "FAILED");
+                }
+                else if (!string.IsNullOrEmpty(entry.jobId))
+                {
+                    // Timeout / network / download glitch but the job exists server-side — keep it resumable.
+                    entry.State = MoveQueueState.Processing;
+                    entry.error = result.error;
+                    SetStatus(FormatStatus($"will retry ({result.error})"));
+                }
+                else
+                {
+                    // Upload never produced a job id; leave queued to retry (capped by attempts).
+                    entry.State = MoveQueueState.Queued;
+                    entry.error = result.error;
+                    SetStatus(FormatStatus($"upload retry ({result.error})"));
+                }
                 return;
             }
 
-            // Save the raw Move AI GLB (if returned) to the device so it can be pulled off and previewed
-            // in any 3D/GLB viewer before fusion.
-            SaveGlbToDevice(recordingFileName, result.glbBytes);
+            if (!string.IsNullOrEmpty(result.jobId))
+                entry.jobId = result.jobId;
 
-            SetStatus("Parsing motion data...");
+            BakeFromResult(entry, result);
+        }
+
+        /// <summary>
+        /// Parse + fuse a finished Move result into the recording it belongs to. The recording is loaded fresh
+        /// from disk by file name (never a stale in-memory reference) so the Move motion always fuses with the
+        /// correct ARKit recording, even with several jobs in flight or on a post-relaunch resume.
+        /// </summary>
+        void BakeFromResult(MoveQueueEntry entry, MoveJobResult result)
+        {
+            entry.State = MoveQueueState.Baking;
+            SaveQueue();
+
+            var recording = RecordingStorage.LoadRecording(entry.recordingFileName);
+            if (recording == null)
+            {
+                FailEntry(entry, "recording JSON missing for bake");
+                return;
+            }
+
+            // Save the raw Move AI GLB (if returned) so it can be pulled off and previewed before fusion.
+            SaveGlbToDevice(entry.recordingFileName, result.glbBytes);
+
+            SetStatus(FormatStatus("parsing motion…"));
             var motion = MoveMotionParser.ParseMotionDataZip(result.motionDataZip, jointMap);
             if (motion == null || motion.FrameCount == 0)
             {
-                SetStatus("Move AI returned no usable motion");
+                FailEntry(entry, "Move returned no usable motion");
                 return;
             }
 
-            SetStatus("Baking fusion...");
+            SetStatus(FormatStatus("baking fusion…"));
             var asset = MoveAIFusionBaker.Bake(recording, motion, jointMap, ResolveBakeSettings());
             if (asset == null)
             {
-                SetStatus("Fusion bake failed");
+                FailEntry(entry, "fusion bake failed");
                 return;
             }
 
-            if (asset.Save(FusionPath(recordingFileName)))
+            if (!asset.Save(FusionPath(entry.recordingFileName)))
             {
-                SetStatus($"Fused replay ready for '{recordingFileName}'");
-                OnFusionReady?.Invoke(recordingFileName);
+                FailEntry(entry, "fusion save failed");
+                return;
             }
-            else
+
+            entry.State = MoveQueueState.Done;
+            entry.error = null;
+            PersistJobStateToRecording(entry.recordingFileName, entry.jobId, "FINISHED");
+            SaveQueue();
+            SetStatus($"Fused replay ready · {entry.recordingFileName}");
+            OnFusionReady?.Invoke(entry.recordingFileName);
+        }
+
+        void FailEntry(MoveQueueEntry entry, string error)
+        {
+            entry.State = MoveQueueState.Failed;
+            entry.error = error;
+            Debug.LogWarning($"[MoveAIFusionCoordinator] Job failed for '{entry.recordingFileName}': {error}");
+            SetStatus($"Move AI failed ({entry.recordingFileName}): {error}");
+            SaveQueue();
+        }
+
+        void PruneDone()
+        {
+            if (queue == null) return;
+            queue.entries.RemoveAll(e => e.State == MoveQueueState.Done);
+        }
+
+        /// <summary>Mirror the job id/state onto the recording JSON so legacy resume + recording menus stay in sync.</summary>
+        void PersistJobStateToRecording(string recordingFileName, string jobId, string state)
+        {
+            try
             {
-                SetStatus("Fusion save failed");
+                var recording = RecordingStorage.LoadRecording(recordingFileName);
+                if (recording == null) return;
+                recording.moveJobId = jobId;
+                recording.moveJobState = state;
+                RecordingStorage.SaveRecording(recording, recordingFileName);
             }
+            catch (Exception e)
+            {
+                Debug.LogWarning($"[MoveAIFusionCoordinator] Could not persist job state to '{recordingFileName}': {e.Message}");
+            }
+        }
+
+        string FormatStatus(string phase)
+        {
+            int pending = CountPending();
+            return pending > 1 ? $"Move AI ({pending} pending): {phase}" : $"Move AI: {phase}";
+        }
+
+        string FormatProgress(MoveJobProgress p)
+        {
+            int pending = CountPending();
+            string prefix = pending > 1 ? $"Move AI ({pending} pending)" : "Move AI";
+            return $"{prefix}: {p.message} ({p.percent:F0}%)";
         }
 
         static string GlbDir => Path.Combine(Application.persistentDataPath, "MoveAIGLB");
@@ -264,56 +536,83 @@ namespace BodyTracking.MoveAI
         }
 
         /// <summary>
-        /// On startup, reconnect to any Move AI fusion jobs that were still processing (or finished server-side
-        /// but never downloaded) when the app was last closed. For each saved recording that has a Move job id
-        /// but no fused asset yet, re-poll Move and — when the motion is ready — parse + bake + save it exactly
-        /// like a fresh job. Safe to call when Move is unconfigured or there is nothing to resume.
+        /// On startup, rebuild the upload queue from disk and resume any unfinished Move AI fusion jobs that were
+        /// still uploading/processing when the app was last backgrounded or closed. Jobs with a server job id
+        /// re-poll + download; jobs that never finished uploading re-upload from their saved video path. Also
+        /// migrates legacy recordings that stored a moveJobId on the recording JSON but predate the queue. Safe
+        /// to call when Move is unconfigured or there is nothing to resume.
         /// </summary>
         public void ResumeInterruptedJobs()
         {
             if (moveApiClient == null || !moveApiClient.HasApiKey)
                 return;
 
-            var recordings = RecordingStorage.GetAvailableRecordings();
-            if (recordings == null || recordings.Count == 0)
-                return;
+            EnsureQueueLoaded();
 
-            int resumed = 0;
+            // Close out jobs that are already fused (asset on disk).
+            foreach (var e in queue.entries)
+            {
+                if (HasFusionAsset(e.recordingFileName))
+                    e.State = MoveQueueState.Done;
+            }
+            PruneDone();
+
+            // Migrate legacy recordings (job id stored on the recording, no queue entry, not yet fused).
+            MigrateLegacyJobs();
+            SaveQueue();
+
+            int actionable = CountActionable();
+            if (actionable > 0)
+            {
+                SetStatus($"Resuming {actionable} Move AI job(s)…");
+                KickProcessor();
+            }
+        }
+
+        void MigrateLegacyJobs()
+        {
+            var recordings = RecordingStorage.GetAvailableRecordings();
+            if (recordings == null) return;
             foreach (var fileName in recordings)
             {
-                // Already fused, nothing to resume.
-                if (HasFusionAsset(fileName))
-                    continue;
+                if (HasFusionAsset(fileName)) continue;
+                if (queue.entries.Exists(e => e.recordingFileName == fileName && !e.IsTerminal)) continue;
 
-                var recording = RecordingStorage.LoadRecording(fileName);
-                if (recording == null || string.IsNullOrEmpty(recording.moveJobId))
-                    continue;
-                // A failed job won't recover by re-polling.
-                if (recording.moveJobState == "FAILED")
-                    continue;
+                if (!RecordingStorage.TryGetMoveJobInfo(fileName, out string jobId, out string jobState)) continue;
+                if (jobState == "FAILED") continue;
 
-                ResumeJob(recording, fileName);
-                resumed++;
+                queue.entries.Add(new MoveQueueEntry
+                {
+                    recordingFileName = fileName,
+                    jobId = jobId,
+                    videoFilePath = null,
+                    State = MoveQueueState.Processing,
+                });
             }
-
-            if (resumed > 0)
-                SetStatus($"Resuming {resumed} Move AI job(s)…");
         }
 
-        void ResumeJob(HipRecording recording, string recordingFileName)
+        /// <summary>Persist the queue across app suspension and re-kick processing when the app returns to the
+        /// foreground (an in-flight upload/poll may have failed while the device was asleep).</summary>
+        void OnApplicationPause(bool paused)
         {
-            // The fusion stack can be left inactive in the scene; activate it so the poll/download coroutine runs.
-            if (!moveApiClient.gameObject.activeSelf)
-                moveApiClient.gameObject.SetActive(true);
-            if (!gameObject.activeSelf)
-                gameObject.SetActive(true);
-
-            string jobId = recording.moveJobId;
-            Debug.Log($"[MoveAIFusionCoordinator] Resuming Move AI job {jobId} for '{recordingFileName}'");
-            moveApiClient.RedownloadMotionData(jobId,
-                onComplete: result => OnMoveJobComplete(recording, recordingFileName, result),
-                onProgress: p => SetStatus($"Move AI (resume): {p.message} ({p.percent:F0}%)"));
+            SaveQueue();
+            if (!paused)
+                KickProcessor();
         }
+
+        // If this host is disabled mid-job the ProcessQueue coroutine stops; clear the guard so a later
+        // KickProcessor() can restart it (resumable jobs are picked back up from their persisted state).
+        void OnDisable()
+        {
+            processing = false;
+            SaveQueue();
+        }
+
+        /// <summary>The scene's primary fused player (timeline-driving). Overlay players read its tuning.</summary>
+        public FusedCharacterPlayer PrimaryPlayer => fusedPlayer;
+
+        /// <summary>True when a fused asset exists for the recording AND its source JSON can be loaded.</summary>
+        public static bool CanPlayFused(string recordingFileName) => HasFusionAsset(recordingFileName);
 
         /// <summary>
         /// Try to start fused playback for a recording. Returns false if no fused asset exists (caller should
@@ -324,9 +623,6 @@ namespace BodyTracking.MoveAI
             if (fusedPlayer == null || !HasFusionAsset(recordingFileName))
                 return false;
 
-            var asset = MoveAIFusionAsset.Load(FusionPath(recordingFileName));
-            if (asset == null) return false;
-
             // The fused player and compare visualizer rely on per-frame Update(), which only pumps on an active
             // GameObject. This host object can be left disabled in the scene, so activate it before playback.
             if (!gameObject.activeSelf)
@@ -334,30 +630,64 @@ namespace BodyTracking.MoveAI
             if (fusedPlayer.gameObject != gameObject && !fusedPlayer.gameObject.activeSelf)
                 fusedPlayer.gameObject.SetActive(true);
 
-            fusedPlayer.SetRouteRootProvider(provider);
-            fusedPlayer.SetSourceRecording(recording);
-            if (!fusedPlayer.LoadAsset(asset)) return false;
+            if (!ConfigureAndStartFusedOn(fusedPlayer, recordingFileName, provider, recording, out var asset))
+                return false;
+
+            if (showCompareSkeletons && recording != null && asset != null)
+            {
+                EnsureCompareVisualizer();
+                compareVisualizer.Begin(recording, asset, provider, fusedPlayer);
+            }
+
+            SetStatus($"Playing fused replay '{recordingFileName}'");
+            return true;
+        }
+
+        /// <summary>
+        /// Configure and start fused playback on an arbitrary <see cref="FusedCharacterPlayer"/> (used by the
+        /// multi-recording overlap engine to drive additional overlay characters). Loads the fused asset and
+        /// the source recording, attaches the Move GLB muscle retarget when available, and starts playback.
+        /// No compare overlay / status text is produced — that is reserved for the primary player.
+        /// </summary>
+        public bool ConfigureAndStartFusedOn(FusedCharacterPlayer targetPlayer, string recordingFileName,
+            IRouteRootProvider provider, HipRecording recording)
+        {
+            return ConfigureAndStartFusedOn(targetPlayer, recordingFileName, provider, recording, out _);
+        }
+
+        bool ConfigureAndStartFusedOn(FusedCharacterPlayer targetPlayer, string recordingFileName,
+            IRouteRootProvider provider, HipRecording recording, out MoveAIFusionAsset loadedAsset)
+        {
+            using var _ = PerfSampler.Scope("Fusion.ConfigureStart");
+            loadedAsset = null;
+            if (targetPlayer == null || !HasFusionAsset(recordingFileName))
+                return false;
+
+            var asset = MoveAIFusionAsset.Load(FusionPath(recordingFileName));
+            if (asset == null) return false;
+
+            if (!gameObject.activeSelf)
+                gameObject.SetActive(true);
+
+            targetPlayer.SetRouteRootProvider(provider);
+            targetPlayer.SetSourceRecording(recording);
+            if (!targetPlayer.LoadAsset(asset)) return false;
 
             // Precedence: if a Move AI GLB exists for this recording, retarget body + fingers from it (muscle space)
-            // while positioning/scale stay on the fused trajectory. The GLB loads asynchronously, so defer the
-            // actual StartPlayback until it's ready (or failed -> procedural). The fused JSON path is otherwise
-            // unchanged, and the dot-skeleton player remains the outer fallback in BodyTrackingController.
-            // Only take the GLB path when the player is actually in GLB articulation mode. In FBX mode the player
-            // runs the original position-based procedural retarget, so we must NOT load/attach a Move GLB — that
-            // keeps the FBX path identical to how it worked before the GLB feature existed.
-            bool glbMode = fusedPlayer.ArticulationMode == FusedCharacterPlayer.BodyArticulationSource.MoveGlb;
+            // while positioning/scale stay on the fused trajectory. The GLB loads asynchronously, so attach it when
+            // ready and keep playing the procedural fallback meanwhile — a slow glTFast load never blocks the UI.
+            bool glbMode = targetPlayer.ArticulationMode == FusedCharacterPlayer.BodyArticulationSource.MoveGlb;
             if (glbMode && preferGlbArticulation && HasGlb(recordingFileName))
-            {
-                // Start playback immediately (procedural fallback); attach the GLB muscle retarget when ready so a
-                // slow glTFast load on device never blocks the UI or leaves the app feeling frozen.
-                StartCoroutine(AttachGlbWhenReady(GlbPath(recordingFileName), recordingFileName));
-            }
+                AttachGlbIfNeeded(GlbPath(recordingFileName), recordingFileName, targetPlayer);
             else
             {
-                fusedPlayer.SetMoveGlbSource(null);
+                targetPlayer.SetMoveGlbSource(null);
+                attachedGlbPathByTarget.Remove(targetPlayer.GetInstanceID());
             }
 
-            StartFusedNow(recordingFileName, asset, provider, recording);
+            targetPlayer.RefreshGlbArticulation();
+            targetPlayer.StartPlayback();
+            loadedAsset = asset;
             return true;
         }
 
@@ -414,7 +744,31 @@ namespace BodyTracking.MoveAI
             if (!HasGlb(recordingFileName)) return;
             if (!EnsureFusionHostActive())
                 return;
-            StartCoroutine(AttachGlbWhenReady(GlbPath(recordingFileName), recordingFileName));
+            AttachGlbIfNeeded(GlbPath(recordingFileName), recordingFileName, fusedPlayer);
+        }
+
+        void AttachGlbIfNeeded(string glbPath, string recordingFileName, FusedCharacterPlayer target)
+        {
+            if (target == null || string.IsNullOrEmpty(glbPath))
+                return;
+
+            int targetId = target.GetInstanceID();
+            if (attachedGlbPathByTarget.TryGetValue(targetId, out string attachedPath) && attachedPath == glbPath)
+            {
+                target.RefreshGlbArticulation();
+                return;
+            }
+
+            string key = GlbAttachKey(target, glbPath);
+            if (glbAttachInFlight.Contains(key))
+                return;
+
+            StartCoroutine(AttachGlbWhenReady(glbPath, recordingFileName, target));
+        }
+
+        static string GlbAttachKey(FusedCharacterPlayer target, string glbPath)
+        {
+            return target.GetInstanceID().ToString(System.Globalization.CultureInfo.InvariantCulture) + "|" + glbPath;
         }
 
         /// <summary>Coroutines require an active host (MoveAIFusion is often left inactive in the scene).</summary>
@@ -432,8 +786,13 @@ namespace BodyTracking.MoveAI
             return true;
         }
 
-        IEnumerator AttachGlbWhenReady(string glbPath, string recordingFileName)
+        IEnumerator AttachGlbWhenReady(string glbPath, string recordingFileName, FusedCharacterPlayer target)
         {
+            if (target == null) yield break;
+            string key = GlbAttachKey(target, glbPath);
+            if (!glbAttachInFlight.Add(key))
+                yield break;
+
             Debug.Log($"[MoveAIFusionCoordinator] GLB load started for '{recordingFileName}'…");
             MoveGlbSource source = null;
             float deadline = Time.realtimeSinceStartup + 45f;
@@ -443,36 +802,25 @@ namespace BodyTracking.MoveAI
                 if (Time.realtimeSinceStartup > deadline)
                 {
                     Debug.LogWarning("[MoveAIFusionCoordinator] Move GLB load timed out after 45s; staying on procedural articulation.");
+                    glbAttachInFlight.Remove(key);
                     yield break;
                 }
                 yield return load.Current;
             }
 
             string loadError = source != null ? source.Error : "unknown";
-            if (source != null && source.IsReady)
+            if (target != null && source != null && source.IsReady)
             {
-                fusedPlayer.SetMoveGlbSource(source);
-                SetStatus($"Move GLB articulation active for '{recordingFileName}'");
+                target.SetMoveGlbSource(source);
+                attachedGlbPathByTarget[target.GetInstanceID()] = glbPath;
+                if (target == fusedPlayer)
+                    SetStatus($"Move GLB articulation active for '{recordingFileName}'");
             }
             else
             {
                 Debug.LogWarning("[MoveAIFusionCoordinator] Move GLB load failed; using procedural articulation. " + loadError);
             }
-        }
-
-        void StartFusedNow(string recordingFileName, MoveAIFusionAsset asset,
-                           IRouteRootProvider provider, HipRecording recording)
-        {
-            fusedPlayer.RefreshGlbArticulation();
-            fusedPlayer.StartPlayback();
-
-            if (showCompareSkeletons && recording != null)
-            {
-                EnsureCompareVisualizer();
-                compareVisualizer.Begin(recording, asset, provider, fusedPlayer);
-            }
-
-            SetStatus($"Playing fused replay '{recordingFileName}'");
+            glbAttachInFlight.Remove(key);
         }
 
         public bool IsFusedPlaying => fusedPlayer != null && fusedPlayer.IsPlaying;

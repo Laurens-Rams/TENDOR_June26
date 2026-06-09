@@ -26,6 +26,11 @@ Shader "Hidden/TENDOR/CharacterCameraSoftening"
             float _MinBlend;
             float _BlurRadius;
             float _DepthStrength;
+            // Camera tone match (applied to CG geometry only, via depth mask).
+            float _MatchStrength;   // 0 = off, 1 = full grade
+            float _MatchContrast;   // <1 lowers contrast around mid-grey
+            float _MatchSaturation; // <1 desaturates toward luma
+            float _MatchBlackLift;  // lifts crushed blacks to match the camera floor
 
             half Luma(half3 rgb)
             {
@@ -72,6 +77,21 @@ Shader "Hidden/TENDOR/CharacterCameraSoftening"
 
                 half blend = saturate(colorEdge * _Strength + depthEdge * _DepthStrength + _MinBlend);
                 half3 outRgb = lerp(center.rgb, blur, blend);
+
+                // Tone-match the character to the soft AR feed: knock down CG contrast/saturation and lift blacks.
+                // CG geometry writes depth (depthC < 1); the camera feed is a background blit at depthC ~= 1, so the
+                // real feed is left untouched. This is a few ALU ops in a pass that already runs — no extra cost.
+                half charMask = (1.0h - saturate((depthC - 0.95) / 0.05)) * _MatchStrength;
+                if (charMask > 0.0001h)
+                {
+                    half3 graded = outRgb;
+                    half l = Luma(graded);
+                    graded = lerp(l.xxx, graded, _MatchSaturation);
+                    graded = (graded - 0.5h) * _MatchContrast + 0.5h;
+                    graded = graded * (1.0h - _MatchBlackLift) + _MatchBlackLift;
+                    outRgb = lerp(outRgb, graded, charMask);
+                }
+
                 return half4(outRgb, center.a);
             }
             ENDHLSL

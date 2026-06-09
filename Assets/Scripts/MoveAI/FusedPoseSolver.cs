@@ -70,6 +70,14 @@ namespace BodyTracking.MoveAI
             [Tooltip("Seconds over which the Move->ARKit yaw offset is eased (move-driven facing only). Larger = steadier but slower to correct an initial mis-facing. ~2s is a good start.")]
             public float facingCorrectionSeconds;
 
+            [Header("Move-driven test mode (FollowMoveGlbRoot) auto re-align")]
+            [Tooltip("ON: while riding the Move GLB root motion, automatically re-anchor to the live ARKit pelvis whenever the Move-predicted position drifts past the threshold below. The correction is eased (no teleport). OFF: only the manual 'Re-align now' button re-anchors.")]
+            public bool moveAutoRealign;
+            [Tooltip("Drift distance (m) between the Move-predicted pelvis and the live ARKit pelvis that triggers an automatic re-align. Set above normal ARKit jitter (~0.05m) but below a noticeable offset. ~0.2m is a good start.")]
+            public float moveRealignDriftThreshold;
+            [Tooltip("Seconds over which a re-align (manual or automatic) glides the body from its drifted spot onto the fresh ARKit anchor, so it slides instead of snapping. Small = snappy, larger = smoother. ~0.4s is a good start.")]
+            public float moveRealignEaseSeconds;
+
             public static AnchorSettings Default => new AnchorSettings
             {
                 mode = AnchorMode.MoveAIDriftCorrected,
@@ -79,6 +87,9 @@ namespace BodyTracking.MoveAI
                 correctXZOnly = false,
                 moveDrivenFacing = true,
                 facingCorrectionSeconds = 2f,
+                moveAutoRealign = true,
+                moveRealignDriftThreshold = 0.2f,
+                moveRealignEaseSeconds = 0.4f,
             };
         }
 
@@ -109,6 +120,10 @@ namespace BodyTracking.MoveAI
             public Quaternion moveDrivenFacing0; // yaw captured from ARKit hip-axis at the align moment
             public Vector3 moveDrivenRoot0;    // GLB root world position at the align moment
             public bool requestRealign;        // set by the trigger hook to re-capture at the current frame
+            // Eased re-align: on re-anchor we keep the body where it was and decay these toward zero/identity so
+            // the correction glides on rather than teleporting. Position offset + yaw offset applied to the render.
+            public Vector3 moveDrivenPosCorrection;     // rendered = target + this; eased toward Vector3.zero
+            public Quaternion moveDrivenRotCorrection;  // rendered = this * facing0; eased toward identity
         }
 
         // After this many consecutive "too big" pelvis jumps, treat it as a real move (e.g. loop restart) and
@@ -200,26 +215,70 @@ namespace BodyTracking.MoveAI
                     // TEST mode: capture world anchor + facing ONCE from ARKit, then translate purely by the GLB
                     // root delta from that moment. facing is FROZEN to the captured yaw (overrides the per-frame
                     // hip-axis facing computed above) so turning comes entirely from Move after the alignment.
-                    // Capture only when the GLB root is actually available, so root0 is a real value.
-                    if (usedGlbPose && (state.requestRealign || !state.hasMoveDrivenAnchor))
+                    // Over time Move's own motion drifts vs the wall; we re-anchor to a confident ARKit pelvis
+                    // either on request (manual button) or automatically once the predicted position has drifted
+                    // past a threshold. The re-anchor is EASED (a decaying position/yaw correction) so the body
+                    // slides onto the fresh anchor instead of teleporting.
+                    bool firstCapture = !state.hasMoveDrivenAnchor;
+
+                    // Auto trigger: compare the pure Move prediction (no eased correction) to the live ARKit pelvis.
+                    bool wantRealign = state.requestRealign;
+                    if (!firstCapture && usedGlbPose && gotAnchor && anchorSettings.moveAutoRealign && !wantRealign)
                     {
+                        Vector3 dNow = (glbRootWorld - state.moveDrivenRoot0) * poseScale;
+                        Vector3 predicted = state.moveDrivenAnchor0 + state.moveDrivenFacing0 * dNow;
+                        if ((predicted - pc).sqrMagnitude >
+                            anchorSettings.moveRealignDriftThreshold * anchorSettings.moveRealignDriftThreshold)
+                            wantRealign = true;
+                    }
+
+                    if (usedGlbPose && firstCapture)
+                    {
+                        // First alignment: snap the base to ARKit with no correction (nothing to glide from).
                         state.moveDrivenAnchor0 = gotAnchor ? pc
                             : state.hasAnchor ? state.anchor
                             : (asset.rootPathLocal != null && k < asset.rootPathLocal.Count) ? asset.rootPathLocal[k]
                             : Vector3.zero;
-                        // Prefer the freshly computed hip-axis facing; else hold the last good one; else identity.
                         state.moveDrivenFacing0 = gotFacing ? f : (state.hasFacing ? state.facing : Quaternion.identity);
                         state.moveDrivenRoot0 = glbRootWorld;
+                        state.moveDrivenPosCorrection = Vector3.zero;
+                        state.moveDrivenRotCorrection = Quaternion.identity;
                         state.hasMoveDrivenAnchor = true;
                         state.requestRealign = false;
                     }
+                    else if (usedGlbPose && wantRealign && gotAnchor)
+                    {
+                        // Re-anchor with easing: capture where the body is rendered RIGHT NOW, move the base onto
+                        // the fresh ARKit anchor (delta resets to 0), then set the correction so the rendered pose
+                        // is unchanged this frame and decays onto the new base over moveRealignEaseSeconds.
+                        Vector3 dOld = (glbRootWorld - state.moveDrivenRoot0) * poseScale;
+                        Vector3 oldRendered = state.moveDrivenAnchor0 + state.moveDrivenFacing0 * dOld + state.moveDrivenPosCorrection;
+                        Quaternion oldFacing = state.moveDrivenRotCorrection * state.moveDrivenFacing0;
+
+                        Quaternion newFacing0 = gotFacing ? f : state.moveDrivenFacing0;
+                        state.moveDrivenAnchor0 = pc;
+                        state.moveDrivenRoot0 = glbRootWorld;
+                        state.moveDrivenPosCorrection = oldRendered - pc;
+                        state.moveDrivenRotCorrection = oldFacing * Quaternion.Inverse(newFacing0);
+                        state.moveDrivenFacing0 = newFacing0;
+                        state.requestRealign = false;
+                    }
+                    // else (requestRealign but no ARKit/GLB this frame): keep requestRealign pending until ARKit returns.
 
                     if (state.hasMoveDrivenAnchor)
                     {
-                        facing = state.moveDrivenFacing0;
+                        // Decay the eased correction toward zero/identity (frame-rate independent).
+                        float wEase = 1f - Mathf.Exp(-Mathf.Max(1e-4f, Time.deltaTime)
+                            / Mathf.Max(1e-4f, anchorSettings.moveRealignEaseSeconds));
+                        state.moveDrivenPosCorrection = Vector3.Lerp(state.moveDrivenPosCorrection, Vector3.zero, wEase);
+                        state.moveDrivenRotCorrection = Quaternion.Slerp(state.moveDrivenRotCorrection, Quaternion.identity, wEase);
+
                         // No fresh GLB root this frame: hold the last anchor rather than snapping to a zero delta.
                         Vector3 d = usedGlbPose ? (glbRootWorld - state.moveDrivenRoot0) * poseScale : Vector3.zero;
-                        anchor = usedGlbPose ? state.moveDrivenAnchor0 + facing * d : state.anchor;
+                        facing = state.moveDrivenRotCorrection * state.moveDrivenFacing0;
+                        anchor = usedGlbPose
+                            ? state.moveDrivenAnchor0 + state.moveDrivenFacing0 * d + state.moveDrivenPosCorrection
+                            : state.anchor;
                         // The captured facing came from the ARKit hip-axis, so treat it like an active hip-axis
                         // facing: keeps invertFacing gated identically to the other modes (no-op while valid).
                         state.hasFacing = true;

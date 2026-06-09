@@ -2,6 +2,7 @@ using System;
 using System.Collections;
 using System.IO;
 using Unity.Collections;
+using Unity.Jobs;
 using UnityEngine;
 using UnityEngine.XR.ARFoundation;
 using UnityEngine.XR.ARSubsystems;
@@ -190,9 +191,14 @@ public class VideoRecorder : MonoBehaviour
         // AR intrinsics are not ready during BodyTrackingController.Initialize(); defer prewarm until the camera
         // is actually producing frames at its real resolution (1920x1440 etc.), otherwise the throwaway capture
         // runs at 1280x720 defaults and the first real record still pays the full CreateRecorderVideo cost.
-        var cm = ResolveCameraManager();
-        if (cm != null)
-            cm.frameReceived += OnCameraFrameForPrewarm;
+        // Only hook the per-frame camera callback when prewarm is enabled — otherwise this delegate would fire
+        // on every AR frame for the app's lifetime (and never unsubscribe), adding needless main-thread work.
+        if (enableEncoderPrewarm)
+        {
+            var cm = ResolveCameraManager();
+            if (cm != null)
+                cm.frameReceived += OnCameraFrameForPrewarm;
+        }
     }
 
     void OnEnable()
@@ -917,53 +923,76 @@ public class VideoRecorder : MonoBehaviour
         int w = captureWidth;
         int h = captureHeight;
 
-        switch (rotation)
+        if (rotation == VideoRotation.None)
         {
-            case VideoRotation.CounterClockwise90:
+            d.CopyFrom(s);
+            return;
+        }
+
+        // The per-output-row pixel mapping below is identical to the previous scalar loops; we just spread the
+        // ~2-3M-pixel remap across worker threads so it does not block the main thread during capture. The job is
+        // completed before the caller uploads the texture (tex.Apply), so timing/output are unchanged.
+        var job = new RotateJob
+        {
+            src = s,
+            dst = d,
+            w = w,
+            h = h,
+            rotation = (int)rotation,
+        };
+
+        // 90deg / portrait remaps produce w output rows (each h wide); 180 keeps h output rows (each w wide).
+        int outputRows = rotation == VideoRotation.Rotate180 ? h : w;
+        job.Schedule(outputRows, 16).Complete();
+    }
+
+    struct RotateJob : IJobParallelFor
+    {
+        [ReadOnly] public NativeArray<int> src;
+        [WriteOnly, NativeDisableParallelForRestriction] public NativeArray<int> dst;
+        public int w;
+        public int h;
+        public int rotation;
+
+        public void Execute(int index)
+        {
+            switch ((VideoRotation)rotation)
             {
-                int dstW = h; // output width
-                for (int nr = 0; nr < w; nr++)        // output rows  [0, w)
+                case VideoRotation.CounterClockwise90:
                 {
+                    int nr = index;                       // output row [0, w)
                     int srcCol = w - 1 - nr;
-                    int rowBase = nr * dstW;
-                    for (int nc = 0; nc < h; nc++)    // output cols  [0, h)
-                        d[rowBase + nc] = s[nc * w + srcCol];
+                    int rowBase = nr * h;
+                    for (int nc = 0; nc < h; nc++)        // output col [0, h)
+                        dst[rowBase + nc] = src[nc * w + srcCol];
+                    break;
                 }
-                break;
-            }
-            case VideoRotation.Clockwise90:
-            {
-                int dstW = h;
-                for (int nr = 0; nr < w; nr++)
+                case VideoRotation.Clockwise90:
                 {
-                    int rowBase = nr * dstW;
+                    int nr = index;
+                    int rowBase = nr * h;
                     for (int nc = 0; nc < h; nc++)
-                        d[rowBase + nc] = s[(h - 1 - nc) * w + nr];
+                        dst[rowBase + nc] = src[(h - 1 - nc) * w + nr];
+                    break;
                 }
-                break;
-            }
-            case VideoRotation.Rotate180:
-            {
-                int count = w * h;
-                for (int i = 0; i < count; i++)
-                    d[i] = s[count - 1 - i];
-                break;
-            }
-            case VideoRotation.PortraitUpright:
-            {
-                // Landscape sensor → portrait upright (swapXY + flipX + flipY).
-                int dstW = h;
-                for (int nr = 0; nr < w; nr++)
+                case VideoRotation.Rotate180:
                 {
-                    int rowBase = nr * dstW;
-                    for (int nc = 0; nc < h; nc++)
-                        d[rowBase + nc] = s[(h - 1 - nc) * w + (w - 1 - nr)];
+                    int r = index;                        // output row [0, h)
+                    int rowBase = r * w;
+                    for (int c = 0; c < w; c++)
+                        dst[rowBase + c] = src[(h - 1 - r) * w + (w - 1 - c)];
+                    break;
                 }
-                break;
+                case VideoRotation.PortraitUpright:
+                {
+                    // Landscape sensor -> portrait upright (swapXY + flipX + flipY).
+                    int nr = index;
+                    int rowBase = nr * h;
+                    for (int nc = 0; nc < h; nc++)
+                        dst[rowBase + nc] = src[(h - 1 - nc) * w + (w - 1 - nr)];
+                    break;
+                }
             }
-            default:
-                d.CopyFrom(s);
-                break;
         }
     }
 

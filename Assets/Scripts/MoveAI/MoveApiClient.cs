@@ -116,7 +116,12 @@ namespace BodyTracking.MoveAI
         /// When &gt; 0, only the clip [0, clipEndSeconds] of the video is processed (server-side, no re-encode).
         /// Used to drop the tail where the climber steps out of frame to tap stop.
         /// </param>
-        public void SubmitVideo(byte[] videoBytes, Action<MoveJobResult> onComplete, Action<MoveJobProgress> onProgress = null, float clipEndSeconds = 0f)
+        /// <param name="onJobCreated">
+        /// Invoked with the Move job id the instant <c>createSingleCamJob</c> returns — before polling begins.
+        /// Callers should persist this id immediately so an interrupted upload (app sleep/kill during the
+        /// minutes-long processing) can be resumed from <see cref="RedownloadMotionData"/> instead of re-uploading.
+        /// </param>
+        public void SubmitVideo(byte[] videoBytes, Action<MoveJobResult> onComplete, Action<MoveJobProgress> onProgress = null, float clipEndSeconds = 0f, Action<string> onJobCreated = null)
         {
             // Coroutines can't start on an inactive GameObject; activate the host first (MoveAIFusion root).
             if (!gameObject.activeSelf)
@@ -131,7 +136,7 @@ namespace BodyTracking.MoveAI
                 return;
             }
 
-            StartCoroutine(RunPipeline(videoBytes, onComplete, onProgress, clipEndSeconds));
+            StartCoroutine(RunPipeline(videoBytes, onComplete, onProgress, clipEndSeconds, onJobCreated));
         }
 
         /// <summary>
@@ -167,6 +172,7 @@ namespace BodyTracking.MoveAI
 
             float elapsed = 0f;
             string motionUrl = null;
+            string glbUrl = null;
             while (elapsed < timeoutSeconds && string.IsNullOrEmpty(motionUrl))
             {
                 string state = null;
@@ -211,6 +217,7 @@ namespace BodyTracking.MoveAI
                             {
                                 var job = ObjAt(resp, "data", "getJob");
                                 motionUrl = FindOutputUrl(job, "MOTION_DATA");
+                                if (requestGlbOutput) glbUrl = FindOutputUrl(job, "GLB");
                             },
                             err => Debug.LogWarning($"[MoveApiClient] redownload outputs error (will retry): {err}"));
                     }
@@ -252,12 +259,21 @@ namespace BodyTracking.MoveAI
             }
             result.motionDataZip = motionBytes;
 
+            // Optional GLB download (best-effort) so a resumed job retargets from muscle space like a fresh one.
+            if (requestGlbOutput && !string.IsNullOrEmpty(glbUrl))
+            {
+                Report(onProgress, MoveJobState.Running, 99, "Downloading GLB", jobId);
+                yield return DownloadBytesWithRetry(glbUrl, DownloadTimeoutSeconds, "GLB",
+                    data => result.glbBytes = data,
+                    err => Debug.LogWarning($"[MoveApiClient] GLB redownload failed (continuing): {err}"));
+            }
+
             result.success = true;
             Report(onProgress, MoveJobState.Finished, 100, "Done", jobId);
             onComplete?.Invoke(result);
         }
 
-        IEnumerator RunPipeline(byte[] videoBytes, Action<MoveJobResult> onComplete, Action<MoveJobProgress> onProgress, float clipEndSeconds = 0f)
+        IEnumerator RunPipeline(byte[] videoBytes, Action<MoveJobResult> onComplete, Action<MoveJobProgress> onProgress, float clipEndSeconds = 0f, Action<string> onJobCreated = null)
         {
             var result = new MoveJobResult();
 
@@ -344,6 +360,8 @@ namespace BodyTracking.MoveAI
                 yield break;
             }
             result.jobId = jobId;
+            // Surface the job id before the long poll so the caller can persist it and resume after a sleep/kill.
+            onJobCreated?.Invoke(jobId);
 
             // 5) poll getJob until FINISHED/FAILED
             float elapsed = 0f;

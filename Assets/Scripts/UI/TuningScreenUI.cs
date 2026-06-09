@@ -5,6 +5,7 @@ using UnityEngine.UI;
 using BodyTracking.Playback;
 using BodyTracking.Playback.PostProcess;
 using BodyTracking.MoveAI;
+using BodyTracking.Animation;
 
 namespace BodyTracking.UI
 {
@@ -78,6 +79,41 @@ namespace BodyTracking.UI
             if (controller == null)
                 controller = UnityEngine.Object.FindFirstObjectByType<BodyTrackingController>();
             return controller;
+        }
+
+        private CharacterMouth mouth;
+        private CharacterEyeBlink eyeBlink;
+        private CharacterEyeMovement eyeMovement;
+
+        private CharacterMouth Mouth()
+        {
+            if (mouth == null)
+                mouth = UnityEngine.Object.FindFirstObjectByType<CharacterMouth>(FindObjectsInactive.Include);
+            return mouth;
+        }
+
+        private CharacterEyeBlink EyeBlink()
+        {
+            if (eyeBlink == null)
+                eyeBlink = UnityEngine.Object.FindFirstObjectByType<CharacterEyeBlink>(FindObjectsInactive.Include);
+            return eyeBlink;
+        }
+
+        private CharacterEyeMovement EyeMovement()
+        {
+            if (eyeMovement == null)
+                eyeMovement = UnityEngine.Object.FindFirstObjectByType<CharacterEyeMovement>(FindObjectsInactive.Include);
+            return eyeMovement;
+        }
+
+        /// <summary>
+        /// The tuning sliders/toggles mutate the primary <see cref="FusedCharacterPlayer"/> only. When several
+        /// characters are playing at once, push those edits onto every overlay so they all share one consistent
+        /// set of correction settings.
+        /// </summary>
+        private void PropagateToOverlays()
+        {
+            Controller()?.ApplyTuningToOverlays();
         }
 
         private void EnsureInitialized()
@@ -207,6 +243,12 @@ namespace BodyTracking.UI
                     ? FusedPoseSolver.AnchorMode.FollowMoveGlbRoot
                     : FusedPoseSolver.AnchorMode.FollowBakedRoot);
             AddButton("Re-align Move movement now", () => p.RealignMoveMovement());
+            AddToggle("Auto re-align (Move test)", () => p.AnchorSettingsLive.moveAutoRealign,
+                v => { var s = p.AnchorSettingsLive; s.moveAutoRealign = v; p.AnchorSettingsLive = s; });
+            AddSlider("Re-align drift threshold (m)", 0.05f, 0.6f, () => p.AnchorSettingsLive.moveRealignDriftThreshold,
+                v => { var s = p.AnchorSettingsLive; s.moveRealignDriftThreshold = v; p.AnchorSettingsLive = s; }, "0.00");
+            AddSlider("Re-align ease (s)", 0.05f, 1.5f, () => p.AnchorSettingsLive.moveRealignEaseSeconds,
+                v => { var s = p.AnchorSettingsLive; s.moveRealignEaseSeconds = v; p.AnchorSettingsLive = s; }, "0.00");
             AddModeToggle("World position source",
                 () => p.PlaybackAnchorMode == FusedPoseSolver.AnchorMode.FollowBakedRoot ? "Baked" : "Live",
                 () =>
@@ -283,6 +325,8 @@ namespace BodyTracking.UI
             AddSlider("Character fit scale", 0.5f, 1.5f, () => p.SkeletonFitScale, v => p.SkeletonFitScale = v, "0.00");
             AddSlider("Playback speed", 0.25f, 2f, () => p.PlaybackSpeed, v => p.PlaybackSpeed = v, "0.00");
 
+            AddFaceRows();
+
             var co = Coordinator();
             if (co != null)
             {
@@ -299,6 +343,36 @@ namespace BodyTracking.UI
                     v => { var s = co.BakeSettings; s.outlierMeters = v; co.BakeSettings = s; }, "0.00");
                 AddButton("Rebake from latest (no API)", OnRebakeClicked);
                 rebakeStatus = AddStatusLabel(co.LastStatus);
+            }
+        }
+
+        /// <summary>
+        /// Eyes + mouth live controls. The eye blink/movement and the new mouth driver are independent
+        /// MonoBehaviours layered on top of the body retarget; expose their main knobs here so the smile/talk
+        /// test sits right alongside the eye-movement and blinking settings.
+        /// </summary>
+        private void AddFaceRows()
+        {
+            var m = Mouth();
+            var blink = EyeBlink();
+            var move = EyeMovement();
+            if (m == null && blink == null && move == null) return;
+
+            AddSection("Face (eyes / mouth)");
+
+            if (blink != null)
+                AddToggle("Eye blinking", () => blink.enabled, v => blink.enabled = v);
+            if (move != null)
+                AddToggle("Eye movement", () => move.enabled, v => move.enabled = v);
+
+            if (m != null)
+            {
+                AddToggle("Mouth (smile/talk)", () => m.enabled, v => m.enabled = v);
+                AddSlider("Smile amount", 0f, 1f, () => m.SmileAmount, v => m.SetSmile(v), "0.00");
+                AddButton(m.IsTalking ? "Stop talking" : "Talk (test)", () =>
+                {
+                    if (m.IsTalking) m.StopTalking(); else m.TriggerTalk();
+                });
             }
         }
 
@@ -463,6 +537,7 @@ namespace BodyTracking.UI
             {
                 setter(v);
                 valText.text = v.ToString(fmt);
+                PropagateToOverlays();
             });
         }
 
@@ -486,6 +561,7 @@ namespace BodyTracking.UI
                 bool nv = !getter();
                 setter(nv);
                 ApplyToggleVisual(btnImg, btnText, nv);
+                PropagateToOverlays();
             });
         }
 
@@ -516,6 +592,7 @@ namespace BodyTracking.UI
             {
                 cycle();
                 if (btnText != null) btnText.text = stateText();
+                PropagateToOverlays();
             });
         }
 
@@ -536,7 +613,11 @@ namespace BodyTracking.UI
                 btnLe.minWidth = 180f;
             }
 
-            btn.onClick.AddListener(() => onClick?.Invoke());
+            btn.onClick.AddListener(() =>
+            {
+                onClick?.Invoke();
+                PropagateToOverlays();
+            });
         }
 
         /// <summary>A wrapping status line used under the Rebake button.</summary>
