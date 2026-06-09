@@ -10460,8 +10460,9 @@ MonoBehaviour:
   penetrationSettings:
     enableFloorFix: 1
     floorContactBand: 0.12
-    enableWallHandIK: 0
-    enableWallFootIK: 0
+    maxStandingHipHeightAboveFloor: 1.3
+    enableWallHandIK: 1
+    enableWallFootIK: 1
     maxIkWeight: 1
     penetrationForFullWeight: 0.08
     enableWholeBodyPush: 0
@@ -10471,6 +10472,20 @@ MonoBehaviour:
     skipDuringJump: 0
     debugDraw: 0
   surfaceProbe: {fileID: 1834499786}
+  enableWallProjection: 1
+  autoCalibrateWallOnPlay: 1
+  wallProjectionSettings:
+    enableSlabClamp: 1
+    wallDepthOffset: 0
+    wallSurfaceDepth: 0.04
+    maxBodyDepth: 0.5
+    enableContactLock: 1
+    snapWorldJoints: 1
+    contactDepthBand: 0.14
+    contactStillnessSpeed: 0.08
+    contactReleaseSpeed: 0.25
+    contactEaseSeconds: 0.12
+    maxContactWeight: 1
   heightFitMode: 2
   skeletonFitScale: 0.88
   logTuningSettingsEvery15s: 1
@@ -15081,6 +15096,7 @@ GameObject:
   m_Component:
   - component: {fileID: 1834499787}
   - component: {fileID: 1834499786}
+  - component: {fileID: 1834499788}
   m_Layer: 0
   m_Name: PosePostProcessing
   m_TagString: Untagged
@@ -15105,14 +15121,40 @@ MonoBehaviour:
     m_Bits: 0
   useArMesh: 1
   maxProbeDistance: 0.5
+  wallLocalZOffset: 0
   wallSkinOffset: 0.02
   floorSkinOffset: 0
+  drawWallGizmo: 1
   useArPlaneFloor: 1
   planeManager: {fileID: 0}
   minFloorPlaneArea: 0.5
   maxFloorDropBelowQuery: 3
   useRouteRootFloorFallback: 0
   floorLocalY: 0
+--- !u!114 &1834499788
+MonoBehaviour:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 1834499785}
+  m_Enabled: 1
+  m_EditorHideFlags: 0
+  m_Script: {fileID: 11500000, guid: fd1b0a9b887841108fe3c1f09efeff59, type: 3}
+  m_Name: 
+  m_EditorClassIdentifier: 
+  player: {fileID: 0}
+  surfaceProbe: {fileID: 1834499786}
+  showVisuals: 1
+  showStatusHud: 1
+  showPlanes: 1
+  showContactMarkers: 1
+  planeSize: 3
+  markerRadius: 0.06
+  wallColor: {r: 0.15, g: 0.6, b: 1, a: 0.22}
+  floorColor: {r: 0.3, g: 1, b: 0.4, a: 0.22}
+  contactOnColor: {r: 0.2, g: 1, b: 0.3, a: 0.95}
+  contactOffColor: {r: 1, g: 1, b: 1, a: 0.25}
 --- !u!4 &1834499787
 Transform:
   m_ObjectHideFlags: 0

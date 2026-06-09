@@ -11,6 +11,10 @@ namespace BodyTracking.Playback.PostProcess
         public bool enableFloorFix;
         [Tooltip("How close (m) a foot must be to the floor for the pose to count as 'standing'.")]
         public float floorContactBand;
+        [Tooltip("Climbing guard: only treat a pose as 'standing' (and apply the floor lift) when the hips are within " +
+                 "this height (m) above the floor. Stops a mid-wall climbing pose — where a low foot happens to dangle " +
+                 "near the floor plane — from lifting (floating) the whole climber. 0 = disabled (legacy behaviour).")]
+        public float maxStandingHipHeightAboveFloor;
 
         [Header("Wall (climbing)")]
         [Tooltip("Pin a hand to the wall surface (two-bone IK) when it sinks through the wall.")]
@@ -44,6 +48,7 @@ namespace BodyTracking.Playback.PostProcess
             // the floor) — otherwise a standing pose would be lifted to the wrong height.
             enableFloorFix = false,
             floorContactBand = 0.12f,
+            maxStandingHipHeightAboveFloor = 1.3f,
             enableWallHandIK = true,
             enableWallFootIK = true,
             maxIkWeight = 1f,
@@ -123,6 +128,11 @@ namespace BodyTracking.Playback.PostProcess
                 if (lowestFoot < float.MaxValue)
                 {
                     standing = lowestFoot <= floorY + s.floorContactBand;
+                    // Climbing guard: a mid-wall pose can have a trailing foot dangle near the floor plane. Only count
+                    // it as standing (and lift it) when the hips are low enough to plausibly be on the ground.
+                    if (standing && s.maxStandingHipHeightAboveFloor > 0f && !float.IsNaN(queryY) &&
+                        queryY - floorY > s.maxStandingHipHeightAboveFloor)
+                        standing = false;
                     if (standing && !jumping && s.enableFloorFix && lowestFoot < floorY)
                     {
                         float lift = floorY - lowestFoot; // only lift up; never push a floating pose down
@@ -159,9 +169,66 @@ namespace BodyTracking.Playback.PostProcess
             }
             if (s.enableWallFootIK)
             {
-                SolveLimbToWall(animator, HumanBodyBones.LeftUpperLeg, HumanBodyBones.LeftLowerLeg, HumanBodyBones.LeftFoot, s);
-                SolveLimbToWall(animator, HumanBodyBones.RightUpperLeg, HumanBodyBones.RightLowerLeg, HumanBodyBones.RightFoot, s);
+                // Effector is the TOE (front of the shoe) — that's what touches the wall in climbing — falling back to
+                // the ankle only on rigs with no toe bone.
+                SolveLimbToWall(animator, HumanBodyBones.LeftUpperLeg, HumanBodyBones.LeftLowerLeg, FootTip(animator, HumanBodyBones.LeftToes, HumanBodyBones.LeftFoot), s);
+                SolveLimbToWall(animator, HumanBodyBones.RightUpperLeg, HumanBodyBones.RightLowerLeg, FootTip(animator, HumanBodyBones.RightToes, HumanBodyBones.RightFoot), s);
             }
+        }
+
+        /// <summary>
+        /// Climbing contact pass: pin each hand/foot that <see cref="WallProjectionResolver"/> has latched onto a hold
+        /// to its locked wall-surface point via two-bone IK. Unlike <see cref="ResolveLimbs"/> (which only pushes a
+        /// limb OUT when it penetrates), this also pulls a contact limb IN onto the surface, so a hand that ARKit/Move
+        /// floated slightly off the wall is brought back onto the hold it is actually gripping. Runs on the humanoid
+        /// rig after the pose is written, so it works for both the procedural and GLB articulation paths.
+        /// </summary>
+        public void ResolveContactLimbs(Animator animator, WallProjectionResolver.WallContact[] contacts, bool jumping, in PenetrationSettings s)
+        {
+            if (animator == null || !animator.isHuman || contacts == null) return;
+            if (jumping && s.skipDuringJump) return;
+
+            foreach (var c in contacts)
+            {
+                if (!c.active || c.weight <= 0f) continue;
+                switch (c.limb)
+                {
+                    case WallProjectionResolver.ClimbLimb.LeftHand:
+                        PinLimb(animator, HumanBodyBones.LeftUpperArm, HumanBodyBones.LeftLowerArm, HumanBodyBones.LeftHand, c.targetWorld, c.weight);
+                        break;
+                    case WallProjectionResolver.ClimbLimb.RightHand:
+                        PinLimb(animator, HumanBodyBones.RightUpperArm, HumanBodyBones.RightLowerArm, HumanBodyBones.RightHand, c.targetWorld, c.weight);
+                        break;
+                    case WallProjectionResolver.ClimbLimb.LeftFoot:
+                        PinLimb(animator, HumanBodyBones.LeftUpperLeg, HumanBodyBones.LeftLowerLeg, FootTip(animator, HumanBodyBones.LeftToes, HumanBodyBones.LeftFoot), c.targetWorld, c.weight);
+                        break;
+                    case WallProjectionResolver.ClimbLimb.RightFoot:
+                        PinLimb(animator, HumanBodyBones.RightUpperLeg, HumanBodyBones.RightLowerLeg, FootTip(animator, HumanBodyBones.RightToes, HumanBodyBones.RightFoot), c.targetWorld, c.weight);
+                        break;
+                }
+            }
+        }
+
+        // Prefer the toe bone (front of the shoe) as the foot IK effector; fall back to the ankle on rigs that have
+        // no mapped toe bone. With the toe as the tip, the two-bone solver (hip→knee→toe) places the FRONT of the foot
+        // on the wall, keeping the ankle behind it — instead of jamming the heel/ankle into the wall.
+        static HumanBodyBones FootTip(Animator animator, HumanBodyBones toes, HumanBodyBones foot)
+            => animator.GetBoneTransform(toes) != null ? toes : foot;
+
+        void PinLimb(Animator animator, HumanBodyBones rootBone, HumanBodyBones midBone, HumanBodyBones tipBone, Vector3 target, float weight)
+        {
+            Transform root = animator.GetBoneTransform(rootBone);
+            Transform mid = animator.GetBoneTransform(midBone);
+            Transform tip = animator.GetBoneTransform(tipBone);
+            if (root == null || mid == null || tip == null) return;
+
+            // Only pin when the tip is actually off the hold; tiny corrections aren't worth a rig change.
+            if ((tip.position - target).sqrMagnitude < 1e-4f) return;
+
+            Vector3 hint = probe != null && probe.TryWall(mid.position, out var h)
+                ? mid.position + h.normal * 0.1f
+                : mid.position;
+            LimbIKSolver.Solve(root, mid, tip, target, weight, hint);
         }
 
         void SolveLimbToWall(Animator animator, HumanBodyBones rootBone, HumanBodyBones midBone, HumanBodyBones tipBone, in PenetrationSettings s)

@@ -23,6 +23,22 @@ namespace BodyTracking.Utils
             return material;
         }
 
+        /// <summary>Solid color material forced transparent (alpha honoured), for semi-transparent debug planes.</summary>
+        public static Material CreateTransparentColorMaterial(Color color)
+        {
+            var shader = FindShader(
+                "Universal Render Pipeline/Unlit",
+                "Unlit/Color",
+                "Sprites/Default");
+            if (shader == null)
+                return null;
+
+            var material = new Material(shader);
+            ApplyColor(material, color);
+            ConfigureTransparent(material);
+            return material;
+        }
+
         public static Material CreateLineMaterial(Color color)
         {
             var shader = FindShader(

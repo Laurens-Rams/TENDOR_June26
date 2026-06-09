@@ -23,8 +23,10 @@ namespace BodyTracking.MoveAI
             public float smoothingTau;       // seconds; larger = gentler re-convergence
             public float outlierMeters;      // reject ARKit samples this far from the aligned Move root
 
-            /// <summary>Non-zero ARKit correction weights used when none are configured (rebake / legacy scenes).</summary>
-            public static readonly Vector3 DefaultAxisWeights = new Vector3(0.6f, 1f, 1f);
+            /// <summary>Non-zero ARKit correction weights used when none are configured (rebake / legacy scenes).
+            /// On a flat wall ARKit's along-wall (X) and vertical (Y) hip are reliable, and depth (Z) is fully trusted
+            /// so the baked root path stays on the wall rather than riding Move's monocular depth.</summary>
+            public static readonly Vector3 DefaultAxisWeights = new Vector3(0.8f, 1f, 1f);
 
             public static Settings Default => new Settings
             {

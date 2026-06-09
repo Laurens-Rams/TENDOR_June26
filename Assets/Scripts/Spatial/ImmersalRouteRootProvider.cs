@@ -139,6 +139,16 @@ namespace BodyTracking.Spatial
                  "(~1920x1440). HD (1280x720) roughly halves that allocation with negligible localization-accuracy " +
                  "loss. Turn OFF to restore the SDK default resolution (production / debugging).")]
         [SerializeField] private bool lowerLocalizationResolution = true;
+
+        [Header("Drift check (passive, measure-only)")]
+        [Tooltip("While the room anchor is frozen and idle, periodically reopen Immersal localization just long " +
+                 "enough to MEASURE how far the live fix has drifted from the locked anchor — without moving the " +
+                 "anchor. Surfaced as a tappable status dot (tap = full re-scan). Independent of auto re-align.")]
+        [SerializeField] private bool enableDriftCheck = true;
+        [Tooltip("Seconds between passive drift checks while frozen and idle. Higher = cooler/less frequent.")]
+        [SerializeField] private float driftCheckIntervalSeconds = 30f;
+        [Tooltip("Max seconds to keep localization open waiting for one fresh fix during a check before giving up.")]
+        [SerializeField] private float driftCheckWindowSeconds = 5f;
 #endif
 
         /// <summary>
@@ -272,6 +282,33 @@ namespace BodyTracking.Spatial
         private int lastSuccessCount = -1;                       // last seen LocalizationSuccessCount
         private readonly List<Pose> recentFixes = new List<Pose>(); // poses sampled at each new success
 
+        // Passive drift-check state. While frozen+idle we periodically reopen localization, sample one fresh
+        // fix, compare it to the frozen anchor to estimate drift, then let localization pause again. The anchor
+        // is NEVER moved by this — it only measures, so a status dot can report how far off the lock looks.
+        private bool driftCheckInProgress;
+        private float nextDriftCheckTime;
+        private float driftCheckDeadline;
+        private float lastDriftMeters = -1f;
+        private float lastDriftDegrees = -1f;
+        private float lastDriftCheckTime = -1f;
+        private bool hasDriftEstimate;
+
+        /// <summary>Raised whenever a passive drift estimate is refreshed (or cleared).</summary>
+        public event Action OnDriftEstimateChanged;
+
+        /// <summary>True when passive drift checking is supported on this build.</summary>
+        public bool DriftCheckSupported => true;
+        /// <summary>True once at least one drift estimate has been measured since the anchor locked.</summary>
+        public bool HasDriftEstimate => hasDriftEstimate;
+        /// <summary>A drift check is currently sampling a fresh Immersal fix.</summary>
+        public bool DriftCheckInProgress => driftCheckInProgress;
+        /// <summary>Estimated positional drift (metres) of the live fix from the frozen anchor; -1 if unknown.</summary>
+        public float LastDriftMeters => lastDriftMeters;
+        /// <summary>Estimated rotational drift (degrees) of the live fix from the frozen anchor; -1 if unknown.</summary>
+        public float LastDriftDegrees => lastDriftDegrees;
+        /// <summary>Seconds since the last drift estimate, or -1 if none yet.</summary>
+        public float SecondsSinceDriftCheck => hasDriftEstimate ? Time.unscaledTime - lastDriftCheckTime : -1f;
+
         // Localization power gating. localizationActive mirrors our belief of the Immersal session's running
         // state; resumeLocalizationUntil > 0 keeps it running for a manual-realign window. ApplyDesired
         // LocalizationState() reconciles the two every frame and only calls Pause/Resume on a real transition.
@@ -313,6 +350,9 @@ namespace BodyTracking.Spatial
             recentFixes.Clear();
             // Re-establishing from scratch needs continuous localization again (handled by ApplyDesiredLocalizationState).
             resumeLocalizationUntil = 0f;
+
+            // No frozen anchor to measure against anymore.
+            ClearDriftEstimate(reschedule: false);
             if (roomAnchor != null)
             {
                 if (arAnchorManager != null)
@@ -343,6 +383,10 @@ namespace BodyTracking.Spatial
             // Push our frequency overrides onto the session once it exists (one-time; no-op afterwards).
             ApplySessionTuning();
 
+            // Decide (before reconciling the session state below) whether to reopen localization for a brief
+            // passive drift measurement. Sets the resume window so ApplyDesiredLocalizationState resumes this tick.
+            MaybeRunDriftCheck();
+
             // Reconcile the Immersal session running/paused state with what we currently need (cheap; only
             // calls into the SDK on an actual transition). This is what stops continuous localization once locked.
             ApplyDesiredLocalizationState();
@@ -367,6 +411,73 @@ namespace BodyTracking.Spatial
             if (!anchorFrozen)
                 return true;
             return resumeLocalizationUntil > 0f && Time.unscaledTime < resumeLocalizationUntil;
+        }
+
+        /// <summary>
+        /// While frozen and idle, periodically reopen localization to MEASURE drift from the locked anchor. The
+        /// measurement itself is taken in <see cref="UpdateLocalizationState"/> when the next fresh fix lands; this
+        /// only opens/closes the localization window. The anchor is never moved.
+        /// </summary>
+        private void MaybeRunDriftCheck()
+        {
+            if (!enableDriftCheck || !anchorFrozen)
+                return;
+
+            if (driftCheckInProgress)
+            {
+                // No fresh fix arrived within the window — give up and retry next interval (let it pause again).
+                if (Time.unscaledTime >= driftCheckDeadline)
+                {
+                    driftCheckInProgress = false;
+                    resumeLocalizationUntil = 0f;
+                    nextDriftCheckTime = Time.unscaledTime + Mathf.Max(2f, driftCheckIntervalSeconds);
+                }
+                return;
+            }
+
+            // Never probe mid-clip (suppressed during record/playback) or before the interval elapses.
+            if (SuppressAutoRealign || Time.unscaledTime < nextDriftCheckTime)
+                return;
+
+            driftCheckInProgress = true;
+            driftCheckDeadline = Time.unscaledTime + Mathf.Max(1f, driftCheckWindowSeconds);
+            // Baseline the success count so the next successful fix during the window registers as "new".
+            lastSuccessCount = GetLocalizationSuccessCount();
+            // Reopen the (possibly paused) session for the measurement window.
+            resumeLocalizationUntil = driftCheckDeadline;
+        }
+
+        /// <summary>
+        /// Record how far the live Immersal fix has drifted from the frozen anchor (measure-only), then close the
+        /// drift-check window so localization can pause again until the next interval.
+        /// </summary>
+        private void RecordDriftEstimate()
+        {
+            if (routeRootObject == null)
+                return;
+
+            Pose target = GetImmersalTargetPose();
+            lastDriftMeters = Vector3.Distance(routeRootObject.transform.position, target.position);
+            lastDriftDegrees = Quaternion.Angle(routeRootObject.transform.rotation, target.rotation);
+            lastDriftCheckTime = Time.unscaledTime;
+            hasDriftEstimate = true;
+
+            driftCheckInProgress = false;
+            resumeLocalizationUntil = 0f; // allow the session to pause again
+            nextDriftCheckTime = Time.unscaledTime + Mathf.Max(2f, driftCheckIntervalSeconds);
+
+            Debug.Log($"[ImmersalRouteRootProvider] Drift check: {lastDriftMeters * 100f:F1} cm / {lastDriftDegrees:F1}°.");
+            OnDriftEstimateChanged?.Invoke();
+        }
+
+        private void ClearDriftEstimate(bool reschedule)
+        {
+            driftCheckInProgress = false;
+            hasDriftEstimate = false;
+            lastDriftMeters = -1f;
+            lastDriftDegrees = -1f;
+            nextDriftCheckTime = reschedule ? Time.unscaledTime + Mathf.Max(2f, driftCheckIntervalSeconds) : 0f;
+            OnDriftEstimateChanged?.Invoke();
         }
 
         /// <summary>
@@ -461,6 +572,10 @@ namespace BodyTracking.Spatial
             }
             lastSuccessCount = successCount;
 
+            // Passive drift check: a fresh fix landed while we were measuring against a frozen anchor.
+            if (newSuccessfulLocalization && anchorFrozen && driftCheckInProgress)
+                RecordDriftEstimate();
+
             if (quality >= minTrackingQuality)
                 stableQualityFrames++;
             else
@@ -546,6 +661,9 @@ namespace BodyTracking.Spatial
             // Drop any open realign window so localization pauses on the next tick (idle heat/battery win).
             resumeLocalizationUntil = 0f;
 
+            // Fresh lock: clear any stale drift estimate and schedule the first passive check.
+            ClearDriftEstimate(reschedule: true);
+
             // Detach from XR Space and hold the localized world pose immediately so recording can start now;
             // the ARAnchor (if enabled) is attached asynchronously and adopts this pose when it arrives.
             routeRootObject.transform.SetParent(null, true);
@@ -591,6 +709,8 @@ namespace BodyTracking.Spatial
                 BeginRealign(mtarget);
                 averagedPose = mtarget;
                 hasAveragedPose = true;
+                // Anchor just snapped to the fresh fix: drop the stale drift estimate and re-measure later.
+                ClearDriftEstimate(reschedule: true);
                 Debug.Log("[ImmersalRouteRootProvider] Manual re-align applied.");
                 return;
             }
@@ -770,6 +890,16 @@ namespace BodyTracking.Spatial
         public bool IsAvailable => false;
         public bool IsLocalized => false;
         public bool IsAnchorFrozen => false;
+
+        public bool DriftCheckSupported => false;
+        public bool HasDriftEstimate => false;
+        public bool DriftCheckInProgress => false;
+        public float LastDriftMeters => -1f;
+        public float LastDriftDegrees => -1f;
+        public float SecondsSinceDriftCheck => -1f;
+#pragma warning disable 67
+        public event Action OnDriftEstimateChanged;
+#pragma warning restore 67
 
         public void RequestRealign() { }
         public void ClearFrozenAnchor() { }

@@ -66,7 +66,9 @@ namespace BodyTracking.UI
         private TextMeshProUGUI currentTimeLabel, totalTimeLabel, recordingNameLabel;
         private Slider scrubSlider;
         private Button prevRecordingButton, nextRecordingButton;
-        private Button realignButton;
+        private Image alignDot;
+        private TextMeshProUGUI alignLabel;
+        private Button alignButton;
         private ImmersalMapSwitcher mapSwitcher;
         private TextMeshProUGUI mapToggleLabel;
         private GameObject mapPanel;
@@ -466,6 +468,20 @@ namespace BodyTracking.UI
             var joints = UIFactory.CreateStatusPill("Pill_Joints", bar, "J: 0", autoSize: false);
             jointsDot = joints.dot; jointsLabel = joints.label;
             SetPillFlex(joints.root, 0.9f);
+
+            // Alignment / drift pill. Shows how far Immersal thinks the locked anchor has drifted (passive
+            // measure-only checks); tap to fully re-scan (clears the anchor and re-localizes). Hidden when
+            // Immersal isn't the active spatial source.
+            var align = UIFactory.CreateStatusPill("Pill_Align", bar, "Align", autoSize: false);
+            alignDot = align.dot; alignLabel = align.label;
+            var alignBg = align.root.GetComponent<Image>();
+            if (alignBg != null) alignBg.raycastTarget = true;
+            alignButton = align.root.gameObject.AddComponent<Button>();
+            alignButton.targetGraphic = alignBg;
+            // No color tint transition so the Button doesn't recolor the pill background (we drive the dot color).
+            alignButton.transition = Selectable.Transition.None;
+            alignButton.onClick.AddListener(OnAlignDotClicked);
+            SetPillFlex(align.root, 1.4f);
         }
 
         private void BuildMoveStatusRow(RectTransform parent)
@@ -548,7 +564,6 @@ namespace BodyTracking.UI
                 return;
 
             BuildMapSwitcher(uiRoot);
-            mapUiBuilt = realignButton != null;
         }
 
         private void BuildMapSwitcher(RectTransform root)
@@ -567,19 +582,8 @@ namespace BodyTracking.UI
             mapSwitcher.OnStatusChanged += OnMapSwitcherStatusChanged;
             mapSwitcher.OnMapSwitched += OnMapSwitched;
 
-            float topY = -(UITokens.Space8 + UITokens.PillHeight * 2f + UITokens.Space4 + 4f);
-            const float mapPillHeight = 34f;
-
-            realignButton = UIFactory.CreatePillButton("ImmersalRetargetRealign", root, "Retarget & align", ghost: true);
-            var realignRect = (RectTransform)realignButton.transform;
-            realignRect.sizeDelta = new Vector2(132f, mapPillHeight);
-            realignRect.anchorMin = new Vector2(0f, 1f);
-            realignRect.anchorMax = new Vector2(0f, 1f);
-            realignRect.pivot = new Vector2(0f, 1f);
-            realignRect.anchoredPosition = new Vector2(UITokens.Space12, topY - 42f);
-            realignButton.onClick.RemoveListener(OnRetargetRealignClicked);
-            realignButton.onClick.AddListener(OnRetargetRealignClicked);
-
+            // Retarget/re-align is now driven by the tappable "Align" status pill in the top bar
+            // (see BuildTopPillsRow / UpdateAlignPill). Nothing else to build here.
             mapUiBuilt = true;
         }
 
@@ -787,10 +791,12 @@ namespace BodyTracking.UI
         private void OnReviewStarted() => UpdateUI();
         private void OnReviewResolved() => UpdateUI();
 
-        private void OnRetargetRealignClicked()
+        private void OnAlignDotClicked()
         {
-            if (controller != null)
-                controller.RetargetAndRealignImmersal();
+            if (controller == null) return;
+            // Full re-scan: clear the frozen anchor and re-localize from scratch.
+            controller.RetargetAndRealignImmersal();
+            UpdateUI();
         }
 
         // ============================================================================================
@@ -880,18 +886,6 @@ namespace BodyTracking.UI
             if (nextRecordingButton != null) nextRecordingButton.interactable = selectorEnabled && availableRecordings.Count > 1;
             if (loadButton != null) loadButton.interactable = selectorEnabled;
 
-            // Retarget/re-align when Immersal is available (including after a map switch, before re-lock).
-            if (realignButton != null)
-            {
-                var immersal = controller.routeRootManager != null
-                    ? controller.routeRootManager.ImmersalProvider
-                    : null;
-                bool immersalActive = immersal != null && immersal.IsAvailable;
-                realignButton.gameObject.SetActive(immersalActive);
-                realignButton.interactable = immersalActive && !isRecording && !isPlaying
-                    && (mapSwitcher == null || !mapSwitcher.IsSwitching);
-            }
-
             if (scrubSlider != null)
                 scrubSlider.interactable = isPlaying;
 
@@ -931,6 +925,70 @@ namespace BodyTracking.UI
             int joints = controller.recorder != null ? controller.recorder.LastTrackedJointCount : 0;
             if (jointsLabel != null) jointsLabel.text = $"J: {joints}";
             if (jointsDot != null) jointsDot.color = joints > 0 ? UITokens.Success : UITokens.Muted;
+
+            UpdateAlignPill();
+        }
+
+        /// <summary>
+        /// Drift/alignment status pill. Reports the passive drift estimate from Immersal (how far the locked
+        /// anchor looks off) and acts as a tap target for a full re-scan. Hidden when Immersal isn't available.
+        /// </summary>
+        private void UpdateAlignPill()
+        {
+            if (alignButton == null) return;
+
+            var immersal = controller != null && controller.routeRootManager != null
+                ? controller.routeRootManager.ImmersalProvider
+                : null;
+            bool available = immersal != null && immersal.IsAvailable;
+            if (alignButton.gameObject.activeSelf != available)
+                alignButton.gameObject.SetActive(available);
+            if (!available)
+                return;
+
+            bool switching = mapSwitcher != null && mapSwitcher.IsSwitching;
+            alignButton.interactable = !controller.IsRecording && !controller.IsPlaying && !switching;
+
+            string label;
+            Color dot;
+
+            if (switching)
+            {
+                label = "Loading…"; dot = UITokens.Primary;
+            }
+            else if (!immersal.IsAnchorFrozen)
+            {
+                label = "Scanning…"; dot = UITokens.Warning;
+            }
+            else if (immersal.DriftCheckInProgress && !immersal.HasDriftEstimate)
+            {
+                label = "Checking…"; dot = UITokens.Primary;
+            }
+            else if (immersal.HasDriftEstimate)
+            {
+                float cm = Mathf.Max(0f, immersal.LastDriftMeters) * 100f;
+                float deg = Mathf.Max(0f, immersal.LastDriftDegrees);
+                dot = DriftColor(immersal.LastDriftMeters, immersal.LastDriftDegrees);
+                if (cm < 1.5f && deg < 2f)
+                    label = "Aligned";
+                else
+                    label = deg >= 4f ? $"Off ~{cm:F0}cm/{deg:F0}\u00B0" : $"Off ~{cm:F0}cm";
+            }
+            else
+            {
+                label = "Aligned"; dot = UITokens.Success;
+            }
+
+            if (alignLabel != null) alignLabel.text = label;
+            if (alignDot != null) alignDot.color = dot;
+        }
+
+        /// <summary>Green within a tight band, amber for a noticeable but usable offset, red beyond that.</summary>
+        private static Color DriftColor(float meters, float degrees)
+        {
+            if (meters < 0.03f && degrees < 3f) return UITokens.Success;
+            if (meters < 0.10f && degrees < 8f) return UITokens.Warning;
+            return UITokens.Danger;
         }
 
         private void UpdateMoveStatusLine()

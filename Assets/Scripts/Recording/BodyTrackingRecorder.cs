@@ -20,6 +20,7 @@ namespace BodyTracking.Recording
         [Header("Recording Settings")]
         [SerializeField] private float targetFrameRate = 30f;
         [SerializeField] private bool showVisualization = false;
+
         // ARKit 3D skeleton: 0=Root, 1=Hips (pelvis center), 2=LeftUpLeg. Use Hips, not LeftUpLeg, so the
         // recorded hip matches Move AI's pelvis Root for fusion alignment.
         [SerializeField] private int preferredHipJointIndex = 1;
@@ -258,8 +259,52 @@ namespace BodyTracking.Recording
                 hipVisualizationSphere.SetActive(false);
             }
 
+            LogRecordedDepthSpread();
+
             OnRecordingComplete?.Invoke(currentRecording);
             return currentRecording;
+        }
+
+        /// <summary>
+        /// Diagnostic: report the recorded RouteRoot-local bounds across the whole clip. The Z (depth, out from
+        /// the wall) spread is the key number — a tiny zSpan means the recorded skeleton genuinely has little
+        /// depth (e.g. ARKit produced near-flat data or the climber was flat against the wall), which is what
+        /// makes the blue review skeleton look "at the same depth". A healthy clip should show several cm to
+        /// tens of cm of zSpan.
+        /// </summary>
+        private void LogRecordedDepthSpread()
+        {
+            if (currentRecording == null || currentRecording.frames == null)
+                return;
+
+            float minX = float.MaxValue, minY = float.MaxValue, minZ = float.MaxValue;
+            float maxX = float.MinValue, maxY = float.MinValue, maxZ = float.MinValue;
+            int samples = 0;
+
+            foreach (var frame in currentRecording.frames)
+            {
+                if (frame.recordedJoints == null) continue;
+                foreach (var j in frame.recordedJoints)
+                {
+                    if (j == null || !j.isTracked) continue;
+                    Vector3 p = j.positionReference;
+                    if (p.x < minX) minX = p.x; if (p.x > maxX) maxX = p.x;
+                    if (p.y < minY) minY = p.y; if (p.y > maxY) maxY = p.y;
+                    if (p.z < minZ) minZ = p.z; if (p.z > maxZ) maxZ = p.z;
+                    samples++;
+                }
+            }
+
+            if (samples == 0)
+            {
+                UnityEngine.Debug.LogWarning("[BodyTrackingRecorder] Recorded 0 tracked joints — nothing to place in space.");
+                return;
+            }
+
+            UnityEngine.Debug.Log(
+                $"[BodyTrackingRecorder] Recorded RouteRoot-local spread over {samples} joint samples: " +
+                $"xSpan={(maxX - minX):F2}m ySpan={(maxY - minY):F2}m zSpan(depth)={(maxZ - minZ):F2}m " +
+                $"(z range {minZ:F2}..{maxZ:F2}). Low zSpan = little real depth in the recording.");
         }
 
         void Update()
@@ -331,7 +376,11 @@ namespace BodyTracking.Recording
 
             if (foundBody)
             {
-                // Store every tracked joint in RouteRoot-local space (raw, no smoothing).
+                // Store every tracked joint in RouteRoot-local space exactly as ARKit reported it (raw, no
+                // smoothing, no depth projection). Preserving the true out-from-wall depth (Z) is what makes the
+                // recorded (blue) review skeleton sit where it was actually recorded instead of flattened onto a
+                // plane. The flat-wall slab prior, when wanted, is applied downstream (WallProjectionResolver on
+                // the fused character at playback), never destructively baked into the source recording.
                 for (int i = 0; i < frameJoints.Count; i++)
                 {
                     var j = frameJoints[i];

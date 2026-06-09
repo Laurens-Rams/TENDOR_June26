@@ -44,6 +44,9 @@ namespace BodyTracking.Spatial
                  "them once the room anchor locks. The dots' renderMode defaults to EditorOnly (invisible on " +
                  "device), so this also forces runtime rendering while scanning.")]
         [SerializeField] private bool showPointCloudWhileScanning = true;
+        [Tooltip("Log point-cloud render state (count, mesh, renderMode, renderer enabled) once per second while " +
+                 "this driver runs. Use to diagnose why the scanning dots aren't visible, then turn off.")]
+        [SerializeField] private bool logPointCloudDiagnostics = true;
 
         [Header("Status sphere placement (camera-relative)")]
         [Tooltip("Local position of the sphere relative to the AR camera (z is metres in front of the lens).")]
@@ -77,6 +80,7 @@ namespace BodyTracking.Spatial
         // (scanning ↔ locked) and don't fight the debug-visuals toggle once scanning is complete.
         bool pointCloudShown;
         bool pointCloudStateKnown;
+        float nextDiagnosticsLogTime;
 
         void Awake()
         {
@@ -116,6 +120,12 @@ namespace BodyTracking.Spatial
             // Point-cloud visibility is independent of the sphere/tint feedback, so drive it even when the rest
             // of the scan visualization is disabled.
             UpdatePointCloudVisibility();
+
+            if (logPointCloudDiagnostics && Time.unscaledTime >= nextDiagnosticsLogTime)
+            {
+                nextDiagnosticsLogTime = Time.unscaledTime + 1f;
+                LogPointCloudDiagnostics();
+            }
 
             if (!showScanVisualization)
             {
@@ -216,6 +226,29 @@ namespace BodyTracking.Spatial
             }
 
             pointCloudShown = show;
+        }
+
+        void LogPointCloudDiagnostics()
+        {
+            int count = cachedVisualizations?.Length ?? 0;
+            int withMesh = 0, runtimeMode = 0, rendererEnabled = 0, totalVerts = 0;
+            if (cachedVisualizations != null)
+            {
+                foreach (var vis in cachedVisualizations)
+                {
+                    if (vis == null) continue;
+                    if (vis.Mesh != null) { withMesh++; totalVerts += vis.Mesh.vertexCount; }
+                    if (vis.renderMode == XRMapVisualization.RenderMode.EditorAndRuntime) runtimeMode++;
+                    var mr = vis.GetComponent<MeshRenderer>();
+                    if (mr != null && mr.enabled) rendererEnabled++;
+                }
+            }
+
+            Debug.Log($"[ImmersalScanViz] cached={count} withMesh={withMesh} verts={totalVerts} " +
+                      $"runtimeMode={runtimeMode} rendererEnabled={rendererEnabled} " +
+                      $"pointCloudVisible={XRMapVisualization.pointCloudVisible} " +
+                      $"scanningComplete={IsScanningComplete()} showWhileScanning={showPointCloudWhileScanning} " +
+                      $"isEditor={Application.isEditor}");
         }
 
         void ResetScanState()

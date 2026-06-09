@@ -169,6 +169,7 @@ namespace BodyTracking.Playback
         {
             enableFloorFix = true,
             floorContactBand = 0.12f,
+            maxStandingHipHeightAboveFloor = 1.3f,
             enableWallHandIK = false,
             enableWallFootIK = false,
             maxIkWeight = 1f,
@@ -183,9 +184,23 @@ namespace BodyTracking.Playback
         [Tooltip("AR surface probe used by the penetration fix. Auto-found if left empty.")]
         [SerializeField] private ARSurfaceProbe surfaceProbe;
 
+        [Header("Wall constraint (flat-wall climbing)")]
+        [Tooltip("Keep the climber pinned to the flat wall: project joints into a thin depth slab (no clipping into / " +
+                 "floating off the wall) and lock hands/feet onto holds while they grip. Exploits the strong priors " +
+                 "of climbing a flat vertical wall, where ARKit's estimated depth is the least reliable axis.")]
+        [SerializeField] private bool enableWallProjection = true;
+        [Tooltip("On playback start, estimate the wall plane from the recording (the climb's closest hand/foot " +
+                 "contacts) and set the wall depth offset automatically. Fixes the case where the RouteRoot origin " +
+                 "(and so the debug wall plane) sits off the physical wall. Turn off to keep a manually-set offset.")]
+        [SerializeField] private bool autoCalibrateWallOnPlay = true;
+        [SerializeField] private WallProjectionSettings wallProjectionSettings = WallProjectionSettings.Default;
+
         // Runtime post-processing helpers (Step 2-4).
         private readonly PosePostProcessor postProcessor = new PosePostProcessor();
         private readonly PosePenetrationResolver penetrationResolver = new PosePenetrationResolver();
+        private readonly WallProjectionResolver wallProjection = new WallProjectionResolver();
+        private WallProjectionResolver.ContactJoint[] contactJointTable = System.Array.Empty<WallProjectionResolver.ContactJoint>();
+        private WallProjectionResolver.WallContact[] lastWallContacts;
         private int[] footWorldIndices = System.Array.Empty<int>();
         private int[] wallContactWorldIndices = System.Array.Empty<int>();
 
@@ -326,6 +341,112 @@ namespace BodyTracking.Playback
             get => penetrationSettings;
             set => penetrationSettings = value;
         }
+        /// <summary>Master switch for the flat-wall depth slab + hold-contact lock (read every frame).</summary>
+        public bool EnableWallProjection
+        {
+            get => enableWallProjection;
+            set => enableWallProjection = value;
+        }
+        /// <summary>Flat-wall depth slab + contact-lock tunables (read every frame).</summary>
+        public WallProjectionSettings WallProjectionSettingsLive
+        {
+            get => wallProjectionSettings;
+            set => wallProjectionSettings = value;
+        }
+        /// <summary>Auto-estimate the wall depth from the recording when playback starts.</summary>
+        public bool AutoCalibrateWallOnPlay
+        {
+            get => autoCalibrateWallOnPlay;
+            set => autoCalibrateWallOnPlay = value;
+        }
+        /// <summary>Per-limb wall-contact state from the last applied frame (null until a frame is applied). For
+        /// debug visualizers that draw which hands/feet are currently locked to a hold.</summary>
+        public WallProjectionResolver.WallContact[] LastWallContacts => lastWallContacts;
+        /// <summary>AR surface probe (wall plane + floor) the player is driving. For debug visualizers.</summary>
+        public ARSurfaceProbe SurfaceProbe => surfaceProbe;
+
+        /// <summary>
+        /// Calibrate the wall plane from the loaded recording (the climbing prior: the wall is where hands/feet get
+        /// closest). Sets both the wall-projection depth offset AND the penetration probe's wall plane so the slab,
+        /// contact lock, IK and debug plane all agree with the real wall — even when the RouteRoot origin does not
+        /// sit on the wall. Safe to call repeatedly. Returns the estimated wall depth (RouteRoot-local Z), or NaN if
+        /// there isn't enough data. Auto-run at <see cref="StartPlayback"/>.
+        /// </summary>
+        /// <summary>
+        /// Resolve the wall plane to use this frame (world point on the surface + outward normal). Prefers the
+        /// AR surface probe (which can return a real AR-detected vertical plane, tilt included); falls back to the
+        /// RouteRoot Z=offset plane. Returns false when neither is available.
+        /// </summary>
+        bool TryGetWallPlane(out Vector3 point, out Vector3 normal)
+        {
+            if (surfaceProbe != null)
+            {
+                if (routeRootProvider != null && routeRootProvider.RouteRoot != null)
+                    surfaceProbe.SetRouteRoot(routeRootProvider.RouteRoot);
+                if (surfaceProbe.TryGetWallPlane(out point, out normal))
+                    return true;
+            }
+
+            if (routeRootProvider != null && routeRootProvider.RouteRoot != null)
+            {
+                Transform rr = routeRootProvider.RouteRoot;
+                normal = rr.forward;
+                point = rr.position + normal * wallProjectionSettings.wallDepthOffset;
+                return true;
+            }
+
+            point = Vector3.zero;
+            normal = Vector3.forward;
+            return false;
+        }
+
+        /// <summary>
+        /// Detect ARKit's front-facing vertical wall plane and use it as the wall (real position + tilt). Sets the
+        /// probe to AR-plane mode on success. Returns true if a wall plane was found. Needs the AR camera.
+        /// </summary>
+        public bool CalibrateWallFromArPlane()
+        {
+            if (surfaceProbe == null)
+            {
+                Debug.LogWarning("[FusedCharacterPlayer] No ARSurfaceProbe — can't calibrate wall from an AR plane.");
+                return false;
+            }
+            if (routeRootProvider != null && routeRootProvider.RouteRoot != null)
+                surfaceProbe.SetRouteRoot(routeRootProvider.RouteRoot);
+
+            Transform cam = Globals.CameraManager != null ? Globals.CameraManager.transform
+                : (Camera.main != null ? Camera.main.transform : null);
+            if (!surfaceProbe.TryCalibrateWallFromArPlane(cam))
+            {
+                Debug.LogWarning("[FusedCharacterPlayer] No front-facing AR vertical plane detected yet — point the phone at the wall and wait for tracking.");
+                return false;
+            }
+
+            surfaceProbe.WallSource = ARSurfaceProbe.WallSourceMode.ARVerticalPlane;
+            wallProjectionSettings.wallDepthOffset = surfaceProbe.WallLocalZOffset;
+            return true;
+        }
+
+        public float AutoCalibrateWallDepth()
+        {
+            if (!WallProjectionResolver.TryEstimateWallDepth(recording, out float wallDepth))
+            {
+                Debug.LogWarning("[FusedCharacterPlayer] Auto wall calibration skipped — not enough tracked joints in the recording.");
+                return float.NaN;
+            }
+
+            wallProjectionSettings.wallDepthOffset = wallDepth;
+            if (surfaceProbe != null)
+                surfaceProbe.WallLocalZOffset = wallDepth;
+
+            Debug.Log($"[FusedCharacterPlayer] Auto-calibrated wall plane to RouteRoot-local Z = {wallDepth:F3} m " +
+                      "(estimated from the climb's closest hand/foot contacts).");
+            return wallDepth;
+        }
+        /// <summary>RouteRoot provider supplying the live wall frame. For debug visualizers / status HUD.</summary>
+        public IRouteRootProvider RouteRootProvider => routeRootProvider;
+        /// <summary>True while a recording is actively playing back.</summary>
+        public bool IsPlayingBack => isPlaying;
         public void SetInvertFacing(bool value)
         {
             if (invertFacing == value) return;
@@ -710,6 +831,9 @@ namespace BodyTracking.Playback
             loggedPlacement = false;
             anchorState = default;
             postProcessor.Reset();
+            wallProjection.Reset();
+            if (autoCalibrateWallOnPlay && enableWallProjection)
+                AutoCalibrateWallDepth();
             RefreshGlbPostProcess();
             glbSource?.ResetSmoothing();
             pendingPosedHeightRefit = glbActive;
@@ -891,6 +1015,22 @@ namespace BodyTracking.Playback
                 // #endregion
             }
 
+            // Flat-wall constraint: clamp every joint into the wall depth slab (no clipping in / floating off) and
+            // lock hands/feet that are gripping holds onto the wall surface. Runs on the shared world array so both
+            // the procedural and GLB paths inherit it; the per-limb contacts also drive a rig-IK contact pass below.
+            lastWallContacts = null;
+            if (enableWallProjection && TryGetWallPlane(out Vector3 wallPoint, out Vector3 wallNormal))
+            {
+                // #region agent log
+                PerfSampler.Begin("WallProjection");
+                // #endregion
+                wallProjection.ProjectIntoSlab(world, wallPoint, wallNormal, wallProjectionSettings);
+                lastWallContacts = wallProjection.ResolveContacts(world, contactJointTable, wallPoint, wallNormal, Time.deltaTime, wallProjectionSettings);
+                // #region agent log
+                PerfSampler.End("WallProjection");
+                // #endregion
+            }
+
             // GLB articulation path: body + fingers come from the Move GLB (muscle space); positioning + facing
             // still come from the fused world joints above. Returns early so the procedural bone solver is skipped.
             if (glbActive && ApplyGlbFrame(t, world, effectiveFacingLocal))
@@ -943,6 +1083,10 @@ namespace BodyTracking.Playback
                 PerfSampler.End("Penetration.Limbs");
                 // #endregion
             }
+
+            // Pull any gripping hand/foot onto its locked hold.
+            if (enableWallProjection && lastWallContacts != null)
+                penetrationResolver.ResolveContactLimbs(characterAnimator, lastWallContacts, jumping, penetrationSettings);
             // #region agent log
             PerfSampler.End("Frame.ApplyFrame");
             // #endregion
@@ -995,6 +1139,10 @@ namespace BodyTracking.Playback
                 PerfSampler.End("Penetration.Limbs");
                 // #endregion
             }
+
+            // Pull any gripping hand/foot onto its locked hold (works in GLB muscle space too).
+            if (enableWallProjection && lastWallContacts != null)
+                penetrationResolver.ResolveContactLimbs(characterAnimator, lastWallContacts, postProcessor.LastJumping, penetrationSettings);
 
             if (!loggedPlacement)
             {
@@ -2066,11 +2214,32 @@ namespace BodyTracking.Playback
             footWorldIndices = feet.ToArray();
             wallContactWorldIndices = wallContacts.ToArray();
 
+            // Map each limb tip to its world-joint index for the wall-contact lock (wrist/ankle, with toe/hand fallbacks).
+            contactJointTable = new[]
+            {
+                new WallProjectionResolver.ContactJoint { limb = WallProjectionResolver.ClimbLimb.LeftHand, worldIndex = FirstJointIndex(pose, "Left_wrist", "Left_hand") },
+                new WallProjectionResolver.ContactJoint { limb = WallProjectionResolver.ClimbLimb.RightHand, worldIndex = FirstJointIndex(pose, "Right_wrist", "Right_hand") },
+                new WallProjectionResolver.ContactJoint { limb = WallProjectionResolver.ClimbLimb.LeftFoot, worldIndex = FirstJointIndex(pose, "Left_toe", "Left_ankle") },
+                new WallProjectionResolver.ContactJoint { limb = WallProjectionResolver.ClimbLimb.RightFoot, worldIndex = FirstJointIndex(pose, "Right_toe", "Right_ankle") },
+            };
+            wallProjection.Reset();
+
             if (surfaceProbe == null)
                 surfaceProbe = FindAnyObjectByType<ARSurfaceProbe>();
             penetrationResolver.SetProbe(surfaceProbe);
             if (surfaceProbe != null && routeRootProvider != null && routeRootProvider.RouteRoot != null)
                 surfaceProbe.SetRouteRoot(routeRootProvider.RouteRoot);
+        }
+
+        /// <summary>First matching joint index for the given names, or -1 when none are present in the pose.</summary>
+        static int FirstJointIndex(MoveMotion pose, params string[] names)
+        {
+            foreach (var n in names)
+            {
+                int idx = pose.IndexOfJoint(n);
+                if (idx >= 0) return idx;
+            }
+            return -1;
         }
 
         static Transform FindBone(Dictionary<string, Transform> byName, string boneName)
