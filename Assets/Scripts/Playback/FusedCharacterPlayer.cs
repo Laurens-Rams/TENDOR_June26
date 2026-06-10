@@ -177,12 +177,11 @@ namespace BodyTracking.Playback
                  "re-anchor to a far pelvis) and allowed through 1:1 so the body recovers instead of crawling. Keep " +
                  "above the largest legitimate per-frame move but below a full across-the-wall jump. 0 = always clamp.")]
         [SerializeField] private float rootTeleportSnapDistance = 1.25f;
-        [Tooltip("Top turn rate (deg/s) the character's FACING may change at. Smooths out sudden body spins from a " +
-                 "noisy/flipped facing without lagging a normal climb turn. 0 = no rotation clamp.")]
-        [SerializeField] private float maxRootTurnSpeed = 540f;
-        [Tooltip("A single-frame facing change larger than this (deg) is treated as a genuine re-facing (loop wrap) " +
-                 "and allowed through 1:1 so it recovers instead of slowly spinning. 0 = always clamp.")]
-        [SerializeField] private float rootTurnSnapDegrees = 135f;
+        [Tooltip("Smoothing time constant (s) for the character's FACING — it eases toward the orange skeleton's facing " +
+                 "so a quick/noisy turn glides smoothly instead of popping. This is an exponential ease (no rate cap, " +
+                 "no snap), so it tracks the turn with only a tiny constant lag and can never lag-then-snap. Smaller = " +
+                 "snappier/closer to the skeleton, larger = smoother/more lag. 0 = facing follows the skeleton exactly.")]
+        [SerializeField] private float rootTurnSmoothingSeconds = 0.12f;
         [Tooltip("Master switch for wall/floor penetration correction + closest-hand IK (Step 4). On by default with " +
                  "feet-on-floor only (wall IK stays off) to complement Move GLB root motion.")]
         [SerializeField] private bool enablePenetrationFix = true;
@@ -196,6 +195,9 @@ namespace BodyTracking.Playback
             enableWallFootIK = false,
             maxIkWeight = 1f,
             penetrationForFullWeight = 0.08f,
+            preserveFootRotation = true,
+            capFootBend = true,
+            minFootShinAngleDeg = 50f,
             enableWholeBodyPush = false,
             minWholeBodyPenetration = 0.04f,
             wholeBodyPenetrationFraction = 0.9188983f,
@@ -384,17 +386,11 @@ namespace BodyTracking.Playback
             get => rootTeleportSnapDistance;
             set => rootTeleportSnapDistance = Mathf.Max(0f, value);
         }
-        /// <summary>Top turn rate (deg/s) the character facing may change at (anti body-spin). 0 = no clamp.</summary>
-        public float MaxRootTurnSpeed
+        /// <summary>Facing smoothing time constant (s); eases the character's turn toward the orange skeleton. 0 = exact.</summary>
+        public float RootTurnSmoothingSeconds
         {
-            get => maxRootTurnSpeed;
-            set => maxRootTurnSpeed = Mathf.Max(0f, value);
-        }
-        /// <summary>Single-frame facing change (deg) above which a turn is treated as a genuine re-facing and passed 1:1.</summary>
-        public float RootTurnSnapDegrees
-        {
-            get => rootTurnSnapDegrees;
-            set => rootTurnSnapDegrees = Mathf.Max(0f, value);
+            get => rootTurnSmoothingSeconds;
+            set => rootTurnSmoothingSeconds = Mathf.Max(0f, value);
         }
         public bool EnablePenetrationFix
         {
@@ -656,6 +652,7 @@ namespace BodyTracking.Playback
             var a = anchorSettings;
             var pp = postProcessSettings;
             var pen = penetrationSettings;
+            var wall = wallProjectionSettings;
             var bake = Object.FindFirstObjectByType<MoveAIFusionCoordinator>()?.BakeSettings
                        ?? MoveAIFusionBaker.Settings.Default;
 
@@ -690,22 +687,51 @@ namespace BodyTracking.Playback
             sb.AppendLine("  enableRootMotionGuard: " + YBool(enableRootMotionGuard));
             sb.AppendLine("  maxRootSpeed: " + YFloat(maxRootSpeed));
             sb.AppendLine("  rootTeleportSnapDistance: " + YFloat(rootTeleportSnapDistance));
-            sb.AppendLine("  maxRootTurnSpeed: " + YFloat(maxRootTurnSpeed));
-            sb.AppendLine("  rootTurnSnapDegrees: " + YFloat(rootTurnSnapDegrees));
+            sb.AppendLine("  rootTurnSmoothingSeconds: " + YFloat(rootTurnSmoothingSeconds));
             sb.AppendLine("  enablePenetrationFix: " + YBool(enablePenetrationFix));
             sb.AppendLine("  penetrationSettings:");
             sb.AppendLine("    enableFloorFix: " + YBool(pen.enableFloorFix));
             sb.AppendLine("    floorContactBand: " + YFloat(pen.floorContactBand));
+            sb.AppendLine("    maxStandingHipHeightAboveFloor: " + YFloat(pen.maxStandingHipHeightAboveFloor));
+            sb.AppendLine("    maxFloorSnapMeters: " + YFloat(pen.maxFloorSnapMeters));
             sb.AppendLine("    enableWallHandIK: " + YBool(pen.enableWallHandIK));
             sb.AppendLine("    enableWallFootIK: " + YBool(pen.enableWallFootIK));
             sb.AppendLine("    maxIkWeight: " + YFloat(pen.maxIkWeight));
             sb.AppendLine("    penetrationForFullWeight: " + YFloat(pen.penetrationForFullWeight));
+            sb.AppendLine("    preserveFootRotation: " + YBool(pen.preserveFootRotation));
+            sb.AppendLine("    capFootBend: " + YBool(pen.capFootBend));
+            sb.AppendLine("    minFootShinAngleDeg: " + YFloat(pen.minFootShinAngleDeg));
             sb.AppendLine("    enableWholeBodyPush: " + YBool(pen.enableWholeBodyPush));
             sb.AppendLine("    minWholeBodyPenetration: " + YFloat(pen.minWholeBodyPenetration));
             sb.AppendLine("    wholeBodyPenetrationFraction: " + YFloat(pen.wholeBodyPenetrationFraction));
             sb.AppendLine("    maxWholeBodyPushMeters: " + YFloat(pen.maxWholeBodyPushMeters));
             sb.AppendLine("    skipDuringJump: " + YBool(pen.skipDuringJump));
             sb.AppendLine("    debugDraw: " + YBool(pen.debugDraw));
+            sb.AppendLine("  enableWallProjection: " + YBool(enableWallProjection));
+            sb.AppendLine("  autoCalibrateWallOnPlay: " + YBool(autoCalibrateWallOnPlay));
+            sb.AppendLine("  wallProjectionSettings:");
+            sb.AppendLine("    enableSlabClamp: " + YBool(wall.enableSlabClamp));
+            sb.AppendLine("    wallDepthOffset: " + YFloat(wall.wallDepthOffset));
+            sb.AppendLine("    wallSurfaceDepth: " + YFloat(wall.wallSurfaceDepth));
+            sb.AppendLine("    maxBodyDepth: " + YFloat(wall.maxBodyDepth));
+            sb.AppendLine("    enableContactLock: " + YBool(wall.enableContactLock));
+            sb.AppendLine("    snapWorldJoints: " + YBool(wall.snapWorldJoints));
+            sb.AppendLine("    contactDepthBand: " + YFloat(wall.contactDepthBand));
+            sb.AppendLine("    contactEaseSeconds: " + YFloat(wall.contactEaseSeconds));
+            sb.AppendLine("    maxContactWeight: " + YFloat(wall.maxContactWeight));
+            sb.AppendLine("    enableWalkAwayRelease: " + YBool(wall.enableWalkAwayRelease));
+            sb.AppendLine("    wallReleaseDepth: " + YFloat(wall.wallReleaseDepth));
+            sb.AppendLine("    wallReengageDepth: " + YFloat(wall.wallReengageDepth));
+            sb.AppendLine("    wallEngageEaseSeconds: " + YFloat(wall.wallEngageEaseSeconds));
+            sb.AppendLine("    enableFloorStandRelease: " + YBool(wall.enableFloorStandRelease));
+            sb.AppendLine("    enableHoldDetection: " + YBool(wall.enableHoldDetection));
+            sb.AppendLine("    contactStillnessSpeed: " + YFloat(wall.contactStillnessSpeed));
+            sb.AppendLine("    contactReleaseSpeed: " + YFloat(wall.contactReleaseSpeed));
+            sb.AppendLine("    holdDwellSeconds: " + YFloat(wall.holdDwellSeconds));
+            sb.AppendLine("    holdMergeRadius: " + YFloat(wall.holdMergeRadius));
+            sb.AppendLine("    holdDetectionDepthBand: " + YFloat(wall.holdDetectionDepthBand));
+            sb.AppendLine("    holdFloorExclusionBand: " + YFloat(wall.holdFloorExclusionBand));
+            sb.AppendLine("    holdSnapRadius: " + YFloat(wall.holdSnapRadius));
             sb.AppendLine("  heightFitMode: " + (int)heightFitMode + "  # " + heightFitMode);
             sb.AppendLine("  skeletonFitScale: " + YFloat(skeletonFitScale));
             sb.AppendLine("--- MoveAIFusionCoordinator (fusion bake) ---");
@@ -1296,6 +1322,8 @@ namespace BodyTracking.Playback
             if (enableWallProjection && lastWallValid)
                 penetrationResolver.ResolveContactPlane(characterAnimator, lastWallContacts, lastWallPoint, lastWallNormal,
                     wallProjectionSettings.wallSurfaceDepth, jumping, penetrationSettings);
+            // Final foot safety net: cap an over-bent (dorsiflexed) ankle from a bad Move AI frame.
+            penetrationResolver.ClampFootBend(characterAnimator, penetrationSettings);
             // #region agent log
             PerfSampler.End("Frame.ApplyFrame");
             // #endregion
@@ -1357,6 +1385,8 @@ namespace BodyTracking.Playback
             if (enableWallProjection && lastWallValid)
                 penetrationResolver.ResolveContactPlane(characterAnimator, lastWallContacts, lastWallPoint, lastWallNormal,
                     wallProjectionSettings.wallSurfaceDepth, postProcessor.LastJumping, penetrationSettings);
+            // Final foot safety net: cap an over-bent (dorsiflexed) ankle from a bad Move AI frame.
+            penetrationResolver.ClampFootBend(characterAnimator, penetrationSettings);
 
             if (!loggedPlacement)
             {
@@ -1441,12 +1471,14 @@ namespace BodyTracking.Playback
             hasLastRootLocalRot = false;
         }
 
-        /// <summary>Cap how fast the character's facing can turn per frame so a noisy/flipped facing can't snap the
-        /// whole body around. Worked in RouteRoot-local space (like the position clamp) so turning the phone is never
-        /// clamped. A jump beyond rootTurnSnapDegrees (loop wrap / genuine re-facing) is allowed through 1:1.</summary>
+        /// <summary>Ease the character's facing toward the target each frame (exponential smoothing toward the orange
+        /// skeleton's facing) so a quick or noisy turn glides instead of popping — WITHOUT a rate cap or snap, which
+        /// would make the body lag a fast turn and then jump to catch up. Worked in RouteRoot-local space so turning
+        /// the phone passes through 1:1; only the body's own facing change is smoothed. Steady-state lag is tiny
+        /// (~turnRate · rootTurnSmoothingSeconds) and the gap can never accumulate into a snap.</summary>
         Quaternion ClampRootRotation(Quaternion targetWorld)
         {
-            if (!enableRootMotionGuard || maxRootTurnSpeed <= 0f)
+            if (rootTurnSmoothingSeconds <= 0f)
                 return targetWorld;
 
             Quaternion targetLocal = Quaternion.Inverse(referenceFrame.rotation) * targetWorld;
@@ -1457,20 +1489,9 @@ namespace BodyTracking.Playback
                 return targetWorld;
             }
 
-            float ang = Quaternion.Angle(lastRootLocalRot, targetLocal);
-            if (rootTurnSnapDegrees > 0f && ang > rootTurnSnapDegrees)
-            {
-                lastRootLocalRot = targetLocal;
-                return targetWorld;
-            }
-
-            float dt = Mathf.Max(1e-4f, Time.deltaTime) * Mathf.Max(0.01f, playbackSpeed);
-            float maxDeg = maxRootTurnSpeed * dt;
-            if (maxDeg > 0f && ang > maxDeg)
-                targetLocal = Quaternion.RotateTowards(lastRootLocalRot, targetLocal, maxDeg);
-
-            lastRootLocalRot = targetLocal;
-            return referenceFrame.rotation * targetLocal;
+            float w = 1f - Mathf.Exp(-Mathf.Max(1e-4f, Time.deltaTime) / rootTurnSmoothingSeconds);
+            lastRootLocalRot = Quaternion.Slerp(lastRootLocalRot, targetLocal, w);
+            return referenceFrame.rotation * lastRootLocalRot;
         }
 
         Vector3 ClampRootMotion(Vector3 targetWorld)

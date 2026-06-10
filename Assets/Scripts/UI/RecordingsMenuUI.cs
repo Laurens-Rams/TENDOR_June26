@@ -545,11 +545,6 @@ namespace BodyTracking.UI
         {
             SyncMapInput();
             UpdateMapHeaderLabel();
-
-            // New map -> reload its latest recording (legacy default) and rebuild the selectable list.
-            var c = Controller();
-            if (c != null)
-                c.LoadLatestRecording();
             RefreshFromStorage();
             RebuildRows();
         }

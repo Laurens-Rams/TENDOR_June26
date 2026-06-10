@@ -564,6 +564,9 @@ namespace BodyTracking.UI
             AddButton("Re-align Immersal map", () => Controller()?.RealignToImmersal());
             AddButton("Retarget & re-align Immersal", () => Controller()?.RetargetAndRealignImmersal());
 
+            AddSection("Settings snapshot");
+            AddButton("Log settings to Xcode (copy)", () => p.LogTuningSnapshotForCopy());
+
             AddSection("Debug view");
             var dbg = EnsureDebugVisuals();
             AddToggle("Skeleton & AR debug overlay", () => dbg.VisualsVisible, v => dbg.SetVisible(v));
@@ -669,9 +672,6 @@ namespace BodyTracking.UI
         {
             SyncMapInput();
             RefreshMapStatusLabel();
-            var c = Controller();
-            if (c != null)
-                c.LoadLatestRecording();
             if (activeCategory == TuningCategory.General)
                 RebuildRows();
         }
@@ -805,12 +805,18 @@ namespace BodyTracking.UI
                 v => { var s = p.PenetrationSettingsLive; s.minWholeBodyPenetration = v; p.PenetrationSettingsLive = s; }, "0.000");
             AddSlider("Whole-body contact fraction", 0f, 1f, () => p.PenetrationSettingsLive.wholeBodyPenetrationFraction,
                 v => { var s = p.PenetrationSettingsLive; s.wholeBodyPenetrationFraction = v; p.PenetrationSettingsLive = s; }, "0.00");
-            AddSlider("Max whole-body push (m)", 0.02f, 0.3f, () => p.PenetrationSettingsLive.maxWholeBodyPushMeters,
+            AddSlider("Max whole-body push (m)", 0.02f, 1f, () => p.PenetrationSettingsLive.maxWholeBodyPushMeters,
                 v => { var s = p.PenetrationSettingsLive; s.maxWholeBodyPushMeters = v; p.PenetrationSettingsLive = s; }, "0.000");
             AddSlider("Max IK weight", 0f, 1f, () => p.PenetrationSettingsLive.maxIkWeight,
                 v => { var s = p.PenetrationSettingsLive; s.maxIkWeight = v; p.PenetrationSettingsLive = s; }, "0.00");
             AddSlider("Penetration for full weight (m)", 0.02f, 0.2f, () => p.PenetrationSettingsLive.penetrationForFullWeight,
                 v => { var s = p.PenetrationSettingsLive; s.penetrationForFullWeight = v; p.PenetrationSettingsLive = s; }, "0.000");
+            AddToggle("Keep recorded foot rotation", () => p.PenetrationSettingsLive.preserveFootRotation,
+                v => { var s = p.PenetrationSettingsLive; s.preserveFootRotation = v; p.PenetrationSettingsLive = s; });
+            AddToggle("Cap foot up-bend", () => p.PenetrationSettingsLive.capFootBend,
+                v => { var s = p.PenetrationSettingsLive; s.capFootBend = v; p.PenetrationSettingsLive = s; });
+            AddSlider("Min foot-shin angle (deg)", 30f, 90f, () => p.PenetrationSettingsLive.minFootShinAngleDeg,
+                v => { var s = p.PenetrationSettingsLive; s.minFootShinAngleDeg = v; p.PenetrationSettingsLive = s; }, "0");
             AddToggle("Skip during jump", () => p.PenetrationSettingsLive.skipDuringJump,
                 v => { var s = p.PenetrationSettingsLive; s.skipDuringJump = v; p.PenetrationSettingsLive = s; });
             AddToggle("Debug draw", () => p.PenetrationSettingsLive.debugDraw,
@@ -855,8 +861,7 @@ namespace BodyTracking.UI
             AddSlider("Max root speed (m/s)", 1f, 20f, () => p.MaxRootSpeed, v => p.MaxRootSpeed = v, "0.0");
             AddSlider("Teleport snap distance (m)", 0.3f, 3f, () => p.RootTeleportSnapDistance,
                 v => p.RootTeleportSnapDistance = v, "0.00");
-            AddSlider("Max turn speed (deg/s)", 90f, 1080f, () => p.MaxRootTurnSpeed, v => p.MaxRootTurnSpeed = v, "0");
-            AddSlider("Turn snap (deg)", 30f, 180f, () => p.RootTurnSnapDegrees, v => p.RootTurnSnapDegrees = v, "0");
+            AddSlider("Turn smoothing (s)", 0f, 0.6f, () => p.RootTurnSmoothingSeconds, v => p.RootTurnSmoothingSeconds = v, "0.00");
         }
 
         /// <summary>Movement, anchor, fit, face, fusion bake.</summary>

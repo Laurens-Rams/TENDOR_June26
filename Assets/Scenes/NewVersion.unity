@@ -10467,8 +10467,7 @@ MonoBehaviour:
   enableRootMotionGuard: 1
   maxRootSpeed: 6
   rootTeleportSnapDistance: 1.25
-  maxRootTurnSpeed: 540
-  rootTurnSnapDegrees: 135
+  rootTurnSmoothingSeconds: 0.12
   enablePenetrationFix: 1
   penetrationSettings:
     enableFloorFix: 1
@@ -10479,10 +10478,13 @@ MonoBehaviour:
     enableWallFootIK: 1
     maxIkWeight: 1
     penetrationForFullWeight: 0.08
-    enableWholeBodyPush: 0
+    preserveFootRotation: 1
+    capFootBend: 1
+    minFootShinAngleDeg: 50
+    enableWholeBodyPush: 1
     minWholeBodyPenetration: 0.04
-    wholeBodyPenetrationFraction: 0.9188983
-    maxWholeBodyPushMeters: 0.12
+    wholeBodyPenetrationFraction: 0.5
+    maxWholeBodyPushMeters: 0.5
     skipDuringJump: 0
     debugDraw: 0
   surfaceProbe: {fileID: 1834499786}

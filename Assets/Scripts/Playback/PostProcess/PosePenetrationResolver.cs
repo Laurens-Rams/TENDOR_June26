@@ -29,6 +29,20 @@ namespace BodyTracking.Playback.PostProcess
         [Range(0f, 1f)] public float maxIkWeight;
         [Tooltip("Penetration depth (m) that maps to full IK weight; shallower clips get a gentler nudge.")]
         public float penetrationForFullWeight;
+        [Tooltip("Keep each ankle at its RECORDED joint angle when the wall foot-IK runs: the leg still swings so the " +
+                 "foot reaches the wall, but the ankle's bend (foot relative to the shin) is restored afterwards so the " +
+                 "IK can't crank the foot into an extreme up/flat bend. Turn off for the legacy behaviour.")]
+        public bool preserveFootRotation;
+
+        [Header("Foot bend cap (bad Move AI feet)")]
+        [Tooltip("Cap how far the ankle may bend UPWARD (dorsiflexion, toes toward the shin) so a bad Move AI foot " +
+                 "frame can't fold the foot flat against the leg — while still allowing a realistic amount. Geometric " +
+                 "and rig-agnostic; runs after the pose + IK as the final word on the foot.")]
+        public bool capFootBend;
+        [Tooltip("Minimum allowed knee->ankle->toe angle (deg). The foot is bent UP when this angle is small; below " +
+                 "this it is opened back to the limit. ~90 deg is a neutral standing foot, real dorsiflexion reaches " +
+                 "~65-70 deg, so ~50 deg allows genuine bend but blocks an impossible fold. Lower = more bend allowed.")]
+        public float minFootShinAngleDeg;
 
         [Header("Whole-body fallback (opt-in)")]
         [Tooltip("Push the entire skeleton out along the wall normal when many hands/feet are deep in the wall. " +
@@ -59,6 +73,9 @@ namespace BodyTracking.Playback.PostProcess
             enableWallFootIK = true,
             maxIkWeight = 1f,
             penetrationForFullWeight = 0.08f,
+            preserveFootRotation = true,
+            capFootBend = true,
+            minFootShinAngleDeg = 50f,
             enableWholeBodyPush = false,
             minWholeBodyPenetration = 0.04f,
             wholeBodyPenetrationFraction = 0.75f,
@@ -206,9 +223,10 @@ namespace BodyTracking.Playback.PostProcess
             if (s.enableWallFootIK)
             {
                 // Effector is the TOE (front of the shoe) — that's what touches the wall in climbing — falling back to
-                // the ankle only on rigs with no toe bone.
-                SolveLimbToWall(animator, HumanBodyBones.LeftUpperLeg, HumanBodyBones.LeftLowerLeg, FootTip(animator, HumanBodyBones.LeftToes, HumanBodyBones.LeftFoot), s);
-                SolveLimbToWall(animator, HumanBodyBones.RightUpperLeg, HumanBodyBones.RightLowerLeg, FootTip(animator, HumanBodyBones.RightToes, HumanBodyBones.RightFoot), s);
+                // the ankle only on rigs with no toe bone. The ankle is restored to its recorded orientation after the
+                // solve (preserveFootRotation) so pinning the foot to the wall doesn't twist it flat.
+                SolveLimbToWall(animator, HumanBodyBones.LeftUpperLeg, HumanBodyBones.LeftLowerLeg, FootTip(animator, HumanBodyBones.LeftToes, HumanBodyBones.LeftFoot), s, PreserveFootBone(animator, HumanBodyBones.LeftFoot, s));
+                SolveLimbToWall(animator, HumanBodyBones.RightUpperLeg, HumanBodyBones.RightLowerLeg, FootTip(animator, HumanBodyBones.RightToes, HumanBodyBones.RightFoot), s, PreserveFootBone(animator, HumanBodyBones.RightFoot, s));
             }
         }
 
@@ -236,10 +254,10 @@ namespace BodyTracking.Playback.PostProcess
                         PinLimb(animator, HumanBodyBones.RightUpperArm, HumanBodyBones.RightLowerArm, HumanBodyBones.RightHand, c.targetWorld, c.weight);
                         break;
                     case WallProjectionResolver.ClimbLimb.LeftFoot:
-                        PinLimb(animator, HumanBodyBones.LeftUpperLeg, HumanBodyBones.LeftLowerLeg, FootTip(animator, HumanBodyBones.LeftToes, HumanBodyBones.LeftFoot), c.targetWorld, c.weight);
+                        PinLimb(animator, HumanBodyBones.LeftUpperLeg, HumanBodyBones.LeftLowerLeg, FootTip(animator, HumanBodyBones.LeftToes, HumanBodyBones.LeftFoot), c.targetWorld, c.weight, PreserveFootBone(animator, HumanBodyBones.LeftFoot, s));
                         break;
                     case WallProjectionResolver.ClimbLimb.RightFoot:
-                        PinLimb(animator, HumanBodyBones.RightUpperLeg, HumanBodyBones.RightLowerLeg, FootTip(animator, HumanBodyBones.RightToes, HumanBodyBones.RightFoot), c.targetWorld, c.weight);
+                        PinLimb(animator, HumanBodyBones.RightUpperLeg, HumanBodyBones.RightLowerLeg, FootTip(animator, HumanBodyBones.RightToes, HumanBodyBones.RightFoot), c.targetWorld, c.weight, PreserveFootBone(animator, HumanBodyBones.RightFoot, s));
                         break;
                 }
             }
@@ -278,16 +296,17 @@ namespace BodyTracking.Playback.PostProcess
             {
                 PushTipToPlane(animator, WallProjectionResolver.ClimbLimb.LeftFoot, holdContacts,
                     HumanBodyBones.LeftUpperLeg, HumanBodyBones.LeftLowerLeg, FootTip(animator, HumanBodyBones.LeftToes, HumanBodyBones.LeftFoot),
-                    wallPoint, wallNormal, surfaceDepth, s);
+                    wallPoint, wallNormal, surfaceDepth, s, PreserveFootBone(animator, HumanBodyBones.LeftFoot, s));
                 PushTipToPlane(animator, WallProjectionResolver.ClimbLimb.RightFoot, holdContacts,
                     HumanBodyBones.RightUpperLeg, HumanBodyBones.RightLowerLeg, FootTip(animator, HumanBodyBones.RightToes, HumanBodyBones.RightFoot),
-                    wallPoint, wallNormal, surfaceDepth, s);
+                    wallPoint, wallNormal, surfaceDepth, s, PreserveFootBone(animator, HumanBodyBones.RightFoot, s));
             }
         }
 
         void PushTipToPlane(Animator animator, WallProjectionResolver.ClimbLimb limb,
             WallProjectionResolver.WallContact[] holdContacts, HumanBodyBones rootBone, HumanBodyBones midBone,
-            HumanBodyBones tipBone, Vector3 wallPoint, Vector3 wallNormal, float surfaceDepth, in PenetrationSettings s)
+            HumanBodyBones tipBone, Vector3 wallPoint, Vector3 wallNormal, float surfaceDepth, in PenetrationSettings s,
+            Transform preserveBone = null)
         {
             int li = (int)limb;
             // A limb anchored to a hold is already being pinned to the surface by the hold pass — leave it alone.
@@ -321,7 +340,11 @@ namespace BodyTracking.Playback.PostProcess
                 Debug.DrawRay(target, wallNormal * 0.1f, Color.yellow);
             }
 
+            // Keep the ankle at its RECORDED joint angle (local rotation relative to the shin). Restoring the foot's
+            // WORLD rotation instead would fight the shin's IK swing and crank the ankle into an extreme bend.
+            Quaternion preserveLocal = preserveBone != null ? preserveBone.localRotation : Quaternion.identity;
             LimbIKSolver.Solve(root, mid, tip, target, weight, hint);
+            if (preserveBone != null) preserveBone.localRotation = preserveLocal;
 
             // Re-measure after the solve: if the tip reached the skin it's a clean push-out (yellow); if it still
             // can't reach (limb too short / weight capped) flag it inside (red) so it's visible in the overlay.
@@ -339,7 +362,50 @@ namespace BodyTracking.Playback.PostProcess
         static HumanBodyBones FootTip(Animator animator, HumanBodyBones toes, HumanBodyBones foot)
             => animator.GetBoneTransform(toes) != null ? toes : foot;
 
-        void PinLimb(Animator animator, HumanBodyBones rootBone, HumanBodyBones midBone, HumanBodyBones tipBone, Vector3 target, float weight)
+        // The ankle bone to restore after a foot-IK solve (so it keeps its recorded orientation), or null when foot
+        // preservation is off / the bone isn't mapped.
+        static Transform PreserveFootBone(Animator animator, HumanBodyBones foot, in PenetrationSettings s)
+            => s.preserveFootRotation ? animator.GetBoneTransform(foot) : null;
+
+        /// <summary>
+        /// Cap how far each ankle is bent UPWARD (dorsiflexed) so a bad Move AI foot frame can't fold the foot flat
+        /// against the shin, while still allowing a realistic range. Purely geometric (rig-agnostic): it measures the
+        /// knee->ankle->toe angle and, when that angle is smaller than <see cref="PenetrationSettings.minFootShinAngleDeg"/>
+        /// (i.e. the foot is bent too far up), rotates the foot about the ankle in the current bend plane to open it back
+        /// to the limit. Plantarflexion (pointing the toes down) is left untouched. Call LAST, after the pose + all IK.
+        /// </summary>
+        public void ClampFootBend(Animator animator, in PenetrationSettings s)
+        {
+            if (!s.capFootBend || animator == null || !animator.isHuman) return;
+            ClampOneFootBend(animator, HumanBodyBones.LeftLowerLeg, HumanBodyBones.LeftFoot, HumanBodyBones.LeftToes, s);
+            ClampOneFootBend(animator, HumanBodyBones.RightLowerLeg, HumanBodyBones.RightFoot, HumanBodyBones.RightToes, s);
+        }
+
+        static void ClampOneFootBend(Animator animator, HumanBodyBones knee, HumanBodyBones foot, HumanBodyBones toes, in PenetrationSettings s)
+        {
+            Transform kneeT = animator.GetBoneTransform(knee);
+            Transform footT = animator.GetBoneTransform(foot);
+            Transform toeT = animator.GetBoneTransform(toes);
+            if (kneeT == null || footT == null || toeT == null) return;
+
+            Vector3 vShin = kneeT.position - footT.position; // ankle -> knee (up the leg)
+            Vector3 vToe = toeT.position - footT.position;   // ankle -> toe (along the foot)
+            if (vShin.sqrMagnitude < 1e-8f || vToe.sqrMagnitude < 1e-8f) return;
+
+            float angle = Vector3.Angle(vShin, vToe);
+            float minAngle = Mathf.Clamp(s.minFootShinAngleDeg, 10f, 170f);
+            if (angle >= minAngle) return; // not over-dorsiflexed — leave the recorded foot alone
+
+            // Bend plane normal; rotating the toe direction about +bendAxis OPENS the knee->ankle->toe angle.
+            Vector3 bendAxis = Vector3.Cross(vShin, vToe);
+            if (bendAxis.sqrMagnitude < 1e-8f) return;
+            bendAxis.Normalize();
+
+            float delta = minAngle - angle; // degrees to open the ankle back to the limit
+            footT.rotation = Quaternion.AngleAxis(delta, bendAxis) * footT.rotation;
+        }
+
+        void PinLimb(Animator animator, HumanBodyBones rootBone, HumanBodyBones midBone, HumanBodyBones tipBone, Vector3 target, float weight, Transform preserveBone = null)
         {
             Transform root = animator.GetBoneTransform(rootBone);
             Transform mid = animator.GetBoneTransform(midBone);
@@ -352,10 +418,12 @@ namespace BodyTracking.Playback.PostProcess
             Vector3 hint = probe != null && probe.TryWall(mid.position, out var h)
                 ? mid.position + h.normal * 0.1f
                 : mid.position;
+            Quaternion preserveLocal = preserveBone != null ? preserveBone.localRotation : Quaternion.identity;
             LimbIKSolver.Solve(root, mid, tip, target, weight, hint);
+            if (preserveBone != null) preserveBone.localRotation = preserveLocal;
         }
 
-        void SolveLimbToWall(Animator animator, HumanBodyBones rootBone, HumanBodyBones midBone, HumanBodyBones tipBone, in PenetrationSettings s)
+        void SolveLimbToWall(Animator animator, HumanBodyBones rootBone, HumanBodyBones midBone, HumanBodyBones tipBone, in PenetrationSettings s, Transform preserveBone = null)
         {
             Transform root = animator.GetBoneTransform(rootBone);
             Transform mid = animator.GetBoneTransform(midBone);
@@ -376,7 +444,9 @@ namespace BodyTracking.Playback.PostProcess
 
             // Hint biases the bend AWAY from the wall (along the outward normal) only when the limb is straight.
             Vector3 hint = mid.position + hit.normal * 0.1f;
+            Quaternion preserveLocal = preserveBone != null ? preserveBone.localRotation : Quaternion.identity;
             LimbIKSolver.Solve(root, mid, tip, hit.surfacePoint, weight, hint);
+            if (preserveBone != null) preserveBone.localRotation = preserveLocal;
         }
     }
 }
