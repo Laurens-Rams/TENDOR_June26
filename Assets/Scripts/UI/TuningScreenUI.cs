@@ -567,6 +567,14 @@ namespace BodyTracking.UI
             AddSection("Settings snapshot");
             AddButton("Log settings to Xcode (copy)", () => p.LogTuningSnapshotForCopy());
 
+            AddSection("Pose A/B debug");
+            AddButton("Disable all corrections (match orange)", () =>
+            {
+                p.DisableAllPoseCorrectionsForDebug();
+                RebuildRows();
+            });
+            AddStatusLabel("Turns off smoothing, wall, IK, floor, root guard. Re-enable one-by-one in Wall / IK / Pose.");
+
             AddSection("Debug view");
             var dbg = EnsureDebugVisuals();
             AddToggle("Skeleton & AR debug overlay", () => dbg.VisualsVisible, v => dbg.SetVisible(v));

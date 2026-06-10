@@ -12,23 +12,24 @@ Drop them into this folder (Assets/AI/BlazePose/) and assign them on the BlazePo
      https://huggingface.co/unity/inference-engine-blaze-pose/tree/main/models
    Files:
      - pose_detection.onnx                  -> BlazePoseRunner.poseDetector
-     - pose_landmarks_detector_full.onnx    -> BlazePoseRunner.poseLandmarker
-       (lite/heavy variants also work; lite is faster, heavy is more accurate)
+     - pose_landmarks_detector_heavy.onnx   -> BlazePoseRunner.poseLandmarker
+       (heavy = most accurate, recommended for the LiDAR hip source. full/lite also work —
+        the setup tool auto-detects any pose_landmarks_detector_* variant and prefers heavy.)
    Place the .onnx files in this folder. Unity imports them as ModelAsset automatically.
 
 3) Anchors CSV (detector priors, 2254 rows of "x,y,w,h"):
-   Get it from the Unity sentis-samples BlazeDetectionSample (Pose):
+   Get it from the Unity sentis-samples BlazeDetectionSample — use the POSE one, NOT Face/Hand:
      https://github.com/Unity-Technologies/sentis-samples
-     BlazeDetectionSample/Pose/Assets/StreamingAssets/pose_detection_anchors.csv  (or Resources)
-   Copy it here as anchors.csv -> BlazePoseRunner.anchorsCSV (TextAsset).
+     BlazeDetectionSample/Pose/Assets/Data/anchors.csv
+   Copy it into this folder (any *.csv name works; the setup tool validates the 2254-row count
+   and rejects the Face/Hand anchor files automatically).
 
-4) On the BlazePoseRunner component, assign:
-     poseDetector, poseLandmarker, anchorsCSV.
+4) Wiring is automatic: while the .setup_pending marker exists in this folder, the setup tool
+   runs after every import/reload and, once all three files are present, wires the
+   BlazePosePipeline (runner refs, AROcclusionManager, enable-on-demand component states),
+   sets BodyTrackingRecorder Pose Source Mode = LidarHip, and saves the scene.
+   You can also run it manually any time: TENDOR > BlazePose > Setup Scene.
    The ImageTransform.compute shader is already in Assets/Resources/ComputeShaders/.
-
-   OR run the one-click scene wiring in Unity:
-     TENDOR > BlazePose > Setup Scene
-   (Also runs automatically once when Unity reimports scripts if .setup_pending exists.)
 
 Scene setup (after models are assigned):
   Stage 1 (validate detection):
@@ -39,9 +40,11 @@ Scene setup (after models are assigned):
     - Add an AROcclusionManager to the AR camera (enable environment depth / LiDAR).
     - Add BlazePoseDepthLift (auto-finds runner + occlusion + camera) and BlazePose3DVisualizer.
       Confirm the 3D spheres sit on the real person; tune the depth flip toggles to match the runner.
-  Stage 3 (record with BlazePose):
-    - On BodyTrackingRecorder, set "Pose Source" = BlazePose (it auto-finds BlazePoseDepthLift).
-      ARKit remains the default/fallback. Record + replay should now use BlazePose joints.
+  Stage 3 (record with the LiDAR hip source):
+    - On BodyTrackingRecorder, "Pose Source Mode" = LidarHip (default). It auto-finds the
+      BlazePoseRunner + AROcclusionManager and falls back to ARKit3D if either is missing.
+      During arming/recording the controller disables ARHumanBodyManager and requests LiDAR
+      environment depth (NoOcclusion), so the hip is positioned via BlazePose 2D + depth.
 
 Model I/O reference (no adaptation needed):
   - Detector input:   (1, 224, 224, 3), output post-processed to (idx, score, box).

@@ -114,6 +114,11 @@ namespace BodyTracking.Data
         public string routeId;
         /// <summary>"immersal" or "imageTarget". Empty/legacy recordings are treated as image-target.</summary>
         public string spatialSource;
+        /// <summary>
+        /// Body-pose backend that produced the hip samples ("ARKit" or "LiDARHip"). Empty on legacy
+        /// recordings (all of which were ARKit). Used for A/B accuracy comparison and review display.
+        /// </summary>
+        public string poseBackend;
 
         // --- Move AI fusion metadata ---
         /// <summary>File name (no extension) of the paired video captured for Move AI processing, if any.</summary>

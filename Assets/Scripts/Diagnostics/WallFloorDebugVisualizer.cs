@@ -48,12 +48,19 @@ namespace BodyTracking.Diagnostics
         [SerializeField] private Color contactInsideColor = new Color(1f, 0.2f, 0.15f, 0.95f);
 
         [Header("Hold overlay")]
-        [Tooltip("Marker size (m) for an inferred hold.")]
-        [SerializeField] private float holdMarkerSize = 0.05f;
+        [Tooltip("Marker size (m) for an inferred hold (the across-wall diameter of the disc/tile).")]
+        [SerializeField] private float holdMarkerSize = 0.11f;
+        [Tooltip("Draw holds as flat discs/tiles pinned flush to the wall (instead of free-floating spheres/cubes) " +
+                 "so they read like markers painted ON the wall.")]
+        [SerializeField] private bool holdsFlatOnWall = true;
+        [Tooltip("Minimum on-screen opacity for the faintest (just-guessed) hold, so even low-confidence holds stay " +
+                 "clearly visible against the camera feed.")]
+        [Range(0f, 1f)]
+        [SerializeField] private float holdMinAlpha = 0.6f;
         [Tooltip("Color for a low-confidence (just-guessed) hold.")]
-        [SerializeField] private Color holdLowConfidenceColor = new Color(1f, 0.35f, 0.2f, 1f);
+        [SerializeField] private Color holdLowConfidenceColor = new Color(1f, 0.55f, 0.1f, 1f);
         [Tooltip("Color for a high-confidence (often-used) hold.")]
-        [SerializeField] private Color holdHighConfidenceColor = new Color(0.2f, 1f, 0.4f, 1f);
+        [SerializeField] private Color holdHighConfidenceColor = new Color(0.1f, 1f, 0.35f, 1f);
 
         public bool ShowVisuals { get => showVisuals; set { showVisuals = value; if (!value) HideAll(); } }
         public bool ShowStatusHud { get => showStatusHud; set => showStatusHud = value; }
@@ -228,7 +235,18 @@ namespace BodyTracking.Diagnostics
                 if (marker == null) continue;
 
                 marker.transform.position = hold.ToWorld(routeRoot);
-                marker.transform.localScale = Vector3.one * holdMarkerSize;
+                if (holdsFlatOnWall && routeRoot != null)
+                {
+                    // Lie the marker flat on the wall: align its local Z (thin axis) with the wall normal
+                    // (RouteRoot forward) so it reads as a disc/tile painted on the wall rather than a floating ball.
+                    marker.transform.rotation = routeRoot.rotation;
+                    marker.transform.localScale = new Vector3(holdMarkerSize, holdMarkerSize, holdMarkerSize * 0.2f);
+                }
+                else
+                {
+                    marker.transform.rotation = Quaternion.identity;
+                    marker.transform.localScale = Vector3.one * holdMarkerSize;
+                }
                 SetMarkerColor(marker, ConfidenceColor(hold.Confidence));
                 SetActive(marker, true);
             }
@@ -273,7 +291,8 @@ namespace BodyTracking.Diagnostics
         {
             float c = Mathf.Clamp01(confidence);
             var col = Color.Lerp(holdLowConfidenceColor, holdHighConfidenceColor, c);
-            col.a = Mathf.Lerp(0.3f, 0.9f, c); // faint guesses stay translucent; sure holds read solid
+            // Even the faintest guess stays clearly visible (holdMinAlpha floor); sure holds read fully solid.
+            col.a = Mathf.Lerp(Mathf.Clamp01(holdMinAlpha), 1f, c);
             return col;
         }
 

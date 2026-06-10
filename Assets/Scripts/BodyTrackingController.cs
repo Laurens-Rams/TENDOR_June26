@@ -116,6 +116,12 @@ namespace BodyTracking
         private bool confirmPendingAfterVideo;
         private bool rejectPendingAfterVideo;
 
+        // Review hip-path polyline (all valid hip samples, confidence color-graded), parented to the
+        // RouteRoot so it stays glued to the wall through any re-anchor while the user reviews.
+        private GameObject reviewHipPath;
+        /// <summary>Quality summary of the recording under review ("Hip 92% valid · conf 0.81 · LiDARHip").</summary>
+        public string ReviewSummary { get; private set; } = "";
+
         // Multi-recording overlap engine: drives one extra character per additional enabled recording, locked
         // to this controller's primary playhead. Created on demand so scenes don't need manual wiring.
         private MultiRecordingPlayback multiPlayback;
@@ -225,6 +231,19 @@ namespace BodyTracking
             bool bodyTracking = mode == OperationMode.WaitingForBody || mode == OperationMode.Recording;
             QualitySettings.vSyncCount = 0;
             Application.targetFrameRate = bodyTracking ? BodyTrackingFrameRate : IdleFrameRate;
+        }
+
+        void Awake()
+        {
+            // ARHumanBodyManager is enabled in the XR Origin prefab by default. If we're on the LidarHip path,
+            // disable it before the first ARSession update so ARKit never boots into body-tracking configuration
+            // (that config has no environment depth and fights LiDAR hip tracking).
+            if (recorder != null &&
+                recorder.ConfiguredPoseSourceMode == BodyPoseSourceMode.LidarHip &&
+                humanBodyManager != null)
+            {
+                humanBodyManager.enabled = false;
+            }
         }
 
         void Start()
@@ -356,7 +375,8 @@ namespace BodyTracking
                 if (recorder != null)
                     recorder.PollBodyDetection();
 
-                bool bodyVisible = recorder != null && recorder.HasTrackedBody;
+                // LiDAR source: require a depth-locked hip (not just a 2D pose) before capture begins.
+                bool bodyVisible = recorder != null && recorder.IsBodyDetectedForArming;
                 stableFrames = bodyVisible ? stableFrames + 1 : 0;
                 if (stableFrames >= needed)
                     break;
@@ -400,9 +420,12 @@ namespace BodyTracking
                 return;
             }
 
+            string hipStatus = recorder != null ? recorder.HipTrackingStatusLine : null;
             string hint = joints == 0
                 ? "Stand in frame, full body visible; landscape works best on iPhone."
                 : $"Get into frame… ({joints} joints, {source})";
+            if (!string.IsNullOrEmpty(hipStatus))
+                hint += $" · {hipStatus}";
 
             if (waitForBodyTimeoutSeconds > 0f)
                 hint += $" · auto-start in {Mathf.Max(0f, waitForBodyTimeoutSeconds - elapsedSeconds):0}s";
@@ -535,35 +558,29 @@ namespace BodyTracking
                     return lastRecording;
                 }
 
-                // Auto-save the recording
+                // Reserve a file name now, but DON'T write to storage yet when a review is required: a rejected
+                // recording must never hit disk (otherwise it shows up in the recordings list). Persistence is
+                // deferred to ConfirmRecording; Reject simply drops the in-memory recording.
                 string fileName = $"hip_recording_{System.DateTime.Now:yyyyMMdd_HHmmss}";
-                if (RecordingStorage.SaveRecording(lastRecording, fileName))
-                {
-                    lastRecordingFileName = fileName;
-                    Debug.Log($"[BodyTrackingController] Hip recording saved: {fileName}");
-                    UpdateStatus($"Hip recording saved: {lastRecording.ValidFrameCount}/{lastRecording.FrameCount} valid frames");
-                    if (saveWorldMapWithRecording && worldMapPersistence != null)
-                    {
-                        StartCoroutine(worldMapPersistence.SaveWorldMapForRecording(fileName, imageTargetManager != null ? imageTargetManager.targetImageName : "unknown"));
-                    }
-                }
-                else
-                {
-                    Debug.LogError("[BodyTrackingController] Failed to save hip recording");
-                    UpdateStatus("Hip recording completed but save failed");
-                }
+                lastRecordingFileName = fileName;
 
-                OnRecordingComplete?.Invoke(lastRecording);
-
-                // Hold the recording for review (replay the skeleton, then Confirm to submit or Reject to discard)
-                // instead of sending it straight to Move AI. Confirm/Reject drive the actual submission/cleanup.
                 if (requireReviewBeforeSubmit)
                 {
+                    UpdateStatus($"Review recording: {lastRecording.ValidFrameCount}/{lastRecording.FrameCount} valid frames");
+                    OnRecordingComplete?.Invoke(lastRecording);
+                    // Hold the recording for review (replay the skeleton, then Confirm to save+submit or Reject to
+                    // discard). Confirm/Reject drive the actual persistence + Move AI submission / cleanup.
                     SetMode(OperationMode.Ready);
                     BeginReview(lastRecording);
                     return lastRecording;
                 }
 
+                // No review step: persist immediately (previous behavior), then submit.
+                if (PersistRecordingToStorage(lastRecording, fileName))
+                    UpdateStatus($"Hip recording saved: {lastRecording.ValidFrameCount}/{lastRecording.FrameCount} valid frames");
+                else
+                    lastRecordingFileName = null;
+                OnRecordingComplete?.Invoke(lastRecording);
                 StopPairedVideoCapture(lastRecording);
             }
             
@@ -574,6 +591,13 @@ namespace BodyTracking
         // ============================================================================================
         // RECORDING REVIEW (confirm / reject before Move AI submission)
         // ============================================================================================
+
+        /// <summary>
+        /// True when a recording was captured with the LiDAR-hip backend (not the current inspector mode).
+        /// Review UI/visuals key off this so ARKit recordings keep the original skeleton-only review.
+        /// </summary>
+        static bool IsLidarHipRecording(HipRecording recording) =>
+            recording != null && recording.poseBackend == "LiDARHip";
 
         /// <summary>
         /// Enter review for a just-finished recording: stop the paired video (without submitting), force the
@@ -605,8 +629,123 @@ namespace BodyTracking
                     SetFusionStatus("Review the skeleton, then confirm to send to Move AI");
             }
 
+            // The green hip-path polyline + quality summary are LiDAR-hip review aids. For ARKit recordings keep
+            // the original workflow (replay the recorded skeleton only, no green hip visualization).
+            bool lidarHip = IsLidarHipRecording(recording);
+            if (lidarHip)
+            {
+                ReviewSummary = BuildReviewSummary(recording);
+                ShowReviewHipPath(recording);
+            }
+            else
+            {
+                ReviewSummary = "";
+                HideReviewHipPath();
+            }
+
             OnReviewStarted?.Invoke();
             StartReviewPlayback();
+        }
+
+        /// <summary>Valid-hip %, mean confidence and source backend, so the user can judge quality before confirming.</summary>
+        private static string BuildReviewSummary(HipRecording recording)
+        {
+            if (recording == null || recording.frames == null || recording.frames.Count == 0)
+                return "";
+
+            int total = recording.frames.Count;
+            int valid = 0;
+            float confidenceSum = 0f;
+            foreach (var frame in recording.frames)
+            {
+                if (!frame.hipJoint.isTracked)
+                    continue;
+                valid++;
+                confidenceSum += frame.hipJoint.confidence;
+            }
+
+            float validPct = 100f * valid / total;
+            float meanConfidence = valid > 0 ? confidenceSum / valid : 0f;
+            string backend = string.IsNullOrEmpty(recording.poseBackend) ? "ARKit" : recording.poseBackend;
+            return $"Hip {validPct:F0}% valid · conf {meanConfidence:F2} · {backend}";
+        }
+
+        /// <summary>
+        /// Draw the recorded hip path (every valid hip sample) as a confidence color-graded polyline during
+        /// review: green = high-confidence LiDAR lock, amber = low. Parented to the RouteRoot (positions are
+        /// stored RouteRoot-local) so it stays on the wall if the anchor refines mid-review.
+        /// </summary>
+        private void ShowReviewHipPath(HipRecording recording)
+        {
+            HideReviewHipPath();
+
+            if (recording == null || recording.frames == null)
+                return;
+            Transform routeRoot = routeRootManager != null ? routeRootManager.RouteRoot : null;
+            if (routeRoot == null)
+                return;
+
+            var positions = new List<Vector3>();
+            var confidences = new List<float>();
+            foreach (var frame in recording.frames)
+            {
+                if (!frame.hipJoint.isTracked)
+                    continue;
+                positions.Add(frame.hipJoint.position);
+                confidences.Add(frame.hipJoint.confidence);
+            }
+            if (positions.Count < 2)
+                return;
+
+            reviewHipPath = new GameObject("ReviewHipPath");
+            reviewHipPath.transform.SetParent(routeRoot, false);
+
+            var line = reviewHipPath.AddComponent<LineRenderer>();
+            line.useWorldSpace = false;
+            line.startWidth = 0.02f;
+            line.endWidth = 0.02f;
+            line.numCornerVertices = 2;
+            line.numCapVertices = 2;
+            var material = BodyTracking.Utils.DebugVisualizationMaterials.CreateLineMaterial(Color.white);
+            if (material != null)
+                line.material = material;
+
+            line.positionCount = positions.Count;
+            for (int i = 0; i < positions.Count; i++)
+                line.SetPosition(i, positions[i]);
+
+            // LineRenderer gradients allow at most 8 color keys, so grade by segment-averaged confidence.
+            int keyCount = Mathf.Clamp(positions.Count, 2, 8);
+            var colorKeys = new GradientColorKey[keyCount];
+            var alphaKeys = new[] { new GradientAlphaKey(0.9f, 0f), new GradientAlphaKey(0.9f, 1f) };
+            for (int k = 0; k < keyCount; k++)
+            {
+                int from = k * confidences.Count / keyCount;
+                int to = Mathf.Max(from + 1, (k + 1) * confidences.Count / keyCount);
+                float sum = 0f;
+                for (int i = from; i < to; i++)
+                    sum += confidences[i];
+                float mean = sum / (to - from);
+                colorKeys[k] = new GradientColorKey(ReviewConfidenceColor(mean), keyCount == 1 ? 0f : k / (float)(keyCount - 1));
+            }
+            var gradient = new Gradient();
+            gradient.SetKeys(colorKeys, alphaKeys);
+            line.colorGradient = gradient;
+        }
+
+        private static Color ReviewConfidenceColor(float confidence)
+        {
+            // Amber (low) -> green (high); ARKit recordings (constant 1.0) read fully green.
+            return Color.Lerp(new Color(1f, 0.72f, 0.1f), new Color(0.15f, 0.9f, 0.3f), Mathf.Clamp01(confidence));
+        }
+
+        private void HideReviewHipPath()
+        {
+            if (reviewHipPath != null)
+            {
+                Destroy(reviewHipPath);
+                reviewHipPath = null;
+            }
         }
 
         /// <summary>Force the recorded dot/line skeleton visible and replay the recording in a loop for review.</summary>
@@ -616,7 +755,12 @@ namespace BodyTracking
                 return;
 
             if (player != null)
-                player.SetSkeletonVisible(true);
+            {
+                // The LiDAR-hip recorded skeleton is a per-joint depth lift: the hip is solid (the green review
+                // path), but the limb joints scatter in depth and read as a shaky non-body. Show only the hip
+                // path for LiDAR-hip recordings; keep the dot/line ghost for ARKit recordings.
+                player.SetSkeletonVisible(!IsLidarHipRecording(reviewRecording));
+            }
 
             if (!IsPlaying)
                 StartPlayback(reviewRecording);
@@ -651,6 +795,8 @@ namespace BodyTracking
                 StopPlayback();
 
             isAwaitingReview = false;
+            HideReviewHipPath();
+            ReviewSummary = "";
             RestoreSkeletonVisibilityAfterReview();
 
             if (!reviewVideoReady && reviewVideoExpected)
@@ -668,6 +814,29 @@ namespace BodyTracking
             OnReviewResolved?.Invoke();
         }
 
+        /// <summary>
+        /// Write a recording (and optionally its world map) to storage. Centralizes the save so it can be
+        /// deferred until the user confirms a reviewed recording — rejected recordings are never persisted.
+        /// </summary>
+        private bool PersistRecordingToStorage(HipRecording recording, string fileName)
+        {
+            if (recording == null || string.IsNullOrEmpty(fileName))
+                return false;
+
+            if (RecordingStorage.SaveRecording(recording, fileName))
+            {
+                Debug.Log($"[BodyTrackingController] Hip recording saved: {fileName}");
+                if (saveWorldMapWithRecording && worldMapPersistence != null)
+                    StartCoroutine(worldMapPersistence.SaveWorldMapForRecording(
+                        fileName, imageTargetManager != null ? imageTargetManager.targetImageName : "unknown"));
+                return true;
+            }
+
+            Debug.LogError("[BodyTrackingController] Failed to save hip recording");
+            UpdateStatus("Hip recording save failed");
+            return false;
+        }
+
         private void SubmitReviewedRecording()
         {
             if (reviewRecording == null || string.IsNullOrEmpty(reviewFileName))
@@ -676,6 +845,11 @@ namespace BodyTracking
             lastRecording = reviewRecording;
             lastRecordingFileName = reviewFileName;
             pairedVideoFilePath = reviewVideoPath;
+
+            // Persist now that the user accepted it (deferred from StopRecording). This is what adds the
+            // recording to the playback list — rejected recordings are never written here.
+            if (!PersistRecordingToStorage(lastRecording, lastRecordingFileName))
+                lastRecordingFileName = null;
 
             if (!string.IsNullOrEmpty(lastRecordingFileName))
                 TrySubmitMoveFusion(lastRecording);
@@ -692,6 +866,8 @@ namespace BodyTracking
 
             isAwaitingReview = false;
             confirmPendingAfterVideo = false;
+            HideReviewHipPath();
+            ReviewSummary = "";
             RestoreSkeletonVisibilityAfterReview();
 
             // Discard the paired video. It may still be encoding (BeginReview already requested the stop with the
@@ -1640,6 +1816,14 @@ namespace BodyTracking
         void ApplyOcclusionForMode(OperationMode mode)
         {
             bool enableOcclusion = mode == OperationMode.Playing;
+            bool capturing = mode == OperationMode.WaitingForBody || mode == OperationMode.Recording;
+
+            // LidarHip source: body pose comes from BlazePose 2D + LiDAR depth instead of ARKit 3D body
+            // tracking. ARKit runs ONE camera config at a time and the body-tracking config has no environment
+            // depth, so the body manager must stay DISABLED during capture to unlock LiDAR depth.
+            // Gate session policy on the *active* source, not the serialized mode — if LidarHip is configured but
+            // fell back to ARKit (missing BlazePose assets), ARKit body tracking must still run normally.
+            bool lidarHip = recorder != null && recorder.UsesLidarHipSource;
 
             // The full-screen character-softening pass only matters while the CG character is composited into the
             // scene (playback). Gate it off otherwise so idle/record camera mode skips two full-screen blits/frame.
@@ -1649,13 +1833,19 @@ namespace BodyTracking
             // it does NOT need to be on while the user is just framing the shot (Ready). Enable it only while
             // arming (WaitingForBody) and Recording; the WaitForBodyThenRecord arming loop already tolerates the
             // brief warm-up before ARKit reports a tracked body. Keep it off in Ready (idle camera = much cooler)
-            // and in Playing (so ARKit is free to pick an occlusion-capable configuration).
-            bool enableBodyTracking = mode == OperationMode.WaitingForBody || mode == OperationMode.Recording;
+            // and in Playing (so ARKit is free to pick an occlusion-capable configuration). With the LidarHip
+            // source it stays off ALWAYS — that's what frees the depth-capable camera configuration.
+            bool enableBodyTracking = capturing && !lidarHip;
             if (humanBodyManager != null && humanBodyManager.enabled != enableBodyTracking)
             {
                 humanBodyManager.enabled = enableBodyTracking;
-                Debug.Log($"[BodyTrackingController] ARHumanBodyManager.enabled={humanBodyManager.enabled} for mode {mode}.");
+                Debug.Log($"[BodyTrackingController] ARHumanBodyManager.enabled={humanBodyManager.enabled} for mode {mode} (lidarHip={lidarHip}).");
             }
+
+            // BlazePose inference only while it is actually consumed (arming/recording with the LidarHip
+            // source) to avoid idle GPU cost. Stagger enable a few frames after depth config so we don't load
+            // heavy Sentis workers on the same frame ARKit switches camera configuration (device crash).
+            SetBlazePoseRunnerEnabled(lidarHip && capturing, staggerFrames: capturing ? 20 : 0);
 
             // Plane detection is only used by playback features (floor contact shadow + floor penetration), so run
             // it only during playback. This stops continuous plane detection in idle/record camera mode.
@@ -1673,8 +1863,92 @@ namespace BodyTracking
             if (characterOcclusion == null)
                 return;
 
-            if (characterOcclusion.OcclusionEnabled != enableOcclusion)
-                characterOcclusion.SetOcclusionEnabled(enableOcclusion);
+            // Occlusion states: Playing = full visual occlusion; LidarHip = depth textures only
+            // (NoOcclusion preference, so the camera image stays clean while the hip source samples depth).
+            // Pre-warm depth once localized in Ready so tapping Record doesn't flip AR config cold.
+            bool depthForHipTracking = !enableOcclusion && lidarHip &&
+                (capturing || (mode == OperationMode.Ready && IsLocalized));
+            if (enableOcclusion)
+            {
+                if (!characterOcclusion.OcclusionEnabled)
+                    characterOcclusion.SetOcclusionEnabled(true);
+            }
+            else if (depthForHipTracking)
+            {
+                if (!characterOcclusion.DepthDataActive)
+                    characterOcclusion.SetDepthDataEnabled(true);
+            }
+            else if (characterOcclusion.OcclusionEnabled || characterOcclusion.DepthDataActive)
+            {
+                characterOcclusion.SetOcclusionEnabled(false);
+            }
+        }
+
+        // BlazePose runner (LidarHip source), enabled only while consumed. Cached after the first search;
+        // searched inactive too because the pipeline object idles disabled.
+        private BodyTracking.AI.BlazePoseRunner blazePoseRunner;
+        private bool blazePoseRunnerSearched;
+        private Coroutine blazePoseEnableCoroutine;
+
+        private void SetBlazePoseRunnerEnabled(bool enabledNow, int staggerFrames = 0)
+        {
+            if (!blazePoseRunnerSearched)
+            {
+                blazePoseRunnerSearched = true;
+                blazePoseRunner = FindFirstObjectByType<BodyTracking.AI.BlazePoseRunner>(FindObjectsInactive.Include);
+            }
+            if (blazePoseRunner == null)
+                return;
+
+            if (!enabledNow)
+            {
+                if (blazePoseEnableCoroutine != null)
+                {
+                    StopCoroutine(blazePoseEnableCoroutine);
+                    blazePoseEnableCoroutine = null;
+                }
+                if (blazePoseRunner.enabled)
+                {
+                    blazePoseRunner.enabled = false;
+                    Debug.Log("[BodyTrackingController] BlazePoseRunner.enabled=False.");
+                }
+                return;
+            }
+
+            if (blazePoseEnableCoroutine != null)
+            {
+                StopCoroutine(blazePoseEnableCoroutine);
+                blazePoseEnableCoroutine = null;
+            }
+
+            if (!blazePoseRunner.gameObject.activeSelf)
+                blazePoseRunner.gameObject.SetActive(true);
+
+            if (staggerFrames > 0 && !blazePoseRunner.enabled)
+            {
+                blazePoseEnableCoroutine = StartCoroutine(EnableBlazePoseRunnerAfterFrames(staggerFrames));
+                return;
+            }
+
+            if (!blazePoseRunner.enabled)
+            {
+                blazePoseRunner.enabled = true;
+                Debug.Log("[BodyTrackingController] BlazePoseRunner.enabled=True.");
+            }
+        }
+
+        IEnumerator EnableBlazePoseRunnerAfterFrames(int frames)
+        {
+            for (int i = 0; i < frames; i++)
+                yield return null;
+            blazePoseEnableCoroutine = null;
+            if (blazePoseRunner == null)
+                yield break;
+            if (!blazePoseRunner.enabled)
+            {
+                blazePoseRunner.enabled = true;
+                Debug.Log($"[BodyTrackingController] BlazePoseRunner.enabled=True (after {frames} frame stagger).");
+            }
         }
 
         /// <summary>
@@ -1727,8 +2001,10 @@ namespace BodyTracking
 
         private void OnRouteLocalizationChanged(bool _)
         {
-            // Immersal locking flips IsLocalized; re-evaluate whether the redundant marker tracking can stop.
+            // Immersal locking flips IsLocalized; re-evaluate image tracking and pre-warm LiDAR depth for hip tracking.
             ApplyImageTrackingForState();
+            if (isInitialized)
+                ApplyOcclusionForMode(currentMode);
         }
 
         /// <summary>

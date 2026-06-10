@@ -1,6 +1,7 @@
 using UnityEngine;
 using UnityEngine.XR.ARFoundation;
 using Unity.XR.CoreUtils;
+using BodyTracking.AI;
 using BodyTracking.Data;
 using BodyTracking.Animation;
 using BodyTracking.Spatial;
@@ -10,16 +11,33 @@ using System.Collections.Generic;
 
 namespace BodyTracking.Recording
 {
+    /// <summary>Which backend supplies the recorded body pose.</summary>
+    public enum BodyPoseSourceMode
+    {
+        /// <summary>ARKit 3D human body tracking (ARHumanBodyManager).</summary>
+        ARKit3D,
+        /// <summary>BlazePose 2D landmarks + LiDAR environment depth (view-independent hip positioning).</summary>
+        LidarHip
+    }
+
     /// <summary>
     /// Records body pose (hip + full skeleton) into the stable RouteRoot frame. The actual skeleton comes from
-    /// <see cref="IBodyPoseSource"/> (ARKit human body tracking) without changing RouteRoot-local recording math
-    /// or the v3 file format.
+    /// <see cref="IBodyPoseSource"/> (ARKit human body tracking, or BlazePose+LiDAR) without changing
+    /// RouteRoot-local recording math or the v3 file format.
     /// </summary>
     public class BodyTrackingRecorder : MonoBehaviour
     {
         [Header("Recording Settings")]
         [SerializeField] private float targetFrameRate = 30f;
         [SerializeField] private bool showVisualization = false;
+
+        [Header("Pose source")]
+        [Tooltip("ARKit3D = ARHumanBodyManager skeleton (poor from behind). LidarHip = BlazePose 2D + LiDAR depth " +
+                 "(view-independent; requires the BlazePose models imported and a LiDAR device). Falls back to " +
+                 "ARKit3D when the BlazePose pipeline is unavailable.")]
+        [SerializeField] private BodyPoseSourceMode poseSourceMode = BodyPoseSourceMode.ARKit3D;
+        [Tooltip("LiDAR hip source tunables (depth gates, body-half offset, stencil guard).")]
+        [SerializeField] private LidarHipPoseSource.Settings lidarHipSettings = new LidarHipPoseSource.Settings();
 
         // ARKit 3D skeleton: 0=Root, 1=Hips (pelvis center), 2=LeftUpLeg. Use Hips, not LeftUpLeg, so the
         // recorded hip matches Move AI's pelvis Root for fusion alignment.
@@ -47,10 +65,16 @@ namespace BodyTracking.Recording
         // provider switch mid-recording can't corrupt stored coordinates.
         private IRouteRootProvider activeRecordingProvider;
 
-        // Pose source (ARKit)
+        // Pose sources
         private ARKitBodyPoseSource arkitSource;
+        private LidarHipPoseSource lidarSource;
         private IBodyPoseSource activeSource;
         private readonly List<BodyPoseJoint> frameJoints = new List<BodyPoseJoint>(96);
+
+        // Diagnostics snapshot taken at StartRecording for the per-recording A/B log.
+        private long lidarDepthAcceptedAtStart;
+        private long lidarDepthRejectedAtStart;
+        private double lidarDepthSumAtStart;
 
         // Recording state
         private HipRecording currentRecording;
@@ -58,6 +82,17 @@ namespace BodyTracking.Recording
         private float recordingStartTime;
         private float nextRecordTime;
         private bool warnedNoJointsThisSession;
+
+        // Live hip marker + short trail (LidarHip source): green = LiDAR depth lock, amber = body seen but no
+        // usable depth, hidden = no person. Gives clear in-app feedback that the tracked path is forming.
+        private GameObject hipMarker;
+        private Material hipMarkerMaterial;
+        private LineRenderer hipTrail;
+        private readonly List<Vector3> trailPositions = new List<Vector3>(128);
+        private readonly List<float> trailTimes = new List<float>(128);
+        private const float HipTrailSeconds = 2f;
+        private static readonly Color HipDepthLockedColor = new Color(0.15f, 0.9f, 0.3f);
+        private static readonly Color HipPoseOnlyColor = new Color(1f, 0.72f, 0.1f);
 
         // Visualization
         private GameObject hipVisualizationSphere;
@@ -79,16 +114,36 @@ namespace BodyTracking.Recording
         public bool IsRecording => isRecording;
         public float RecordingDuration => isRecording ? Time.time - recordingStartTime : 0f;
         public HipRecording LastRecording => currentRecording;
+        /// <summary>Serialized pose-source selection (may differ from <see cref="ActiveSourceName"/> if LidarHip fell back).</summary>
+        public BodyPoseSourceMode ConfiguredPoseSourceMode => poseSourceMode;
+
         public string ActiveSourceName => activeSource != null ? activeSource.SourceName : "none";
         public bool HasTrackedBody => activeSource != null && activeSource.HasTrackedBody;
         public int LastTrackedBodyCount => activeSource != null ? activeSource.TrackedBodyCount : 0;
         public int LastTrackedJointCount => activeSource != null ? activeSource.TrackedJointCount : 0;
+
+        /// <summary>True when recording is driven by the BlazePose+LiDAR source (controller uses this to pick
+        /// the AR session config: ARHumanBodyManager off, environment depth on).</summary>
+        public bool UsesLidarHipSource => activeSource != null && activeSource == lidarSource;
+        /// <summary>The LiDAR hip source when it is active, else null (live marker / UI status).</summary>
+        public LidarHipPoseSource ActiveLidarSource => UsesLidarHipSource ? lidarSource : null;
+        /// <summary>One-line tracking status for the recording UI ("Hip lock: LiDAR" etc.). Empty for ARKit.</summary>
+        public string HipTrackingStatusLine => UsesLidarHipSource ? lidarSource.StatusLine : string.Empty;
+
+        /// <summary>
+        /// "Body detected" gate for the arming countdown. For the LiDAR source this requires a depth-locked
+        /// hip (not just a 2D pose), so recording starts with real positional samples available.
+        /// </summary>
+        public bool IsBodyDetectedForArming =>
+            UsesLidarHipSource ? lidarSource.LockState == LidarHipLockState.DepthLocked : HasTrackedBody;
 
         /// <summary>Force a pose poll this frame so <see cref="HasTrackedBody"/> is current (used while arming).</summary>
         public void PollBodyDetection()
         {
             if (activeSource != null)
                 activeSource.TryGetCurrentPose(null, out _, out _);
+            // Show the hip marker while arming too, so the user can see the lock state before capture starts.
+            UpdateLiveHipMarker();
         }
 
         /// <summary>
@@ -103,6 +158,8 @@ namespace BodyTracking.Recording
                 HideSkeletonVisualization();
                 if (hipVisualizationSphere != null)
                     hipVisualizationSphere.SetActive(false);
+                HideHipMarker();
+                HideHipTrail();
             }
         }
 
@@ -124,7 +181,7 @@ namespace BodyTracking.Recording
             BuildPoseSources();
             if (activeSource == null)
             {
-                UnityEngine.Debug.LogError("[BodyTrackingRecorder] No pose source available — ARHumanBodyManager is required");
+                UnityEngine.Debug.LogError("[BodyTrackingRecorder] No pose source available — need an ARHumanBodyManager (ARKit3D) or a BlazePoseRunner + AROcclusionManager (LidarHip)");
                 return false;
             }
 
@@ -143,7 +200,26 @@ namespace BodyTracking.Recording
             arkitSource = bodyManager != null
                 ? new ARKitBodyPoseSource(bodyManager, preferredHipJointIndex)
                 : null;
-            activeSource = arkitSource;
+
+            lidarSource = null;
+            if (poseSourceMode == BodyPoseSourceMode.LidarHip)
+            {
+                // The BlazePose pipeline may be disabled while idle (enable-on-demand), so search inactive too.
+                var runner = FindFirstObjectByType<BlazePoseRunner>(FindObjectsInactive.Include);
+                var occlusion = FindFirstObjectByType<AROcclusionManager>(FindObjectsInactive.Include);
+                if (runner != null && occlusion != null)
+                {
+                    lidarSource = new LidarHipPoseSource(runner, occlusion, lidarHipSettings);
+                }
+                else
+                {
+                    UnityEngine.Debug.LogWarning("[BodyTrackingRecorder] LidarHip selected but BlazePoseRunner/AROcclusionManager missing — falling back to ARKit3D. Import the BlazePose models (Assets/AI/BlazePose/IMPORT_MODELS.txt) and add the pipeline to the scene.");
+                }
+            }
+
+            activeSource = lidarSource ?? (IBodyPoseSource)arkitSource;
+            if (lidarSource == null && poseSourceMode == BodyPoseSourceMode.LidarHip && arkitSource != null)
+                UnityEngine.Debug.Log("[BodyTrackingRecorder] Pose source fallback: ARKit3D");
         }
 
         /// <summary>
@@ -219,8 +295,16 @@ namespace BodyTracking.Recording
                 mapId = routeRootProvider.MapId,
                 routeId = routeRootProvider.RouteId,
                 spatialSource = spatialSource,
+                poseBackend = activeSource.SourceName,
                 recordingTimestamp = DateTime.Now
             };
+
+            if (lidarSource != null)
+            {
+                lidarDepthAcceptedAtStart = lidarSource.HipDepthAccepted;
+                lidarDepthRejectedAtStart = lidarSource.HipDepthRejected;
+                lidarDepthSumAtStart = lidarSource.HipDepthSumMeters;
+            }
 
             isRecording = true;
             recordingStartTime = Time.time;
@@ -258,11 +342,53 @@ namespace BodyTracking.Recording
             {
                 hipVisualizationSphere.SetActive(false);
             }
+            HideHipTrail();
 
             LogRecordedDepthSpread();
+            LogPoseSourceDiagnostics();
 
             OnRecordingComplete?.Invoke(currentRecording);
             return currentRecording;
+        }
+
+        /// <summary>
+        /// Per-recording accuracy diagnostics in the same log style, enabling ARKit-vs-LiDAR A/B comparison
+        /// across recordings: valid-hip %, mean confidence, and (LiDAR only) depth accept/reject stats.
+        /// </summary>
+        private void LogPoseSourceDiagnostics()
+        {
+            if (currentRecording == null || currentRecording.frames == null || currentRecording.frames.Count == 0)
+                return;
+
+            int total = currentRecording.frames.Count;
+            int validHip = 0;
+            float confidenceSum = 0f;
+            foreach (var frame in currentRecording.frames)
+            {
+                if (frame.hipJoint.isTracked)
+                {
+                    validHip++;
+                    confidenceSum += frame.hipJoint.confidence;
+                }
+            }
+
+            float validPct = 100f * validHip / total;
+            float meanConfidence = validHip > 0 ? confidenceSum / validHip : 0f;
+            string msg = $"[BodyTrackingRecorder] Pose source diagnostics — backend={currentRecording.poseBackend}, " +
+                         $"validHip={validHip}/{total} ({validPct:F0}%), meanConfidence={meanConfidence:F2}";
+
+            if (UsesLidarHipSource && lidarSource != null)
+            {
+                long accepted = lidarSource.HipDepthAccepted - lidarDepthAcceptedAtStart;
+                long rejected = lidarSource.HipDepthRejected - lidarDepthRejectedAtStart;
+                double depthSum = lidarSource.HipDepthSumMeters - lidarDepthSumAtStart;
+                long attempts = accepted + rejected;
+                float depthFailPct = attempts > 0 ? 100f * rejected / attempts : 0f;
+                float meanDepth = accepted > 0 ? (float)(depthSum / accepted) : 0f;
+                msg += $", depthFail={depthFailPct:F0}% ({rejected}/{attempts}), meanHipDepth={meanDepth:F2}m";
+            }
+
+            UnityEngine.Debug.Log(msg);
         }
 
         /// <summary>
@@ -318,16 +444,25 @@ namespace BodyTracking.Recording
             bool shouldSamplePose = isRecording || (showSkeletonVisualization && showSkeletonWhenNotRecording);
             if (!shouldSamplePose)
             {
-                // Avoid scanning ARKit body trackables while idle; arming refreshes detection explicitly.
+                // Avoid scanning ARKit body trackables while idle; arming refreshes detection explicitly
+                // (PollBodyDetection also drives the live hip marker while arming).
                 HideSkeletonVisualization();
+                HideHipMarker();
+                HideHipTrail();
                 return;
             }
 
             // Sample the current pose once per frame and reuse it for both visualization and recording so the
             // stored data exactly matches what was shown.
             bool foundBody = activeSource.TryGetCurrentPose(frameJoints, out Vector3 hipWorld, out bool hipTracked);
+            UpdateLiveHipMarker();
 
-            if (showSkeletonVisualization && (isRecording || showSkeletonWhenNotRecording))
+            // The LiDAR-hip joint skeleton is a per-joint depth lift: only the hip (green marker) is solid; the
+            // limb joints scatter in depth and read as a shaky non-body. Show just the hip marker for LiDAR-hip;
+            // keep the full dot/line skeleton for ARKit. (Joint capture/recording is unaffected either way.)
+            bool drawJointSkeleton = showSkeletonVisualization && !UsesLidarHipSource &&
+                                     (isRecording || showSkeletonWhenNotRecording);
+            if (drawJointSkeleton)
             {
                 if (foundBody)
                     UpdateSkeletonVisualization(frameJoints);
@@ -391,7 +526,10 @@ namespace BodyTracking.Recording
                 if (hipTracked)
                 {
                     Vector3 referencePosition = liveFrame.InverseTransformPoint(hipWorld);
-                    frame.hipJoint = new HipJointData(referencePosition, 1.0f, true);
+                    // LiDAR source reports a real per-sample confidence (min of landmark visibility and depth
+                    // quality); ARKit has no equivalent, so it stays at the legacy constant 1.0.
+                    float confidence = UsesLidarHipSource ? lidarSource.LastHipConfidence : 1.0f;
+                    frame.hipJoint = new HipJointData(referencePosition, confidence, true);
                     foundValidJoint = true;
 
                     if (showVisualization)
@@ -450,6 +588,131 @@ namespace BodyTracking.Recording
             if (driveCharacterDuringRecording && characterController != null && characterController.IsInitialized)
             {
                 characterController.SetTargetHipPosition(worldPosition);
+            }
+        }
+
+        // ========================================================================================
+        // Live hip marker + trail (LidarHip source)
+        // ========================================================================================
+
+        /// <summary>
+        /// Colored sphere at the lifted hip: green = LiDAR depth lock, amber = body seen but depth invalid
+        /// (out of LiDAR range / depth edge), hidden = no person. A short trail of depth-locked positions
+        /// (last ~2 s) shows the tracked path forming while recording/arming.
+        /// </summary>
+        private void UpdateLiveHipMarker()
+        {
+            if (!UsesLidarHipSource || !showSkeletonVisualization)
+                return;
+
+            var src = lidarSource;
+            var state = src.LockState;
+            if (state == LidarHipLockState.None || !src.TryGetHipVisual(out Vector3 hipWorld))
+            {
+                HideHipMarker();
+                return;
+            }
+
+            EnsureHipMarker();
+            hipMarker.transform.position = hipWorld;
+            hipMarker.SetActive(true);
+            if (hipMarkerMaterial != null)
+                hipMarkerMaterial.color = state == LidarHipLockState.DepthLocked ? HipDepthLockedColor : HipPoseOnlyColor;
+
+            if (state == LidarHipLockState.DepthLocked)
+                AppendHipTrailPoint(hipWorld);
+            PruneHipTrail();
+        }
+
+        private void EnsureHipMarker()
+        {
+            if (hipMarker != null)
+                return;
+
+            hipMarker = GameObject.CreatePrimitive(PrimitiveType.Sphere);
+            hipMarker.name = "LidarHipMarker";
+            hipMarker.transform.localScale = Vector3.one * 0.12f;
+
+            var xrOrigin = FindFirstObjectByType<XROrigin>();
+            if (xrOrigin != null)
+                hipMarker.transform.SetParent(xrOrigin.transform);
+
+            var renderer = hipMarker.GetComponent<Renderer>();
+            if (renderer != null)
+            {
+                hipMarkerMaterial = DebugVisualizationMaterials.CreateSolidColorMaterial(HipDepthLockedColor);
+                if (hipMarkerMaterial != null)
+                    renderer.material = hipMarkerMaterial;
+            }
+
+            var collider = hipMarker.GetComponent<Collider>();
+            if (collider != null)
+                Destroy(collider);
+
+            var trailObject = new GameObject("LidarHipTrail");
+            if (xrOrigin != null)
+                trailObject.transform.SetParent(xrOrigin.transform);
+            hipTrail = trailObject.AddComponent<LineRenderer>();
+            hipTrail.useWorldSpace = true;
+            hipTrail.startWidth = 0.015f;
+            hipTrail.endWidth = 0.015f;
+            hipTrail.numCapVertices = 2;
+            var trailMaterial = DebugVisualizationMaterials.CreateLineMaterial(HipDepthLockedColor);
+            if (trailMaterial != null)
+                hipTrail.material = trailMaterial;
+            var faded = HipDepthLockedColor; faded.a = 0.1f;
+            hipTrail.startColor = faded;          // oldest point fades out
+            hipTrail.endColor = HipDepthLockedColor;
+            hipTrail.positionCount = 0;
+        }
+
+        private void AppendHipTrailPoint(Vector3 worldPosition)
+        {
+            // Skip sub-centimeter moves so a still climber doesn't fill the buffer with noise.
+            if (trailPositions.Count > 0 && (trailPositions[trailPositions.Count - 1] - worldPosition).sqrMagnitude < 0.0001f)
+            {
+                trailTimes[trailTimes.Count - 1] = Time.time;
+                return;
+            }
+            trailPositions.Add(worldPosition);
+            trailTimes.Add(Time.time);
+        }
+
+        private void PruneHipTrail()
+        {
+            if (hipTrail == null)
+                return;
+
+            float cutoff = Time.time - HipTrailSeconds;
+            int firstKept = 0;
+            while (firstKept < trailTimes.Count && trailTimes[firstKept] < cutoff)
+                firstKept++;
+            if (firstKept > 0)
+            {
+                trailPositions.RemoveRange(0, firstKept);
+                trailTimes.RemoveRange(0, firstKept);
+            }
+
+            hipTrail.positionCount = trailPositions.Count;
+            for (int i = 0; i < trailPositions.Count; i++)
+                hipTrail.SetPosition(i, trailPositions[i]);
+            hipTrail.gameObject.SetActive(trailPositions.Count >= 2);
+        }
+
+        private void HideHipMarker()
+        {
+            if (hipMarker != null)
+                hipMarker.SetActive(false);
+        }
+
+        private void HideHipTrail()
+        {
+            trailPositions.Clear();
+            trailTimes.Clear();
+            if (hipTrail != null)
+            {
+                hipTrail.positionCount = 0;
+                hipTrail.gameObject.SetActive(false);
             }
         }
 
@@ -643,6 +906,10 @@ namespace BodyTracking.Recording
             {
                 Destroy(hipVisualizationSphere);
             }
+            if (hipMarker != null)
+                Destroy(hipMarker);
+            if (hipTrail != null)
+                Destroy(hipTrail.gameObject);
             ClearSkeletonObjects();
             if (skeletonRoot != null)
             {

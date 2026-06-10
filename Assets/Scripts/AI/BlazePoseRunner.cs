@@ -1,4 +1,5 @@
 using System;
+using System.Collections;
 using Unity.Collections;
 using Unity.Mathematics;
 using Unity.InferenceEngine;
@@ -33,7 +34,7 @@ namespace BodyTracking.AI
         [SerializeField] XRCpuImage.Transformation cpuTransformation = XRCpuImage.Transformation.None;
 
         [Header("Inference")]
-        [Tooltip("Backend used for both workers. GPUCompute recommended on device.")]
+        [Tooltip("Backend used for both workers. GPUCompute is fastest in Editor; on iOS device we auto-fallback to CPU because GPUCompute + heavy BlazePose + live AR depth has caused crashes.")]
         [SerializeField] BackendType backend = BackendType.GPUCompute;
         [Tooltip("Minimum seconds between inferences. 0 = every frame (heavy).")]
         [SerializeField, Min(0f)] float inferenceInterval = 0.04f; // ~25 Hz target
@@ -68,13 +69,50 @@ namespace BodyTracking.AI
         Texture2D m_InferenceTexture;
         readonly BlazePoseResult m_Result = new BlazePoseResult();
         bool m_Initialized;
+        bool m_Initializing;
+        Coroutine m_InitCoroutine;
         bool m_Running;
         float m_LastInferenceTime = -999f;
         int m_FrameCounter;
 
+        // Camera state snapshotted when the CPU image is acquired (inference finishes 1-2 frames later,
+        // so consumers must unproject with the pose/intrinsics from acquisition time, not publish time).
+        bool m_PendingHasCameraPose;
+        Vector3 m_PendingCameraPosition;
+        Quaternion m_PendingCameraRotation;
+        bool m_PendingHasIntrinsics;
+        XRCameraIntrinsics m_PendingIntrinsics;
+        float m_PendingCaptureTime;
+
         void OnEnable()
         {
+            if (m_Initialized || m_Initializing)
+                return;
+            if (m_InitCoroutine != null)
+                StopCoroutine(m_InitCoroutine);
+            // Defer worker creation a few frames so we don't load the heavy Sentis models on the same
+            // frame ARKit switches to the LiDAR-depth camera configuration (that combo has crashed devices).
+            m_InitCoroutine = StartCoroutine(DeferredInitialize());
+        }
+
+        IEnumerator DeferredInitialize()
+        {
+            m_Initializing = true;
+            for (int i = 0; i < 8; i++)
+                yield return null;
+            m_InitCoroutine = null;
             Initialize();
+            m_Initializing = false;
+        }
+
+        static BackendType ResolveBackend(BackendType configured)
+        {
+#if UNITY_IOS && !UNITY_EDITOR
+            // GPUCompute + pose_landmarks_detector_heavy + live AR depth/textures → device OOM/crash observed on A17 Pro.
+            if (configured == BackendType.GPUCompute)
+                return BackendType.CPU;
+#endif
+            return configured;
         }
 
         void Initialize()
@@ -88,6 +126,7 @@ namespace BodyTracking.AI
                 return;
             }
 
+            var resolvedBackend = ResolveBackend(backend);
             m_Anchors = BlazeUtils.LoadAnchors(anchorsCSV.text, k_NumAnchors);
 
             // Detector: append argmax/score filtering so the worker returns (idx, score, box) for the best pose.
@@ -99,16 +138,16 @@ namespace BodyTracking.AI
             var scores = outputs[1]; // (1, 2254, 1)
             var idx_scores_boxes = BlazeUtils.ArgMaxFiltering(boxes, scores);
             poseDetectorModel = graph.Compile(idx_scores_boxes.Item1, idx_scores_boxes.Item2, idx_scores_boxes.Item3);
-            m_PoseDetectorWorker = new Worker(poseDetectorModel, backend);
+            m_PoseDetectorWorker = new Worker(poseDetectorModel, resolvedBackend);
 
             var poseLandmarkerModel = ModelLoader.Load(poseLandmarker);
-            m_PoseLandmarkerWorker = new Worker(poseLandmarkerModel, backend);
+            m_PoseLandmarkerWorker = new Worker(poseLandmarkerModel, resolvedBackend);
 
             m_DetectorInput = new Tensor<float>(new TensorShape(1, k_DetectorInputSize, k_DetectorInputSize, 3));
             m_LandmarkerInput = new Tensor<float>(new TensorShape(1, k_LandmarkerInputSize, k_LandmarkerInputSize, 3));
 
             m_Initialized = true;
-            Debug.Log($"[BlazePoseRunner] Initialized OK. anchors={m_Anchors.GetLength(0)}, backend={backend}, interval={inferenceInterval}, scoreThreshold={scoreThreshold}");
+            Debug.Log($"[BlazePoseRunner] Initialized OK. anchors={m_Anchors.GetLength(0)}, backend={resolvedBackend} (configured={backend}), interval={inferenceInterval}, scoreThreshold={scoreThreshold}");
         }
 
         bool ShouldLog()
@@ -172,6 +211,17 @@ namespace BodyTracking.AI
                 return false;
             if (!cm.TryAcquireLatestCpuImage(out XRCpuImage image))
                 return false;
+
+            // Snapshot camera state at acquisition (paired with this image, published with the result).
+            var camTransform = cm.transform;
+            m_PendingHasCameraPose = camTransform != null;
+            if (m_PendingHasCameraPose)
+            {
+                m_PendingCameraPosition = camTransform.position;
+                m_PendingCameraRotation = camTransform.rotation;
+            }
+            m_PendingHasIntrinsics = cm.TryGetIntrinsics(out m_PendingIntrinsics);
+            m_PendingCaptureTime = Time.unscaledTime;
 
             try
             {
@@ -296,6 +346,7 @@ namespace BodyTracking.AI
             m_Result.textureWidth = textureWidth;
             m_Result.textureHeight = textureHeight;
             m_Result.frameId = ++m_FrameCounter;
+            ApplyPendingCameraState();
 
             for (var i = 0; i < k_NumKeypoints; i++)
             {
@@ -324,11 +375,28 @@ namespace BodyTracking.AI
             m_Result.textureWidth = textureWidth;
             m_Result.textureHeight = textureHeight;
             m_Result.frameId = ++m_FrameCounter;
+            ApplyPendingCameraState();
             OnPoseUpdated?.Invoke(m_Result);
+        }
+
+        void ApplyPendingCameraState()
+        {
+            m_Result.hasCameraPose = m_PendingHasCameraPose;
+            m_Result.cameraPosition = m_PendingCameraPosition;
+            m_Result.cameraRotation = m_PendingCameraRotation;
+            m_Result.hasIntrinsics = m_PendingHasIntrinsics;
+            m_Result.intrinsics = m_PendingIntrinsics;
+            m_Result.captureTime = m_PendingCaptureTime;
         }
 
         void OnDisable()
         {
+            if (m_InitCoroutine != null)
+            {
+                StopCoroutine(m_InitCoroutine);
+                m_InitCoroutine = null;
+                m_Initializing = false;
+            }
             Dispose();
         }
 

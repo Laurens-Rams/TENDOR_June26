@@ -61,6 +61,9 @@ namespace BodyTracking.AR
         /// <summary>True while occlusion modes are being requested from the subsystem.</summary>
         public bool OcclusionEnabled { get; private set; }
 
+        /// <summary>True while depth textures are requested without visual occlusion (LiDAR hip tracking).</summary>
+        public bool DepthDataActive { get; private set; }
+
         private Coroutine capabilityLogRoutine;
 
         const string EnvironmentDepthKeyword = "ARKIT_ENVIRONMENT_DEPTH_ENABLED";
@@ -103,6 +106,7 @@ namespace BodyTracking.AR
             }
 
             OcclusionEnabled = enabledNow;
+            DepthDataActive = false;
 
             if (enabledNow)
             {
@@ -135,6 +139,41 @@ namespace BodyTracking.AR
 
         /// <summary>Convenience toggle for UI buttons.</summary>
         public void ToggleOcclusion() => SetOcclusionEnabled(!OcclusionEnabled);
+
+        /// <summary>
+        /// Request LiDAR environment depth + human segmentation CPU images WITHOUT rendering occlusion
+        /// (<see cref="OcclusionPreferenceMode.NoOcclusion"/>): used while recording with the BlazePose+LiDAR
+        /// hip source, which samples the depth/stencil images but must not visually occlude anything.
+        /// Only valid while ARHumanBodyManager is disabled — ARKit's body-tracking camera configuration has
+        /// no depth. Disable by calling <see cref="SetOcclusionEnabled"/> with the desired final state.
+        /// </summary>
+        public void SetDepthDataEnabled(bool enabledNow)
+        {
+            if (occlusionManager == null)
+            {
+                Debug.LogWarning("[ARCharacterOcclusion] No AROcclusionManager — cannot request depth data.");
+                return;
+            }
+
+            if (!enabledNow)
+            {
+                SetOcclusionEnabled(false);
+                return;
+            }
+
+            OcclusionEnabled = false;
+            DepthDataActive = true;
+
+            occlusionManager.requestedEnvironmentDepthMode = environmentDepthMode;
+            // Raw (unsmoothed) depth: temporal smoothing trades latency for stability, and the hip source
+            // medians its own samples — prefer the freshest depth for a moving climber.
+            occlusionManager.environmentDepthTemporalSmoothingRequested = false;
+            occlusionManager.requestedHumanStencilMode = humanStencilMode;
+            occlusionManager.requestedHumanDepthMode = humanDepthMode;
+            occlusionManager.requestedOcclusionPreferenceMode = OcclusionPreferenceMode.NoOcclusion;
+
+            Debug.Log("[ARCharacterOcclusion] Depth data requested without occlusion (LiDAR hip tracking).");
+        }
 
         /// <summary>
         /// The occlusion subsystem reports its capabilities as Unknown until it has started, so we wait a few

@@ -1039,6 +1039,15 @@ namespace BodyTracking.UI
                 reviewRoot.SetActive(awaitingReview);
             if (reviewCaption != null && reviewCaption.gameObject.activeSelf != awaitingReview)
                 reviewCaption.gameObject.SetActive(awaitingReview);
+            if (reviewCaption != null && awaitingReview)
+            {
+                // Quality summary (valid-hip %, mean confidence, backend) so the user can judge the
+                // tracked path before confirming the Move AI submission.
+                string summary = controller.ReviewSummary;
+                reviewCaption.text = string.IsNullOrEmpty(summary)
+                    ? "Review the skeleton — keep or discard?"
+                    : $"Review — {summary}";
+            }
 
             if (!awaitingReview)
                 return;
@@ -1340,13 +1349,23 @@ namespace BodyTracking.UI
         {
             if (controller == null) return "No controller";
             if (!controller.IsInitialized) return "Initializing…";
-            if (controller.IsWaitingForBody) return "Get into frame…";
-            if (controller.IsRecording) return "Recording";
+            if (controller.IsWaitingForBody) return WithHipLockStatus("Get into frame…");
+            if (controller.IsRecording) return WithHipLockStatus("Recording");
             if (controller.IsPlaying) return controller.IsLocalized ? "Playing back" : GetLocalizationHint();
             if (!controller.IsLocalized) return GetLocalizationHint();
             if (controller.CanPlayback) return "Localized — tap Play";
             if (controller.CanRecord) return "Localized — tap Record";
             return "Ready";
+        }
+
+        /// <summary>
+        /// Append the LiDAR hip-lock status ("Hip lock: LiDAR" / "Body seen — out of depth range") so tracking
+        /// failures are diagnosable on the wall. Empty for the ARKit source — base caption is returned as-is.
+        /// </summary>
+        private string WithHipLockStatus(string baseText)
+        {
+            string hipStatus = controller.recorder != null ? controller.recorder.HipTrackingStatusLine : null;
+            return string.IsNullOrEmpty(hipStatus) ? baseText : $"{baseText} · {hipStatus}";
         }
 
         private Color GetModeColor()

@@ -214,6 +214,8 @@ namespace BodyTracking.Playback
             if (lastPlaybackAnchorMode == mode) return;
             lastPlaybackAnchorMode = mode;
             moveAnchorState.hasFacing = false;
+            moveAnchorState.hasPendingFacing = false;
+            moveAnchorState.consecutiveFacingFrames = 0;
             // Re-capture the Move-driven anchor on mode switch so the overlay re-anchors cleanly like the character.
             moveAnchorState.hasMoveDrivenAnchor = false;
         }

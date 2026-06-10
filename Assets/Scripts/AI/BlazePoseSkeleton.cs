@@ -1,4 +1,5 @@
 using UnityEngine;
+using UnityEngine.XR.ARSubsystems;
 
 namespace BodyTracking.AI
 {
@@ -27,6 +28,18 @@ namespace BodyTracking.AI
         public float textureHeight;
         public int frameId;
         public readonly BlazeLandmark[] landmarks = new BlazeLandmark[BlazePoseSkeleton.NumKeypoints];
+
+        // --- Capture-time camera state -----------------------------------------------------------
+        // Inference takes 1-2 frames, so by the time landmarks arrive the phone may have moved. These
+        // capture the AR camera state at the moment the CPU image was acquired, so depth-lift consumers
+        // unproject through the pose/intrinsics that actually produced the pixels (no motion smear).
+        public bool hasCameraPose;
+        public Vector3 cameraPosition;
+        public Quaternion cameraRotation;
+        public bool hasIntrinsics;
+        public XRCameraIntrinsics intrinsics;
+        /// <summary>Time.unscaledTime when the camera image was acquired (staleness checks).</summary>
+        public float captureTime;
     }
 
     /// <summary>
@@ -43,6 +56,12 @@ namespace BodyTracking.AI
         public const int RightShoulder = 12;
         public const int LeftHip = 23;
         public const int RightHip = 24;
+        public const int LeftKnee = 25;
+        public const int RightKnee = 26;
+        public const int LeftAnkle = 27;
+        public const int RightAnkle = 28;
+        public const int LeftHeel = 29;
+        public const int RightHeel = 30;
 
         /// <summary>
         /// Parent index per landmark forming a single tree rooted at the right hip (parent = -1). Bones are

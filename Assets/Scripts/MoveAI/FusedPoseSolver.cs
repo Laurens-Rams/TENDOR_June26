@@ -27,6 +27,20 @@ namespace BodyTracking.MoveAI
         const float MinHipAxis = 0.08f;
         // Max plausible per-update pelvis jump (m). Larger deltas are treated as a tracking glitch, not motion.
         const float MaxAnchorJump = 1.0f;
+        // Max plausible per-frame change of the Move->ARKit yaw OFFSET (deg). The offset maps the Move hip axis
+        // onto the recorded ARKit hip axis; when the climber genuinely turns, BOTH axes turn together, so the
+        // offset itself only drifts slowly. A big jump is therefore a glitch — most commonly an ARKit left/right
+        // hip swap, which reads as exactly 180° and used to whirl the skeleton toward/away from the wall.
+        const float MaxFacingJumpDeg = 30f;
+        // Consecutive consistent over-threshold yaw measurements before the new offset is accepted as real
+        // (~0.75s at 60fps). Filters flip glitches but still recovers if the alignment genuinely changed
+        // (e.g. a long dropout was followed by a different relative timing/orientation).
+        const int FacingAcceptFrames = 45;
+        // Consecutive frames with a valid ARKit hip axis before a re-align (auto or manual) is allowed to run.
+        // When blue "comes back" after a dropout the pelvis often reappears 1–2 frames before the leg sockets
+        // stabilise; re-aligning on that partial frame both slides AND twists the body. Wait until blue is fully
+        // back (~0.25 s at 60 fps).
+        const int MinStableFacingForRealign = 15;
 
         /// <summary>How the character's world position (pelvis anchor) is derived each frame.</summary>
         public enum AnchorMode
@@ -44,8 +58,8 @@ namespace BodyTracking.MoveAI
             FollowBakedRoot,
             /// <summary>TEST: drive world movement from the Move GLB's OWN root motion. Capture the world anchor +
             /// yaw ONCE from ARKit at the first valid frame (or on re-align request), then translate purely by the
-            /// GLB root delta from that moment. ARKit is read once; the body may drift vs the wall over time. Easy
-            /// to remove (delete this value + the UI toggle).</summary>
+            /// GLB root delta from that moment. Re-align adjusts POSITION only — yaw stays locked so turning comes
+            /// entirely from the Move GLB after the initial alignment.</summary>
             FollowMoveGlbRoot
         }
 
@@ -71,7 +85,7 @@ namespace BodyTracking.MoveAI
             public float facingCorrectionSeconds;
 
             [Header("Move-driven test mode (FollowMoveGlbRoot) auto re-align")]
-            [Tooltip("ON: while riding the Move GLB root motion, automatically re-anchor to the live ARKit pelvis whenever the Move-predicted position drifts past the threshold below. The correction is eased (no teleport). OFF: only the manual 'Re-align now' button re-anchors.")]
+            [Tooltip("ON: while riding the Move GLB root motion, automatically re-anchor to the live ARKit pelvis whenever the Move-predicted position drifts past the threshold below. Waits until the blue hip axis has been stable for ~0.25s (avoids re-aligning on a partial ARKit reacquire). Position only — yaw stays locked. OFF: only the manual 'Re-align now' button re-anchors.")]
             public bool moveAutoRealign;
             [Tooltip("Drift distance (m) between the Move-predicted pelvis and the live ARKit pelvis that triggers an automatic re-align. Set above normal ARKit jitter (~0.05m) but below a noticeable offset. ~0.2m is a good start.")]
             public float moveRealignDriftThreshold;
@@ -106,6 +120,11 @@ namespace BodyTracking.MoveAI
             public bool initialized; // retained for back-compat; true once either anchor or facing is known
             public int rejectStreak; // consecutive teleport-guard rejections (for recovery from real jumps/loops)
 
+            // --- Facing flip guard (large yaw jumps are held until they prove sustained) ---
+            public Quaternion pendingFacing; // candidate yaw offset waiting to prove itself
+            public int pendingFacingFrames;  // consecutive frames the candidate stayed consistent
+            public bool hasPendingFacing;
+
             // --- MoveAIDriftCorrected state ---
             public Vector3 moveAnchor;     // held world-local pelvis position (follows ARKit while moving, frozen while still)
             public bool hasMoveAnchor;     // moveAnchor has been seeded
@@ -117,8 +136,9 @@ namespace BodyTracking.MoveAI
             // --- FollowMoveGlbRoot state (capture-once world anchor + facing, then ride the GLB root delta) ---
             public bool hasMoveDrivenAnchor;   // anchor0/facing0/root0 have been captured
             public Vector3 moveDrivenAnchor0;  // world-local pelvis anchor captured from ARKit at the align moment
-            public Quaternion moveDrivenFacing0; // yaw captured from ARKit hip-axis at the align moment
+            public Quaternion moveDrivenFacing0; // yaw captured from ARKit hip-axis at the align moment (frozen forever after)
             public Vector3 moveDrivenRoot0;    // GLB root world position at the align moment
+            public int consecutiveFacingFrames; // valid hip-axis streak; gates re-align until blue is fully back
             public bool requestRealign;        // set by the trigger hook to re-capture at the current frame
             // Eased re-align: on re-anchor we keep the body where it was and decay these toward zero/identity so
             // the correction glides on rather than teleporting. Position offset + yaw offset applied to the render.
@@ -170,6 +190,10 @@ namespace BodyTracking.MoveAI
                 HipFrame arkit = recording.GetFrameAtTime(t);
                 bool gotAnchor = TryGetPelvisCenter(arkit, out var pc);
                 bool gotFacing = TryComputeFacingAlignment(asset, fk, arkit, out var f);
+                if (gotFacing)
+                    state.consecutiveFacingFrames++;
+                else
+                    state.consecutiveFacingFrames = 0;
 
                 // Reject a sudden teleport of the pelvis (garbage frame during a dropout) — but only briefly.
                 // A SUSTAINED large jump is a real move (most commonly the loop restart, where the pelvis
@@ -189,17 +213,46 @@ namespace BodyTracking.MoveAI
                     state.rejectStreak = 0;
                 }
 
-                // FACING = exact match to the recorded ARKit (blue) skeleton. The alignment rotates the Move hip
-                // lateral axis directly onto the ARKit hip lateral axis, so the orange hip line is always PARALLEL
-                // to the blue hip line. Applied DIRECTLY every valid frame (no easing/slerp) so orange tracks blue
-                // with zero lag and can't slowly drift or spin. The hip SOCKETS (upper-leg joints) stay apart even
-                // when the feet/knees are together during a climb, so this stays valid; we only hold the last good
-                // yaw across genuine tracking dropouts (no valid hip pair this frame).
+                // FACING = the yaw OFFSET mapping the Move hip lateral axis onto the recorded ARKit hip lateral
+                // axis. Small per-frame updates are applied directly (zero lag, orange hip line stays parallel to
+                // the blue one), but the offset can only drift slowly in reality — the climber's genuine turning
+                // moves BOTH axes together. So a sudden large jump (typically the exact-180° ARKit left/right hip
+                // swap, or a degenerate axis right at the validity threshold) is a glitch: hold the current yaw
+                // and only accept the new one once it has stayed consistent for a sustained run of frames. This
+                // stops the skeleton from randomly whirling toward/away from the wall mid-playback. Dropouts
+                // (no valid hip pair) keep holding the last good yaw as before.
                 if (gotFacing)
                 {
-                    state.facing = f;
-                    facing = f;
-                    state.hasFacing = true;
+                    if (!state.hasFacing)
+                    {
+                        state.facing = f;
+                        state.hasFacing = true;
+                        state.hasPendingFacing = false;
+                    }
+                    else if (Quaternion.Angle(state.facing, f) <= MaxFacingJumpDeg)
+                    {
+                        state.facing = f;
+                        state.hasPendingFacing = false;
+                    }
+                    else if (state.hasPendingFacing && Quaternion.Angle(state.pendingFacing, f) <= MaxFacingJumpDeg)
+                    {
+                        // Candidate stayed consistent: count it; accept once sustained (a real alignment change).
+                        state.pendingFacing = f;
+                        state.pendingFacingFrames++;
+                        if (state.pendingFacingFrames >= FacingAcceptFrames)
+                        {
+                            state.facing = f;
+                            state.hasPendingFacing = false;
+                        }
+                    }
+                    else
+                    {
+                        // New (or inconsistent) outlier: start/restart the candidate, keep the held yaw.
+                        state.pendingFacing = f;
+                        state.pendingFacingFrames = 1;
+                        state.hasPendingFacing = true;
+                    }
+                    facing = state.facing;
                 }
                 else if (state.hasFacing)
                 {
@@ -222,8 +275,12 @@ namespace BodyTracking.MoveAI
                     bool firstCapture = !state.hasMoveDrivenAnchor;
 
                     // Auto trigger: compare the pure Move prediction (no eased correction) to the live ARKit pelvis.
+                    // Requires a stable hip axis (blue fully back) so a pelvis-only reacquire after dropout does not
+                    // fire a re-align that slides/twists the body.
                     bool wantRealign = state.requestRealign;
-                    if (!firstCapture && usedGlbPose && gotAnchor && anchorSettings.moveAutoRealign && !wantRealign)
+                    bool facingStable = state.consecutiveFacingFrames >= MinStableFacingForRealign;
+                    if (!firstCapture && usedGlbPose && gotAnchor && gotFacing && facingStable &&
+                        anchorSettings.moveAutoRealign && !wantRealign)
                     {
                         Vector3 dNow = (glbRootWorld - state.moveDrivenRoot0) * poseScale;
                         Vector3 predicted = state.moveDrivenAnchor0 + state.moveDrivenFacing0 * dNow;
@@ -232,42 +289,43 @@ namespace BodyTracking.MoveAI
                             wantRealign = true;
                     }
 
-                    if (usedGlbPose && firstCapture)
+                    if (usedGlbPose && firstCapture && gotFacing)
                     {
-                        // First alignment: snap the base to ARKit with no correction (nothing to glide from).
+                        // First alignment: lock position + yaw once blue has a valid hip axis. Until then we ride
+                        // the baked trajectory so nothing is captured from a partial/dropped-out ARKit frame.
                         state.moveDrivenAnchor0 = gotAnchor ? pc
                             : state.hasAnchor ? state.anchor
                             : (asset.rootPathLocal != null && k < asset.rootPathLocal.Count) ? asset.rootPathLocal[k]
                             : Vector3.zero;
-                        state.moveDrivenFacing0 = gotFacing ? f : (state.hasFacing ? state.facing : Quaternion.identity);
+                        state.moveDrivenFacing0 = state.facing;
                         state.moveDrivenRoot0 = glbRootWorld;
                         state.moveDrivenPosCorrection = Vector3.zero;
                         state.moveDrivenRotCorrection = Quaternion.identity;
                         state.hasMoveDrivenAnchor = true;
                         state.requestRealign = false;
                     }
-                    else if (usedGlbPose && wantRealign && gotAnchor)
+                    else if (usedGlbPose && wantRealign && gotAnchor && gotFacing && facingStable)
                     {
-                        // Re-anchor with easing: capture where the body is rendered RIGHT NOW, move the base onto
-                        // the fresh ARKit anchor (delta resets to 0), then set the correction so the rendered pose
-                        // is unchanged this frame and decays onto the new base over moveRealignEaseSeconds.
+                        // Re-anchor POSITION only. Yaw was captured at the first valid frame and never changes —
+                        // turning after that comes entirely from the Move GLB. Refreshing yaw when blue returns
+                        // after a dropout was the main cause of random spins toward/away from the wall.
                         Vector3 dOld = (glbRootWorld - state.moveDrivenRoot0) * poseScale;
                         Vector3 oldRendered = state.moveDrivenAnchor0 + state.moveDrivenFacing0 * dOld + state.moveDrivenPosCorrection;
                         Quaternion oldFacing = state.moveDrivenRotCorrection * state.moveDrivenFacing0;
 
-                        Quaternion newFacing0 = gotFacing ? f : state.moveDrivenFacing0;
                         state.moveDrivenAnchor0 = pc;
                         state.moveDrivenRoot0 = glbRootWorld;
                         state.moveDrivenPosCorrection = oldRendered - pc;
-                        state.moveDrivenRotCorrection = oldFacing * Quaternion.Inverse(newFacing0);
-                        state.moveDrivenFacing0 = newFacing0;
+                        // Preserve the rendered facing exactly; facing0 is unchanged so this equals the prior rotCorrection.
+                        state.moveDrivenRotCorrection = oldFacing * Quaternion.Inverse(state.moveDrivenFacing0);
                         state.requestRealign = false;
                     }
-                    // else (requestRealign but no ARKit/GLB this frame): keep requestRealign pending until ARKit returns.
+                    // else (requestRealign but blue not fully back yet): keep pending until hip axis is stable.
 
                     if (state.hasMoveDrivenAnchor)
                     {
-                        // Decay the eased correction toward zero/identity (frame-rate independent).
+                        // Decay the eased position correction toward zero (frame-rate independent). rotCorrection
+                        // should stay near identity now that re-align never changes yaw; decay it too for safety.
                         float wEase = 1f - Mathf.Exp(-Mathf.Max(1e-4f, Time.deltaTime)
                             / Mathf.Max(1e-4f, anchorSettings.moveRealignEaseSeconds));
                         state.moveDrivenPosCorrection = Vector3.Lerp(state.moveDrivenPosCorrection, Vector3.zero, wEase);
@@ -279,9 +337,6 @@ namespace BodyTracking.MoveAI
                         anchor = usedGlbPose
                             ? state.moveDrivenAnchor0 + state.moveDrivenFacing0 * d + state.moveDrivenPosCorrection
                             : state.anchor;
-                        // The captured facing came from the ARKit hip-axis, so treat it like an active hip-axis
-                        // facing: keeps invertFacing gated identically to the other modes (no-op while valid).
-                        state.hasFacing = true;
                     }
                     else
                     {
@@ -324,7 +379,10 @@ namespace BodyTracking.MoveAI
                 }
 
                 state.initialized = state.hasAnchor || state.hasFacing || state.hasMoveAnchor;
-                hipAxisFacingActive = state.hasFacing;
+                // The captured Move-driven facing also came from the ARKit hip-axis, so treat it like an active
+                // hip-axis facing: keeps invertFacing gated identically across the modes (no-op while valid).
+                hipAxisFacingActive = state.hasFacing ||
+                    (anchorSettings.mode == AnchorMode.FollowMoveGlbRoot && state.hasMoveDrivenAnchor);
             }
             else
             {
@@ -455,6 +513,8 @@ namespace BodyTracking.MoveAI
         /// translation forward, which collapses when the body is upright/still). Applying this every frame keeps the
         /// orange skeleton's hip line exactly parallel to the blue ARKit hip line — i.e. orange matches blue's yaw.
         /// Returns false (caller holds its last good yaw) only when either hip pair is missing this frame.
+        /// NOTE: the result is a raw per-frame measurement — <see cref="ComputeLocalJoints"/> flip-guards it
+        /// (an ARKit left/right hip swap reads as exactly 180°) before it is allowed to rotate the body.
         /// </summary>
         public static bool TryComputeFacingAlignment(MoveAIFusionAsset asset, Vector3[] fk, HipFrame arkit, out Quaternion facing)
         {

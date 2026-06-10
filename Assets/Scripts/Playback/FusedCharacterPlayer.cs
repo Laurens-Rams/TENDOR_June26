@@ -107,6 +107,8 @@ namespace BodyTracking.Playback
                 playbackAnchorMode = value;
                 // Rebake the one-shot GLB yaw offset when switching Baked vs Live mid-playback.
                 anchorState.hasFacing = false;
+                anchorState.hasPendingFacing = false;
+                anchorState.consecutiveFacingFrames = 0;
                 // Re-capture the move-driven anchor so the test mode re-anchors cleanly each time it's enabled.
                 anchorState.hasMoveDrivenAnchor = false;
                 anchorState.requestRealign = false;
@@ -644,6 +646,48 @@ namespace BodyTracking.Playback
                 yield return wait;
                 LogTuningSnapshotForCopy();
             }
+        }
+
+        /// <summary>
+        /// Turn off every post-solve correction so the driven character tracks the orange compare skeleton as
+        /// closely as the rig allows. Re-enable features one-by-one from the Wall / IK / Pose tabs to find
+        /// which stage misplaces hands or feet.
+        /// </summary>
+        public void DisableAllPoseCorrectionsForDebug()
+        {
+            enablePoseSmoothing = false;
+            var pp = postProcessSettings;
+            pp.enableSmoothing = false;
+            pp.enableGlitchGuard = false;
+            postProcessSettings = pp;
+
+            enableRootMotionGuard = false;
+            rootTurnSmoothingSeconds = 0f;
+            ResetRootMotionGuard();
+
+            enablePenetrationFix = false;
+            var pen = penetrationSettings;
+            pen.enableFloorFix = false;
+            pen.enableWallHandIK = false;
+            pen.enableWallFootIK = false;
+            pen.enableWholeBodyPush = false;
+            pen.capFootBend = false;
+            penetrationSettings = pen;
+
+            enableWallProjection = false;
+            var wall = wallProjectionSettings;
+            wall.enableSlabClamp = false;
+            wall.enableContactLock = false;
+            wallProjectionSettings = wall;
+            wallProjection.Reset();
+
+            postProcessor.Reset();
+            RefreshGlbPostProcess();
+            glbSource?.ResetSmoothing();
+
+            Debug.Log("[FusedCharacterPlayer] All pose corrections OFF (A/B debug). Orange skeleton = raw fused " +
+                      "joints; character should now match it except for GLB retarget / foot placement. Re-enable " +
+                      "one feature at a time in Tuning → Wall, IK, or Pose.");
         }
 
         /// <summary>Emit all tunables in Unity scene YAML form for copy/paste into NewVersion.unity.</summary>
